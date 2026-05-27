@@ -1,3 +1,203 @@
+from __future__ import annotations
+
+import os
+import secrets
+import smtplib
+import sqlite3
+import time
+from datetime import datetime, timezone
+from email.message import EmailMessage
+from pathlib import Path
+from string import Template
+
+import pandas as pd
+import streamlit as st
+
+
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = ROOT / "data"
+DB_PATH = DATA_DIR / "mailer.sqlite3"
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def get_secret(name: str, default: str = "") -> str:
+    saved = get_setting(name)
+    if saved:
+        return saved
+    try:
+        return str(st.secrets.get(name, default))
+    except Exception:
+        return os.getenv(name, default)
+
+
+def init_db() -> None:
+    DATA_DIR.mkdir(exist_ok=True)
+    with sqlite3.connect(DB_PATH) as db:
+        db.executescript(
+            """
+            create table if not exists contacts (
+                id integer primary key autoincrement,
+                email text not null unique,
+                name text not null default '',
+                channel text not null default '',
+                source text not null default '',
+                consent integer not null default 0,
+                unsubscribed integer not null default 0,
+                token text not null unique,
+                created_at text not null
+            );
+
+            create table if not exists sends (
+                id integer primary key autoincrement,
+                contact_id integer not null,
+                subject text not null,
+                status text not null,
+                error text not null default '',
+                sent_at text not null,
+                foreign key(contact_id) references contacts(id)
+            );
+
+            create table if not exists settings (
+                key text primary key,
+                value text not null
+            );
+            """
+        )
+
+
+def fetch_contacts() -> pd.DataFrame:
+    with sqlite3.connect(DB_PATH) as db:
+        return pd.read_sql_query(
+            """
+            select
+                c.id,
+                c.email,
+                c.name,
+                c.channel,
+                c.source,
+                c.consent,
+                c.unsubscribed,
+                coalesce(max(s.sent_at), '') as last_sent
+            from contacts c
+            left join sends s on s.contact_id = c.id
+            group by c.id
+            order by c.id desc
+            """,
+            db,
+        )
+
+
+def execute(query: str, params: tuple = ()) -> None:
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute(query, params)
+        db.commit()
+
+
+def get_setting(key: str, default: str = "") -> str:
+    if not DB_PATH.exists():
+        return default
+    with sqlite3.connect(DB_PATH) as db:
+        row = db.execute("select value from settings where key = ?", (key,)).fetchone()
+        return str(row[0]) if row else default
+
+
+def save_setting(key: str, value: str) -> None:
+    execute(
+        "insert into settings(key, value) values(?, ?) on conflict(key) do update set value = excluded.value",
+        (key, value),
+    )
+
+
+def delete_setting(key: str) -> None:
+    execute("delete from settings where key = ?", (key,))
+
+
+def rows(query: str, params: tuple = ()) -> list[sqlite3.Row]:
+    with sqlite3.connect(DB_PATH) as db:
+        db.row_factory = sqlite3.Row
+        return list(db.execute(query, params))
+
+
+def smtp_configured() -> bool:
+    required = ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "MAIL_FROM"]
+    return all(get_secret(key) for key in required)
+
+
+def render_template(text: str, contact: sqlite3.Row, unsubscribe_url: str) -> str:
+    values = {
+        "name": contact["name"] or "ご担当者",
+        "email": contact["email"],
+        "channel": contact["channel"] or "貴チャンネル",
+        "unsubscribe_url": unsubscribe_url,
+    }
+    return Template(text).safe_substitute(values)
+
+
+def send_email(to_email: str, subject: str, body: str) -> tuple[bool, str]:
+    if not smtp_configured():
+        return True, "DRY_RUN: SMTP設定がないため実送信はしていません"
+
+    message = EmailMessage()
+    message["From"] = get_secret("MAIL_FROM")
+    message["To"] = to_email
+    message["Subject"] = subject
+    message.set_content(body)
+
+    host = get_secret("SMTP_HOST")
+    port = int(get_secret("SMTP_PORT", "587"))
+    use_ssl = get_secret("SMTP_SSL").lower() in {"1", "true", "yes"}
+
+    try:
+        if use_ssl:
+            with smtplib.SMTP_SSL(host, port, timeout=30) as smtp:
+                smtp.login(get_secret("SMTP_USER"), get_secret("SMTP_PASS"))
+                smtp.send_message(message)
+        else:
+            with smtplib.SMTP(host, port, timeout=30) as smtp:
+                smtp.starttls()
+                smtp.login(get_secret("SMTP_USER"), get_secret("SMTP_PASS"))
+                smtp.send_message(message)
+        return True, "送信しました"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def add_contact(email: str, name: str, channel: str, source: str, consent: bool) -> None:
+    execute(
+        """
+        insert or replace into contacts
+        (email, name, channel, source, consent, unsubscribed, token, created_at)
+        values (?, ?, ?, ?, ?, 0, ?, ?)
+        """,
+        (
+            email.strip().lower(),
+            name.strip(),
+            channel.strip(),
+            source.strip(),
+            1 if consent else 0,
+            secrets.token_urlsafe(24),
+            now_iso(),
+        ),
+    )
+
+
+def settings_panel() -> None:
+    st.subheader("送信元メール設定")
+    st.caption("ここで登録したメールアカウントから送信されます。相手には「送信者表示名 <送信元メールアドレス>」の形で見えます。")
+
+    current_from = get_setting("MAIL_FROM")
+    current_user = get_setting("SMTP_USER")
+    current_host = get_setting("SMTP_HOST", "smtp.gmail.com")
+    current_port = get_setting("SMTP_PORT", "587")
+    current_ssl = get_setting("SMTP_SSL", "false").lower() in {"1", "true", "yes"}
+    has_password = bool(get_setting("SMTP_PASS"))
+
+    with st.form("mail_settings"):
+        sender_name = st.text_input("送信者表示名", value=get_setting("SENDER_NAME", "UniVerse"))
+        sender_email = st.text_input("送信元メールアドレス", value=current_user)
         smtp_host = st.text_input("SMTPサーバー", value=current_host)
         smtp_port = st.text_input("SMTPポート", value=current_port)
         smtp_ssl = st.checkbox("SSL接続を使う", value=current_ssl)
