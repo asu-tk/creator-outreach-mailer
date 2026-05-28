@@ -680,16 +680,16 @@ https://universeapp.jp/
             st.write("検索条件に合う宛先はありません。")
             return
 
-        header = st.columns([2.4, 1.4, 1.8, 0.9, 1.5, 0.7, 0.7])
-        headers = ["email", "name", "channel", "状態", "last_sent", "保存", "削除"]
+        header = st.columns([2.0, 2.4, 1.4, 0.9, 1.5, 0.7, 0.7])
+        headers = ["channel", "email", "name", "状態", "last_sent", "保存", "削除"]
         for column, label in zip(header, headers):
             column.markdown(f"**{label}**")
 
         for row in contacts.itertuples():
-            columns = st.columns([2.4, 1.4, 1.8, 0.9, 1.5, 0.7, 0.7])
-            edited_email = columns[0].text_input("email", value=row.email or "", key=f"contact_email_{row.id}", label_visibility="collapsed")
-            edited_name = columns[1].text_input("name", value=row.name or "", key=f"contact_name_{row.id}", label_visibility="collapsed")
-            edited_channel = columns[2].text_input("channel", value=row.channel or "", key=f"contact_channel_{row.id}", label_visibility="collapsed")
+            columns = st.columns([2.0, 2.4, 1.4, 0.9, 1.5, 0.7, 0.7])
+            edited_channel = columns[0].text_input("channel", value=row.channel or "", key=f"contact_channel_{row.id}", label_visibility="collapsed")
+            edited_email = columns[1].text_input("email", value=row.email or "", key=f"contact_email_{row.id}", label_visibility="collapsed")
+            edited_name = columns[2].text_input("name", value=row.name or "", key=f"contact_name_{row.id}", label_visibility="collapsed")
             columns[3].write(row.状態)
             columns[4].write(row.last_sent or "-")
             if columns[5].button("保存", key=f"save_contact_{row.id}"):
