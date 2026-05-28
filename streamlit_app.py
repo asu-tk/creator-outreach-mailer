@@ -28,6 +28,10 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def today_key() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
 def get_secret(name: str, default: str = "") -> str:
     saved = get_setting(name)
     if saved:
@@ -88,6 +92,11 @@ def init_db() -> None:
                 description text not null default '',
                 keyword text not null default '',
                 created_at text not null
+            );
+
+            create table if not exists youtube_api_usage (
+                usage_date text primary key,
+                units integer not null default 0
             );
             """
         )
@@ -154,6 +163,37 @@ def execute(query: str, params: tuple = ()) -> None:
     with sqlite3.connect(DB_PATH) as db:
         db.execute(query, params)
         db.commit()
+
+
+def get_youtube_daily_limit() -> int:
+    value = get_setting("YOUTUBE_DAILY_LIMIT", "10000")
+    try:
+        return max(1, int(value))
+    except ValueError:
+        return 10000
+
+
+def estimate_youtube_units(max_results: int) -> int:
+    pages = max(1, (max(1, int(max_results)) + 49) // 50)
+    return pages * 101
+
+
+def get_youtube_units_used(date_key: str | None = None) -> int:
+    key = date_key or today_key()
+    result = rows("select units from youtube_api_usage where usage_date = ?", (key,))
+    return int(result[0]["units"]) if result else 0
+
+
+def add_youtube_units(units: int, date_key: str | None = None) -> None:
+    key = date_key or today_key()
+    execute(
+        """
+        insert into youtube_api_usage(usage_date, units)
+        values(?, ?)
+        on conflict(usage_date) do update set units = units + excluded.units
+        """,
+        (key, int(units)),
+    )
 
 
 def get_setting(key: str, default: str = "") -> str:
@@ -304,13 +344,15 @@ def save_candidate(candidate: dict, keyword: str) -> bool:
     return True
 
 
-def search_youtube_channels(keyword: str, min_subs: int, max_subs: int, max_results: int) -> tuple[int, int]:
+def search_youtube_channels(keyword: str, min_subs: int, max_subs: int, max_results: int) -> tuple[int, int, int]:
     found = 0
     saved = 0
+    units_used = 0
     page_token = ""
     max_results = max(1, min(max_results, 200))
 
     while found < max_results:
+        units_used += 100
         search_data = youtube_api_get(
             "search",
             {
@@ -329,6 +371,7 @@ def search_youtube_channels(keyword: str, min_subs: int, max_subs: int, max_resu
         if not channel_ids:
             break
 
+        units_used += 1
         channel_data = youtube_api_get(
             "channels",
             {
@@ -368,7 +411,8 @@ def search_youtube_channels(keyword: str, min_subs: int, max_subs: int, max_resu
         if not page_token:
             break
 
-    return found, saved
+    add_youtube_units(units_used)
+    return found, saved, units_used
 
 
 def rows(query: str, params: tuple = ()) -> list[sqlite3.Row]:
@@ -491,6 +535,7 @@ def settings_panel() -> None:
     current_port = get_setting("SMTP_PORT", "587")
     current_ssl = get_setting("SMTP_SSL", "false").lower() in {"1", "true", "yes"}
     current_youtube_api_key = get_setting("YOUTUBE_API_KEY")
+    current_youtube_daily_limit = get_youtube_daily_limit()
     has_password = bool(get_setting("SMTP_PASS"))
 
     with st.form("mail_settings"):
@@ -509,6 +554,12 @@ def settings_panel() -> None:
             type="password",
             placeholder="保存済み" if current_youtube_api_key else "Google Cloud ConsoleのAPIキー",
         )
+        youtube_daily_limit = st.number_input(
+            "YouTube API 1日上限 units",
+            min_value=1,
+            value=current_youtube_daily_limit,
+            step=100,
+        )
         submitted = st.form_submit_button("送信元設定を保存")
 
     if submitted:
@@ -523,6 +574,7 @@ def settings_panel() -> None:
             save_setting("SMTP_PASS", smtp_pass)
         if youtube_api_key:
             save_setting("YOUTUBE_API_KEY", youtube_api_key.strip())
+        save_setting("YOUTUBE_DAILY_LIMIT", str(int(youtube_daily_limit)))
         st.success(f"保存しました。相手には {mail_from} から届きます。")
 
     if current_from:
@@ -693,19 +745,37 @@ def main() -> None:
             yt_min_subs = st.number_input("登録者数 最小", min_value=0, value=1000, step=1000)
             yt_max_subs = st.number_input("登録者数 最大（0なら上限なし）", min_value=0, value=100000, step=1000)
             yt_max_results = st.number_input("最大取得件数", min_value=1, max_value=200, value=50)
+            daily_limit = get_youtube_daily_limit()
+            used_units = get_youtube_units_used()
+            estimated_units = estimate_youtube_units(int(yt_max_results))
+            remaining_units = max(0, daily_limit - used_units)
+            usage_ratio = min(1.0, used_units / daily_limit)
+            st.progress(usage_ratio)
+            st.caption(
+                f"YouTube API使用量（概算）: 今日 {used_units:,} / {daily_limit:,} units、"
+                f"残り目安 {remaining_units:,} units、今回予定 約{estimated_units:,} units"
+            )
+            if used_units >= daily_limit:
+                st.error("今日の推定上限に達しています。Google側のリセット後に再度試してください。")
+            elif used_units + estimated_units > daily_limit:
+                st.warning("この検索を実行すると、今日の推定上限を超える可能性があります。取得件数を減らしてください。")
+            elif used_units / daily_limit >= 0.8:
+                st.warning("YouTube API使用量が上限に近づいています。")
             yt_submitted = st.form_submit_button("候補を検索して保存")
         if yt_submitted:
             if not yt_keyword.strip():
                 st.error("検索キーワードを入力してください")
+            elif get_youtube_units_used() + estimate_youtube_units(int(yt_max_results)) > get_youtube_daily_limit():
+                st.error("推定上限を超えるため検索を止めました。最大取得件数を減らすか、明日以降に実行してください。")
             else:
                 try:
-                    checked, saved = search_youtube_channels(
+                    checked, saved, units_used = search_youtube_channels(
                         yt_keyword.strip(),
                         int(yt_min_subs),
                         int(yt_max_subs),
                         int(yt_max_results),
                     )
-                    st.success(f"{checked}件を確認し、新規候補を{saved}件保存しました。")
+                    st.success(f"{checked}件を確認し、新規候補を{saved}件保存しました。推定使用量: {units_used} units")
                 except Exception as exc:
                     st.error(str(exc))
 

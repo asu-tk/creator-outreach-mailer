@@ -87,6 +87,19 @@ APP_BASE_URL = "http://localhost:8501"
 
 公開URLを自分だけで使いたい場合は、Streamlit Cloud側で公開範囲や共有先を絞ってください。
 
+## YouTube API使用量メーター
+
+YouTube候補検索では、このアプリが実行した検索から推定した使用量を日別に記録します。Google Cloud Console側の正確な残量を直接取得するものではありません。
+
+目安:
+
+```text
+search.list: 100 units
+channels.list: 1 unit
+```
+
+通常の1ページ検索は約101 unitsとして計算します。標準上限は1日10,000 unitsですが、上限を変更している場合はアプリ画面の「YouTube API 1日上限 units」で調整できます。
+
 ## 旧ローカル版
 
 Streamlitを使わず、Codex同梱のPythonだけで起動する簡易版も残しています。
