@@ -681,7 +681,7 @@ https://universeapp.jp/
             return
 
         header = st.columns([2.0, 2.4, 1.4, 0.9, 1.5, 0.7, 0.7])
-        headers = ["channel", "email", "name", "状態", "last_sent", "保存", "削除"]
+        headers = ["チャンネル", "email", "name", "状態", "last_sent", "保存", "削除"]
         for column, label in zip(header, headers):
             column.markdown(f"**{label}**")
 
