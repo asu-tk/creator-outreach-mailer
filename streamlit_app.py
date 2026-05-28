@@ -5,6 +5,9 @@ import secrets
 import smtplib
 import sqlite3
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
@@ -65,6 +68,19 @@ def init_db() -> None:
                 key text primary key,
                 value text not null
             );
+
+            create table if not exists youtube_candidates (
+                id integer primary key autoincrement,
+                channel_id text not null unique,
+                title text not null default '',
+                channel_url text not null default '',
+                subscriber_count integer not null default 0,
+                video_count integer not null default 0,
+                view_count integer not null default 0,
+                description text not null default '',
+                keyword text not null default '',
+                created_at text not null
+            );
             """
         )
 
@@ -85,6 +101,26 @@ def fetch_contacts() -> pd.DataFrame:
             left join sends s on s.contact_id = c.id
             group by c.id
             order by c.id desc
+            """,
+            db,
+        )
+
+
+def fetch_candidates() -> pd.DataFrame:
+    with sqlite3.connect(DB_PATH) as db:
+        return pd.read_sql_query(
+            """
+            select
+                id,
+                title,
+                channel_url,
+                subscriber_count,
+                video_count,
+                view_count,
+                keyword,
+                created_at
+            from youtube_candidates
+            order by id desc
             """,
             db,
         )
@@ -120,11 +156,122 @@ def delete_contact(contact_id: int) -> None:
     execute("delete from contacts where id = ?", (contact_id,))
 
 
+def delete_candidate(candidate_id: int) -> None:
+    execute("delete from youtube_candidates where id = ?", (candidate_id,))
+
+
 def contact_exists(email: str) -> bool:
     normalized_email = email.strip().lower()
     if not normalized_email:
         return False
     return bool(rows("select id from contacts where email = ?", (normalized_email,)))
+
+
+def youtube_api_get(path: str, params: dict[str, str | int]) -> dict:
+    api_key = get_secret("YOUTUBE_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("YouTube APIキーが未設定です")
+    query = urllib.parse.urlencode({**params, "key": api_key})
+    url = f"https://www.googleapis.com/youtube/v3/{path}?{query}"
+    try:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            import json
+
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"YouTube APIエラー: {exc.code} {detail[:300]}") from exc
+
+
+def save_candidate(candidate: dict, keyword: str) -> bool:
+    execute(
+        """
+        insert or ignore into youtube_candidates
+        (channel_id, title, channel_url, subscriber_count, video_count, view_count, description, keyword, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            candidate["channel_id"],
+            candidate["title"],
+            candidate["channel_url"],
+            int(candidate.get("subscriber_count", 0)),
+            int(candidate.get("video_count", 0)),
+            int(candidate.get("view_count", 0)),
+            candidate.get("description", ""),
+            keyword,
+            now_iso(),
+        ),
+    )
+    return True
+
+
+def search_youtube_channels(keyword: str, min_subs: int, max_subs: int, max_results: int) -> tuple[int, int]:
+    found = 0
+    saved = 0
+    page_token = ""
+    max_results = max(1, min(max_results, 200))
+
+    while found < max_results:
+        search_data = youtube_api_get(
+            "search",
+            {
+                "part": "snippet",
+                "type": "channel",
+                "q": keyword,
+                "maxResults": min(50, max_results - found),
+                "pageToken": page_token,
+            },
+        )
+        channel_ids = [
+            item["snippet"]["channelId"]
+            for item in search_data.get("items", [])
+            if item.get("snippet", {}).get("channelId")
+        ]
+        if not channel_ids:
+            break
+
+        channel_data = youtube_api_get(
+            "channels",
+            {
+                "part": "snippet,statistics",
+                "id": ",".join(channel_ids),
+                "maxResults": 50,
+            },
+        )
+
+        for item in channel_data.get("items", []):
+            stats = item.get("statistics", {})
+            snippet = item.get("snippet", {})
+            subscriber_count = int(stats.get("subscriberCount", 0))
+            if subscriber_count < min_subs:
+                continue
+            if max_subs and subscriber_count > max_subs:
+                continue
+
+            channel_id = item["id"]
+            before = rows("select id from youtube_candidates where channel_id = ?", (channel_id,))
+            save_candidate(
+                {
+                    "channel_id": channel_id,
+                    "title": snippet.get("title", ""),
+                    "channel_url": f"https://www.youtube.com/channel/{channel_id}",
+                    "subscriber_count": subscriber_count,
+                    "video_count": int(stats.get("videoCount", 0)),
+                    "view_count": int(stats.get("viewCount", 0)),
+                    "description": snippet.get("description", ""),
+                },
+                keyword,
+            )
+            after = rows("select id from youtube_candidates where channel_id = ?", (channel_id,))
+            if not before and after:
+                saved += 1
+
+        found += len(channel_ids)
+        page_token = search_data.get("nextPageToken", "")
+        if not page_token:
+            break
+
+    return found, saved
 
 
 def rows(query: str, params: tuple = ()) -> list[sqlite3.Row]:
@@ -219,6 +366,7 @@ def settings_panel() -> None:
     current_host = get_setting("SMTP_HOST", "smtp.gmail.com")
     current_port = get_setting("SMTP_PORT", "587")
     current_ssl = get_setting("SMTP_SSL", "false").lower() in {"1", "true", "yes"}
+    current_youtube_api_key = get_setting("YOUTUBE_API_KEY")
     has_password = bool(get_setting("SMTP_PASS"))
 
     with st.form("mail_settings"):
@@ -232,6 +380,11 @@ def settings_panel() -> None:
             type="password",
             placeholder="保存済み" if has_password else "Gmailの場合はアプリパスワード",
         )
+        youtube_api_key = st.text_input(
+            "YouTube APIキー",
+            type="password",
+            placeholder="保存済み" if current_youtube_api_key else "Google Cloud ConsoleのAPIキー",
+        )
         submitted = st.form_submit_button("送信元設定を保存")
 
     if submitted:
@@ -244,15 +397,19 @@ def settings_panel() -> None:
         save_setting("SMTP_SSL", "true" if smtp_ssl else "false")
         if smtp_pass:
             save_setting("SMTP_PASS", smtp_pass)
+        if youtube_api_key:
+            save_setting("YOUTUBE_API_KEY", youtube_api_key.strip())
         st.success(f"保存しました。相手には {mail_from} から届きます。")
 
     if current_from:
         st.write(f"現在の表示: `{current_from}`")
     if has_password:
         st.caption("パスワードは保存済みです。変更したい時だけ新しいパスワードを入力してください。")
+    if current_youtube_api_key:
+        st.caption("YouTube APIキーは保存済みです。変更したい時だけ新しいキーを入力してください。")
 
     if st.button("送信元設定を削除"):
-        for key in ["SENDER_NAME", "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "MAIL_FROM", "SMTP_SSL", "APP_BASE_URL", "UNSUBSCRIBE_EMAIL"]:
+        for key in ["SENDER_NAME", "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "MAIL_FROM", "SMTP_SSL", "APP_BASE_URL", "UNSUBSCRIBE_EMAIL", "YOUTUBE_API_KEY"]:
             delete_setting(key)
         st.success("送信元設定を削除しました")
         st.rerun()
@@ -330,6 +487,29 @@ def main() -> None:
         if uploaded and st.button("取り込む"):
             added, skipped = import_csv(uploaded)
             st.success(f"{added}件を取り込みました。重複は{skipped}件スキップしました。")
+
+        st.subheader("YouTube候補検索")
+        st.caption("メールアドレスは取得しません。条件に合うチャンネル候補だけを保存します。")
+        with st.form("youtube_search"):
+            yt_keyword = st.text_input("検索キーワード", placeholder="例: 料理 レシピ / ゲーム実況 / 英会話")
+            yt_min_subs = st.number_input("登録者数 最小", min_value=0, value=1000, step=1000)
+            yt_max_subs = st.number_input("登録者数 最大（0なら上限なし）", min_value=0, value=100000, step=1000)
+            yt_max_results = st.number_input("最大取得件数", min_value=1, max_value=200, value=50)
+            yt_submitted = st.form_submit_button("候補を検索して保存")
+        if yt_submitted:
+            if not yt_keyword.strip():
+                st.error("検索キーワードを入力してください")
+            else:
+                try:
+                    checked, saved = search_youtube_channels(
+                        yt_keyword.strip(),
+                        int(yt_min_subs),
+                        int(yt_max_subs),
+                        int(yt_max_results),
+                    )
+                    st.success(f"{checked}件を確認し、新規候補を{saved}件保存しました。")
+                except Exception as exc:
+                    st.error(str(exc))
 
     with right:
         st.subheader("メール作成")
@@ -487,6 +667,45 @@ https://universeapp.jp/
             if columns[5].button("削除", key=f"delete_contact_{row.id}"):
                 delete_contact(int(row.id))
                 st.success(f"{row.email} を削除しました")
+                st.rerun()
+
+    st.divider()
+    st.subheader("YouTube候補一覧")
+    candidates = fetch_candidates()
+    if candidates.empty:
+        st.write("まだ候補チャンネルがありません。")
+    else:
+        candidate_search = st.text_input(
+            "候補一覧を検索",
+            placeholder="チャンネル名、検索キーワードで検索",
+        ).strip().lower()
+        if candidate_search:
+            mask = candidates[["title", "keyword"]].fillna("").astype(str).apply(
+                lambda column: column.str.lower().str.contains(candidate_search, regex=False)
+            ).any(axis=1)
+            candidates = candidates[mask]
+
+        st.caption(f"{len(candidates)}件表示中")
+        if candidates.empty:
+            st.write("検索条件に合う候補はありません。")
+            return
+
+        header = st.columns([2.2, 1.0, 1.0, 1.0, 1.2, 1.0, 0.7])
+        headers = ["チャンネル", "登録者数", "動画数", "総再生数", "検索キーワード", "開く", ""]
+        for column, label in zip(header, headers):
+            column.markdown(f"**{label}**")
+
+        for row in candidates.itertuples():
+            columns = st.columns([2.2, 1.0, 1.0, 1.0, 1.2, 1.0, 0.7])
+            columns[0].write(row.title or "-")
+            columns[1].write(f"{int(row.subscriber_count):,}")
+            columns[2].write(f"{int(row.video_count):,}")
+            columns[3].write(f"{int(row.view_count):,}")
+            columns[4].write(row.keyword or "-")
+            columns[5].markdown(f"[YouTubeで開く]({row.channel_url})")
+            if columns[6].button("削除", key=f"delete_candidate_{row.id}"):
+                delete_candidate(int(row.id))
+                st.success(f"{row.title} を削除しました")
                 st.rerun()
 
 
