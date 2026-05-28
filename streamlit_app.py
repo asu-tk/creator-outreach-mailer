@@ -117,11 +117,12 @@ def fetch_contacts() -> pd.DataFrame:
                 c.channel,
                 c.consent,
                 c.unsubscribed,
+                c.created_at,
                 coalesce(max(s.sent_at), '') as last_sent
             from contacts c
             left join sends s on s.contact_id = c.id
             group by c.id
-            order by c.id desc
+            order by c.id asc
             """,
             db,
         )
@@ -752,10 +753,19 @@ https://universeapp.jp/
     if contacts.empty:
         st.write("まだ宛先がありません。")
     else:
-        search_text = st.text_input(
+        search_col, sort_col, direction_col = st.columns([2.4, 1.2, 1.0])
+        search_text = search_col.text_input(
             "宛先一覧を検索",
             placeholder="メールアドレス、名前、チャンネル名で検索",
         ).strip().lower()
+        sort_key = sort_col.selectbox(
+            "並び順",
+            options=["登録順", "最終送信"],
+        )
+        sort_direction = direction_col.selectbox(
+            "向き",
+            options=["古い順", "新しい順"],
+        )
         contacts["状態"] = contacts.apply(
             lambda row: "停止" if row["unsubscribed"] else ("送信可" if row["consent"] else "要確認"),
             axis=1,
@@ -767,6 +777,13 @@ https://universeapp.jp/
                 lambda column: column.str.lower().str.contains(search_text, regex=False)
             ).any(axis=1)
             contacts = contacts[mask]
+
+        ascending = sort_direction == "古い順"
+        if sort_key == "登録順":
+            contacts = contacts.sort_values(["id"], ascending=ascending)
+        else:
+            contacts["_last_sent_sort"] = contacts["last_sent"].replace("", "9999-12-31T23:59:59+00:00" if ascending else "")
+            contacts = contacts.sort_values(["_last_sent_sort", "id"], ascending=[ascending, True])
 
         st.caption(f"{len(contacts)}件表示中")
 
