@@ -754,6 +754,7 @@ def main() -> None:
             f"YouTube API使用量（概算）: 今日 {used_units:,} / {daily_limit:,} units、"
             f"残り目安 {remaining_units:,} units、今回予定 約{estimated_units:,} units"
         )
+        st.caption("目安: YouTube APIは50件ごとに1ページ扱いです。1〜50件は約101 units、51〜100件は約202 units、101〜150件は約303 unitsです。")
         if used_units >= daily_limit:
             st.error("今日の推定上限に達しています。Google側のリセット後に再度試してください。")
         elif used_units + estimated_units > daily_limit:
