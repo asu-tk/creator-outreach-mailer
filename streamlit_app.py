@@ -48,6 +48,12 @@ def init_db() -> None:
                 name text not null default '',
                 channel text not null default '',
                 youtube_channel_id text not null default '',
+                youtube_channel_url text not null default '',
+                youtube_subscriber_count integer not null default 0,
+                youtube_video_count integer not null default 0,
+                youtube_view_count integer not null default 0,
+                youtube_keyword text not null default '',
+                youtube_description text not null default '',
                 source text not null default '',
                 consent integer not null default 0,
                 unsubscribed integer not null default 0,
@@ -85,8 +91,18 @@ def init_db() -> None:
             """
         )
         columns = [row[1] for row in db.execute("pragma table_info(contacts)").fetchall()]
-        if "youtube_channel_id" not in columns:
-            db.execute("alter table contacts add column youtube_channel_id text not null default ''")
+        migrations = {
+            "youtube_channel_id": "alter table contacts add column youtube_channel_id text not null default ''",
+            "youtube_channel_url": "alter table contacts add column youtube_channel_url text not null default ''",
+            "youtube_subscriber_count": "alter table contacts add column youtube_subscriber_count integer not null default 0",
+            "youtube_video_count": "alter table contacts add column youtube_video_count integer not null default 0",
+            "youtube_view_count": "alter table contacts add column youtube_view_count integer not null default 0",
+            "youtube_keyword": "alter table contacts add column youtube_keyword text not null default ''",
+            "youtube_description": "alter table contacts add column youtube_description text not null default ''",
+        }
+        for column, statement in migrations.items():
+            if column not in columns:
+                db.execute(statement)
         db.commit()
 
 
@@ -182,12 +198,17 @@ def save_candidate_from_contact(contact_id: int) -> tuple[bool, str]:
         """
         insert into youtube_candidates
         (channel_id, title, channel_url, subscriber_count, video_count, view_count, description, keyword, created_at)
-        values (?, ?, ?, 0, 0, 0, '', '宛先から戻す', ?)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             channel_id,
             item["channel"],
-            f"https://www.youtube.com/channel/{channel_id}",
+            item["youtube_channel_url"] or f"https://www.youtube.com/channel/{channel_id}",
+            int(item["youtube_subscriber_count"]),
+            int(item["youtube_video_count"]),
+            int(item["youtube_view_count"]),
+            item["youtube_description"],
+            item["youtube_keyword"],
             now_iso(),
         ),
     )
@@ -409,7 +430,19 @@ def send_email(to_email: str, subject: str, body: str) -> tuple[bool, str]:
         return False, str(exc)
 
 
-def add_contact(email: str, name: str, channel: str, consent: bool, youtube_channel_id: str = "") -> bool:
+def add_contact(
+    email: str,
+    name: str,
+    channel: str,
+    consent: bool,
+    youtube_channel_id: str = "",
+    youtube_channel_url: str = "",
+    youtube_subscriber_count: int = 0,
+    youtube_video_count: int = 0,
+    youtube_view_count: int = 0,
+    youtube_keyword: str = "",
+    youtube_description: str = "",
+) -> bool:
     normalized_email = email.strip().lower()
     if normalized_email and contact_exists(normalized_email):
         return False
@@ -420,14 +453,24 @@ def add_contact(email: str, name: str, channel: str, consent: bool, youtube_chan
     execute(
         """
         insert into contacts
-        (email, name, channel, youtube_channel_id, source, consent, unsubscribed, token, created_at)
-        values (?, ?, ?, ?, '', ?, 0, ?, ?)
+        (
+            email, name, channel, youtube_channel_id, youtube_channel_url,
+            youtube_subscriber_count, youtube_video_count, youtube_view_count,
+            youtube_keyword, youtube_description, source, consent, unsubscribed, token, created_at
+        )
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, 0, ?, ?)
         """,
         (
             normalized_email,
             name.strip(),
             channel.strip(),
             youtube_channel_id.strip(),
+            youtube_channel_url.strip(),
+            int(youtube_subscriber_count),
+            int(youtube_video_count),
+            int(youtube_view_count),
+            youtube_keyword.strip(),
+            youtube_description.strip(),
             1 if consent else 0,
             secrets.token_urlsafe(24),
             now_iso(),
@@ -797,7 +840,21 @@ https://universeapp.jp/
             columns[4].write(row.keyword or "-")
             columns[5].markdown(f"[YouTubeで開く]({row.channel_url})")
             if columns[6].button("宛先に登録", key=f"candidate_to_contact_{row.id}"):
-                added = add_contact("", "", row.title or "", True, row.channel_id)
+                candidate_detail = rows("select * from youtube_candidates where id = ?", (int(row.id),))
+                candidate = candidate_detail[0] if candidate_detail else None
+                added = add_contact(
+                    "",
+                    "",
+                    row.title or "",
+                    True,
+                    row.channel_id,
+                    row.channel_url,
+                    int(row.subscriber_count),
+                    int(row.video_count),
+                    int(row.view_count),
+                    row.keyword or "",
+                    candidate["description"] if candidate else "",
+                )
                 if added:
                     delete_candidate(int(row.id))
                     st.success(f"{row.title} を宛先一覧に追加しました。メールアドレスを入力して保存してください。")
