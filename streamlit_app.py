@@ -219,7 +219,6 @@ def settings_panel() -> None:
     current_host = get_setting("SMTP_HOST", "smtp.gmail.com")
     current_port = get_setting("SMTP_PORT", "587")
     current_ssl = get_setting("SMTP_SSL", "false").lower() in {"1", "true", "yes"}
-    current_unsubscribe_email = get_setting("UNSUBSCRIBE_EMAIL") or current_user
     has_password = bool(get_setting("SMTP_PASS"))
 
     with st.form("mail_settings"):
@@ -228,11 +227,6 @@ def settings_panel() -> None:
         smtp_host = st.text_input("SMTPサーバー", value=current_host)
         smtp_port = st.text_input("SMTPポート", value=current_port)
         smtp_ssl = st.checkbox("SSL接続を使う", value=current_ssl)
-        unsubscribe_email = st.text_input(
-            "配信停止受付メールアドレス",
-            value=current_unsubscribe_email,
-            placeholder="例: info@universeapp.jp",
-        )
         smtp_pass = st.text_input(
             "SMTPパスワード / アプリパスワード",
             type="password",
@@ -248,15 +242,12 @@ def settings_panel() -> None:
         save_setting("SMTP_USER", sender_email.strip())
         save_setting("MAIL_FROM", mail_from)
         save_setting("SMTP_SSL", "true" if smtp_ssl else "false")
-        save_setting("UNSUBSCRIBE_EMAIL", unsubscribe_email.strip() or sender_email.strip())
         if smtp_pass:
             save_setting("SMTP_PASS", smtp_pass)
         st.success(f"保存しました。相手には {mail_from} から届きます。")
 
     if current_from:
         st.write(f"現在の表示: `{current_from}`")
-    if current_unsubscribe_email:
-        st.write(f"配信停止受付: `{current_unsubscribe_email}`")
     if has_password:
         st.caption("パスワードは保存済みです。変更したい時だけ新しいパスワードを入力してください。")
 
@@ -280,12 +271,11 @@ def import_csv(uploaded_file) -> tuple[int, int]:
             skipped += 1
             continue
         seen_in_file.add(email)
-        consent = str(row.get("consent", "")).strip().lower() in {"1", "yes", "true", "y"}
         was_added = add_contact(
             email=email,
             name=str(row.get("name", "")),
             channel=str(row.get("channel", "")),
-            consent=consent,
+            consent=True,
         )
         if was_added:
             added += 1
@@ -336,7 +326,7 @@ def main() -> None:
 
         st.subheader("CSV取り込み")
         uploaded = st.file_uploader("CSVファイル", type=["csv"])
-        st.caption("列: email, name, channel, consent")
+        st.caption("列: email, name, channel。CSVで取り込んだ宛先は自動的に送信可になります。")
         if uploaded and st.button("取り込む"):
             added, skipped = import_csv(uploaded)
             st.success(f"{added}件を取り込みました。重複は{skipped}件スキップしました。")
@@ -386,8 +376,7 @@ YouTubeサブスク型翻訳アプリ｜UniVerse
 https://universeapp.jp/
 
 
-不要な場合はこちらから配信停止できます。
-${unsubscribe_url}""",
+不要な場合は、お手数ですが「配信停止希望」とご返信ください。""",
             height=560,
         )
         delay = st.number_input("送信間隔（秒）", min_value=1, max_value=60, value=3)
@@ -413,10 +402,6 @@ ${unsubscribe_url}""",
                 progress = st.progress(0)
                 log = st.empty()
                 sent = failed = 0
-                if not get_secret("UNSUBSCRIBE_EMAIL", "") and not get_secret("SMTP_USER", ""):
-                    st.error("配信停止受付メールアドレスが未設定です。左側の送信元メール設定で保存してください。")
-                    st.stop()
-
                 for index, contact in enumerate(contacts):
                     unsubscribe_url = build_unsubscribe_mailto(contact)
                     subject = render_template(subject_template, contact, unsubscribe_url)
