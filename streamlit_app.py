@@ -166,6 +166,35 @@ def delete_candidate(candidate_id: int) -> None:
     execute("delete from youtube_candidates where id = ?", (candidate_id,))
 
 
+def save_candidate_from_contact(contact_id: int) -> tuple[bool, str]:
+    contact = rows("select * from contacts where id = ?", (contact_id,))
+    if not contact:
+        return False, "宛先が見つかりません"
+    item = contact[0]
+    channel_id = item["youtube_channel_id"]
+    if not channel_id:
+        return False, "この宛先はYouTube候補から登録されたものではありません"
+    if youtube_channel_in_candidates(channel_id):
+        delete_contact(contact_id)
+        return True, "すでに候補一覧にあるため、宛先一覧からだけ削除しました"
+
+    execute(
+        """
+        insert into youtube_candidates
+        (channel_id, title, channel_url, subscriber_count, video_count, view_count, description, keyword, created_at)
+        values (?, ?, ?, 0, 0, 0, '', '宛先から戻す', ?)
+        """,
+        (
+            channel_id,
+            item["channel"],
+            f"https://www.youtube.com/channel/{channel_id}",
+            now_iso(),
+        ),
+    )
+    delete_contact(contact_id)
+    return True, "YouTube候補一覧に戻しました"
+
+
 def contact_exists(email: str) -> bool:
     normalized_email = email.strip().lower()
     if not normalized_email:
@@ -702,26 +731,33 @@ https://universeapp.jp/
             st.write("検索条件に合う宛先はありません。")
             return
 
-        header = st.columns([2.0, 2.4, 1.4, 0.9, 1.5, 0.7, 0.7])
-        headers = ["チャンネル", "email", "name", "状態", "last_sent", "保存", "削除"]
+        header = st.columns([2.0, 2.4, 1.4, 0.9, 1.5, 0.9, 0.7, 0.7])
+        headers = ["チャンネル", "email", "name", "状態", "last_sent", "候補へ戻す", "保存", "削除"]
         for column, label in zip(header, headers):
             column.markdown(f"**{label}**")
 
         for row in contacts.itertuples():
-            columns = st.columns([2.0, 2.4, 1.4, 0.9, 1.5, 0.7, 0.7])
+            columns = st.columns([2.0, 2.4, 1.4, 0.9, 1.5, 0.9, 0.7, 0.7])
             edited_channel = columns[0].text_input("channel", value=row.channel or "", key=f"contact_channel_{row.id}", label_visibility="collapsed")
             edited_email = columns[1].text_input("email", value=row.email or "", key=f"contact_email_{row.id}", label_visibility="collapsed")
             edited_name = columns[2].text_input("name", value=row.name or "", key=f"contact_name_{row.id}", label_visibility="collapsed")
             columns[3].write(row.状態)
             columns[4].write(row.last_sent or "-")
-            if columns[5].button("保存", key=f"save_contact_{row.id}"):
+            if columns[5].button("戻す", key=f"restore_candidate_{row.id}"):
+                ok, message = save_candidate_from_contact(int(row.id))
+                if ok:
+                    st.success(message)
+                    st.rerun()
+                else:
+                    st.warning(message)
+            if columns[6].button("保存", key=f"save_contact_{row.id}"):
                 ok, message = update_contact(int(row.id), edited_email, edited_name, edited_channel, True)
                 if ok:
                     st.success(message)
                     st.rerun()
                 else:
                     st.error(message)
-            if columns[6].button("削除", key=f"delete_contact_{row.id}"):
+            if columns[7].button("削除", key=f"delete_contact_{row.id}"):
                 delete_contact(int(row.id))
                 st.success(f"{row.email} を削除しました")
                 st.rerun()
