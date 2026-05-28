@@ -740,28 +740,27 @@ def main() -> None:
 
         st.subheader("YouTube候補検索")
         st.caption("メールアドレスは取得しません。条件に合うチャンネル候補だけを保存します。")
-        with st.form("youtube_search"):
-            yt_keyword = st.text_input("検索キーワード", placeholder="例: 料理 レシピ / ゲーム実況 / 英会話")
-            yt_min_subs = st.number_input("登録者数 最小", min_value=0, value=1000, step=1000)
-            yt_max_subs = st.number_input("登録者数 最大（0なら上限なし）", min_value=0, value=100000, step=1000)
-            yt_max_results = st.number_input("最大取得件数", min_value=1, max_value=200, value=50)
-            daily_limit = get_youtube_daily_limit()
-            used_units = get_youtube_units_used()
-            estimated_units = estimate_youtube_units(int(yt_max_results))
-            remaining_units = max(0, daily_limit - used_units)
-            usage_ratio = min(1.0, used_units / daily_limit)
-            st.progress(usage_ratio)
-            st.caption(
-                f"YouTube API使用量（概算）: 今日 {used_units:,} / {daily_limit:,} units、"
-                f"残り目安 {remaining_units:,} units、今回予定 約{estimated_units:,} units"
-            )
-            if used_units >= daily_limit:
-                st.error("今日の推定上限に達しています。Google側のリセット後に再度試してください。")
-            elif used_units + estimated_units > daily_limit:
-                st.warning("この検索を実行すると、今日の推定上限を超える可能性があります。取得件数を減らしてください。")
-            elif used_units / daily_limit >= 0.8:
-                st.warning("YouTube API使用量が上限に近づいています。")
-            yt_submitted = st.form_submit_button("候補を検索して保存")
+        yt_keyword = st.text_input("検索キーワード", placeholder="例: 料理 レシピ / ゲーム実況 / 英会話")
+        yt_min_subs = st.number_input("登録者数 最小", min_value=0, value=1000, step=1000)
+        yt_max_subs = st.number_input("登録者数 最大（0なら上限なし）", min_value=0, value=100000, step=1000)
+        yt_max_results = st.number_input("最大取得件数", min_value=1, max_value=200, value=50)
+        daily_limit = get_youtube_daily_limit()
+        used_units = get_youtube_units_used()
+        estimated_units = estimate_youtube_units(int(yt_max_results))
+        remaining_units = max(0, daily_limit - used_units)
+        usage_ratio = min(1.0, used_units / daily_limit)
+        st.progress(usage_ratio)
+        st.caption(
+            f"YouTube API使用量（概算）: 今日 {used_units:,} / {daily_limit:,} units、"
+            f"残り目安 {remaining_units:,} units、今回予定 約{estimated_units:,} units"
+        )
+        if used_units >= daily_limit:
+            st.error("今日の推定上限に達しています。Google側のリセット後に再度試してください。")
+        elif used_units + estimated_units > daily_limit:
+            st.warning("この検索を実行すると、今日の推定上限を超える可能性があります。取得件数を減らしてください。")
+        elif used_units / daily_limit >= 0.8:
+            st.warning("YouTube API使用量が上限に近づいています。")
+        yt_submitted = st.button("候補を検索して保存")
         if yt_submitted:
             if not yt_keyword.strip():
                 st.error("検索キーワードを入力してください")
