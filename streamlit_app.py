@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import secrets
 import smtplib
 import sqlite3
@@ -538,13 +539,80 @@ def settings_panel() -> None:
         st.rerun()
 
 
-def import_csv(uploaded_file) -> tuple[int, int]:
-    frame = pd.read_csv(uploaded_file).fillna("")
+def normalize_column_name(value: object) -> str:
+    return re.sub(r"[\s_\-　]+", "", str(value).strip().lower())
+
+
+def find_column(frame: pd.DataFrame, aliases: set[str]) -> str | None:
+    normalized_aliases = {normalize_column_name(alias) for alias in aliases}
+    for column in frame.columns:
+        if normalize_column_name(column) in normalized_aliases:
+            return str(column)
+    return None
+
+
+def guess_email_column(frame: pd.DataFrame) -> str | None:
+    email_pattern = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+    best_column = None
+    best_count = 0
+    for column in frame.columns:
+        count = frame[column].fillna("").astype(str).str.strip().apply(
+            lambda value: bool(email_pattern.match(value))
+        ).sum()
+        if count > best_count:
+            best_column = str(column)
+            best_count = int(count)
+    return best_column if best_count else None
+
+
+def read_contacts_file(uploaded_file) -> pd.DataFrame:
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        return pd.read_csv(uploaded_file).fillna("")
+    if name.endswith(".tsv"):
+        return pd.read_csv(uploaded_file, sep="\t").fillna("")
+    if name.endswith((".xlsx", ".xls")):
+        return pd.read_excel(uploaded_file).fillna("")
+    raise ValueError("対応している形式は CSV / TSV / XLSX / XLS です")
+
+
+def import_contacts_file(uploaded_file) -> tuple[int, int, dict[str, str | None]]:
+    frame = read_contacts_file(uploaded_file)
+    email_column = find_column(
+        frame,
+        {
+            "email",
+            "e-mail",
+            "mail",
+            "メール",
+            "メールアドレス",
+            "メアド",
+            "連絡先",
+            "emailaddress",
+        },
+    ) or guess_email_column(frame)
+    name_column = find_column(frame, {"name", "名前", "担当者", "担当者名", "contact", "contactname"})
+    channel_column = find_column(
+        frame,
+        {
+            "channel",
+            "channelname",
+            "チャンネル",
+            "チャンネル名",
+            "youtube",
+            "youtubeチャンネル",
+            "youtubeチャンネル名",
+        },
+    )
+
+    if not email_column:
+        raise ValueError("メールアドレスの列を見つけられませんでした。列名に email または メールアドレス を入れてください。")
+
     added = 0
     skipped = 0
     seen_in_file: set[str] = set()
     for _, row in frame.iterrows():
-        email = str(row.get("email", "")).strip().lower()
+        email = str(row.get(email_column, "")).strip().lower()
         if not email:
             continue
         if email in seen_in_file:
@@ -553,15 +621,15 @@ def import_csv(uploaded_file) -> tuple[int, int]:
         seen_in_file.add(email)
         was_added = add_contact(
             email=email,
-            name=str(row.get("name", "")),
-            channel=str(row.get("channel", "")),
+            name=str(row.get(name_column, "")) if name_column else "",
+            channel=str(row.get(channel_column, "")) if channel_column else "",
             consent=True,
         )
         if was_added:
             added += 1
         else:
             skipped += 1
-    return added, skipped
+    return added, skipped, {"email": email_column, "name": name_column, "channel": channel_column}
 
 
 def main() -> None:
@@ -604,12 +672,19 @@ def main() -> None:
             else:
                 st.error("メールアドレスを入力してください")
 
-        st.subheader("CSV取り込み")
-        uploaded = st.file_uploader("CSVファイル", type=["csv"])
-        st.caption("列: email, name, channel。CSVで取り込んだ宛先は自動的に送信可になります。")
+        st.subheader("ファイル取り込み")
+        uploaded = st.file_uploader("CSV / Excelファイル", type=["csv", "tsv", "xlsx", "xls"])
+        st.caption("email / メールアドレス、channel / チャンネル名、name / 名前 などの列名を自動判別します。取り込んだ宛先は自動的に送信可になります。")
         if uploaded and st.button("取り込む"):
-            added, skipped = import_csv(uploaded)
-            st.success(f"{added}件を取り込みました。重複は{skipped}件スキップしました。")
+            try:
+                added, skipped, mapping = import_contacts_file(uploaded)
+                st.success(f"{added}件を取り込みました。重複や空欄は{skipped}件スキップしました。")
+                st.caption(
+                    f"判別した列: email={mapping['email'] or '-'} / "
+                    f"channel={mapping['channel'] or '-'} / name={mapping['name'] or '-'}"
+                )
+            except Exception as exc:
+                st.error(str(exc))
 
         st.subheader("YouTube候補検索")
         st.caption("メールアドレスは取得しません。条件に合うチャンネル候補だけを保存します。")
