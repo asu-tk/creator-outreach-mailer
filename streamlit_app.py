@@ -378,24 +378,42 @@ https://universeapp.jp/
             height=560,
         )
         delay = st.number_input("送信間隔（秒）", min_value=1, max_value=60, value=3)
+        send_limit = st.number_input("今回送信する件数", min_value=1, max_value=500, value=50)
         confirmed = st.checkbox("送信対象が許諾済み、または法的に送信可能な宛先であることを確認しました")
 
         target_count = rows("select count(*) as count from contacts where consent = 1 and unsubscribed = 0")[0]["count"]
         st.metric("送信対象", f"{target_count}件")
+        st.caption("送信対象は、未送信の宛先を優先し、その後は最終送信日時が古い順に選ばれます。")
 
         test_button, send_button = st.columns(2)
         with test_button:
             run_test = st.button("最初の1件でテスト", use_container_width=True)
         with send_button:
-            run_all = st.button("送信対象全員へ送信", type="primary", use_container_width=True)
+            run_all = st.button("指定件数を送信", type="primary", use_container_width=True)
 
         if run_test or run_all:
             if not confirmed:
                 st.error("送信前の確認にチェックしてください")
             else:
-                contacts = rows("select * from contacts where consent = 1 and unsubscribed = 0 order by id")
+                contacts = rows(
+                    """
+                    select
+                        c.*,
+                        max(s.sent_at) as last_sent
+                    from contacts c
+                    left join sends s on s.contact_id = c.id and s.status = 'sent'
+                    where c.consent = 1 and c.unsubscribed = 0
+                    group by c.id
+                    order by
+                        case when max(s.sent_at) is null then 0 else 1 end,
+                        max(s.sent_at) asc,
+                        c.id asc
+                    """
+                )
                 if run_test:
                     contacts = contacts[:1]
+                else:
+                    contacts = contacts[: int(send_limit)]
 
                 progress = st.progress(0)
                 log = st.empty()
