@@ -986,18 +986,33 @@ https://universeapp.jp/
             contacts["_last_sent_sort"] = contacts["last_sent"].replace("", "9999-12-31T23:59:59+00:00" if ascending else "")
             contacts = contacts.sort_values(["_last_sent_sort", "id"], ascending=[ascending, True])
 
-        st.caption(f"{len(contacts)}件表示中")
-
         if contacts.empty:
             st.write("検索条件に合う宛先はありません。")
             return
+
+        total_contacts = len(contacts)
+        page_col, size_col, info_col = st.columns([1.0, 1.0, 2.0])
+        page_size = size_col.selectbox("表示件数", [20, 50, 100], index=0, key="contacts_page_size")
+        total_pages = max(1, (total_contacts + page_size - 1) // page_size)
+        current_page = page_col.number_input(
+            "ページ",
+            min_value=1,
+            max_value=total_pages,
+            value=min(st.session_state.get("contacts_page", 1), total_pages),
+            step=1,
+            key="contacts_page",
+        )
+        start_index = (int(current_page) - 1) * page_size
+        end_index = min(start_index + page_size, total_contacts)
+        visible_contacts = contacts.iloc[start_index:end_index]
+        info_col.caption(f"{total_contacts}件中 {start_index + 1}〜{end_index}件を表示 / {total_pages}ページ")
 
         header = st.columns([2.0, 2.4, 1.4, 0.9, 1.5, 0.9, 0.7, 0.7])
         headers = ["チャンネル", "email", "name", "状態", "last_sent", "候補へ戻す", "保存", "削除"]
         for column, label in zip(header, headers):
             column.markdown(f"**{label}**")
 
-        for row in contacts.itertuples():
+        for row in visible_contacts.itertuples():
             columns = st.columns([2.0, 2.4, 1.4, 0.9, 1.5, 0.9, 0.7, 0.7])
             edited_channel = columns[0].text_input("channel", value=row.channel or "", key=f"contact_channel_{row.id}", label_visibility="collapsed")
             edited_email = columns[1].text_input("email", value=row.email or "", key=f"contact_email_{row.id}", label_visibility="collapsed")
