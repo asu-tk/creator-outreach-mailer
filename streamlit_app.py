@@ -77,7 +77,6 @@ def fetch_contacts() -> pd.DataFrame:
                 c.email,
                 c.name,
                 c.channel,
-                c.source,
                 c.consent,
                 c.unsubscribed,
                 coalesce(max(s.sent_at), '') as last_sent
@@ -177,18 +176,17 @@ def send_email(to_email: str, subject: str, body: str) -> tuple[bool, str]:
         return False, str(exc)
 
 
-def add_contact(email: str, name: str, channel: str, source: str, consent: bool) -> None:
+def add_contact(email: str, name: str, channel: str, consent: bool) -> None:
     execute(
         """
         insert or replace into contacts
         (email, name, channel, source, consent, unsubscribed, token, created_at)
-        values (?, ?, ?, ?, ?, 0, ?, ?)
+        values (?, ?, ?, '', ?, 0, ?, ?)
         """,
         (
             email.strip().lower(),
             name.strip(),
             channel.strip(),
-            source.strip(),
             1 if consent else 0,
             secrets.token_urlsafe(24),
             now_iso(),
@@ -267,7 +265,6 @@ def import_csv(uploaded_file) -> int:
             email=email,
             name=str(row.get("name", "")),
             channel=str(row.get("channel", "")),
-            source=str(row.get("source", "")),
             consent=consent,
         )
         count += 1
@@ -302,19 +299,18 @@ def main() -> None:
             email = st.text_input("メールアドレス")
             name = st.text_input("名前", placeholder="例: 山田さん")
             channel = st.text_input("チャンネル名", placeholder="例: Sample Channel")
-            source = st.text_input("取得元・許諾メモ", placeholder="例: 資料請求フォーム 2026-05-28")
             consent = st.checkbox("営業メール送信の許諾がある")
             submitted = st.form_submit_button("追加")
         if submitted:
             if email:
-                add_contact(email, name, channel, source, consent)
+                add_contact(email, name, channel, consent)
                 st.success("宛先を追加しました")
             else:
                 st.error("メールアドレスを入力してください")
 
         st.subheader("CSV取り込み")
         uploaded = st.file_uploader("CSVファイル", type=["csv"])
-        st.caption("列: email, name, channel, source, consent")
+        st.caption("列: email, name, channel, consent")
         if uploaded and st.button("取り込む"):
             count = import_csv(uploaded)
             st.success(f"{count}件を取り込みました")
@@ -397,7 +393,7 @@ ${unsubscribe_url}""",
     else:
         search_text = st.text_input(
             "宛先一覧を検索",
-            placeholder="メールアドレス、名前、チャンネル名、取得元で検索",
+            placeholder="メールアドレス、名前、チャンネル名で検索",
         ).strip().lower()
         contacts["状態"] = contacts.apply(
             lambda row: "停止" if row["unsubscribed"] else ("送信可" if row["consent"] else "要確認"),
@@ -405,7 +401,7 @@ ${unsubscribe_url}""",
         )
 
         if search_text:
-            search_columns = ["email", "name", "channel", "source"]
+            search_columns = ["email", "name", "channel"]
             mask = contacts[search_columns].fillna("").astype(str).apply(
                 lambda column: column.str.lower().str.contains(search_text, regex=False)
             ).any(axis=1)
@@ -417,20 +413,19 @@ ${unsubscribe_url}""",
             st.write("検索条件に合う宛先はありません。")
             return
 
-        header = st.columns([2.2, 1.2, 1.5, 2.0, 0.8, 1.4, 0.7])
-        headers = ["email", "name", "channel", "source", "状態", "last_sent", ""]
+        header = st.columns([2.4, 1.4, 1.8, 0.9, 1.5, 0.7])
+        headers = ["email", "name", "channel", "状態", "last_sent", ""]
         for column, label in zip(header, headers):
             column.markdown(f"**{label}**")
 
         for row in contacts.itertuples():
-            columns = st.columns([2.2, 1.2, 1.5, 2.0, 0.8, 1.4, 0.7])
+            columns = st.columns([2.4, 1.4, 1.8, 0.9, 1.5, 0.7])
             columns[0].write(row.email)
             columns[1].write(row.name or "-")
             columns[2].write(row.channel or "-")
-            columns[3].write(row.source or "-")
-            columns[4].write(row.状態)
-            columns[5].write(row.last_sent or "-")
-            if columns[6].button("削除", key=f"delete_contact_{row.id}"):
+            columns[3].write(row.状態)
+            columns[4].write(row.last_sent or "-")
+            if columns[5].button("削除", key=f"delete_contact_{row.id}"):
                 delete_contact(int(row.id))
                 st.success(f"{row.email} を削除しました")
                 st.rerun()
