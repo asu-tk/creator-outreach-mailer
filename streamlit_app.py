@@ -23,6 +23,24 @@ ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 DB_PATH = DATA_DIR / "mailer.sqlite3"
 
+YOUTUBE_VIDEO_CATEGORIES = {
+    "エンターテイメント": "24",
+    "ゲーム": "20",
+    "コメディ": "23",
+    "スポーツ": "17",
+    "ニュースと政治": "25",
+    "ハウツーとスタイル": "26",
+    "ブログ": "22",
+    "ペットと動物": "15",
+    "映画とアニメ": "1",
+    "音楽": "10",
+    "科学と技術": "28",
+    "教育": "27",
+    "自動車と乗り物": "2",
+    "非営利団体と社会活動": "29",
+    "旅行とイベント": "19",
+}
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -344,24 +362,50 @@ def save_candidate(candidate: dict, keyword: str) -> bool:
     return True
 
 
-def search_youtube_channels(keyword: str, min_subs: int, max_subs: int, max_results: int) -> tuple[int, int, int]:
+def search_youtube_channels(
+    keyword: str,
+    min_subs: int,
+    max_subs: int,
+    max_results: int,
+    search_mode: str = "キーワード",
+    category_id: str = "",
+    display_label: str = "",
+) -> tuple[int, int, int]:
     found = 0
     saved = 0
     units_used = 0
     page_token = ""
     max_results = max(1, min(max_results, 200))
+    candidate_label = display_label or keyword
 
     while found < max_results:
         units_used += 100
+        search_params = {
+            "part": "snippet",
+            "maxResults": min(50, max_results - found),
+            "pageToken": page_token,
+        }
+        if search_mode == "カテゴリー":
+            search_params.update(
+                {
+                    "type": "video",
+                    "videoCategoryId": category_id,
+                    "regionCode": "JP",
+                    "order": "relevance",
+                }
+            )
+            if keyword:
+                search_params["q"] = keyword
+        else:
+            search_params.update(
+                {
+                    "type": "channel",
+                    "q": keyword,
+                }
+            )
         search_data = youtube_api_get(
             "search",
-            {
-                "part": "snippet",
-                "type": "channel",
-                "q": keyword,
-                "maxResults": min(50, max_results - found),
-                "pageToken": page_token,
-            },
+            search_params,
         )
         channel_ids = [
             item["snippet"]["channelId"]
@@ -401,7 +445,7 @@ def search_youtube_channels(keyword: str, min_subs: int, max_subs: int, max_resu
                     "view_count": int(stats.get("viewCount", 0)),
                     "description": snippet.get("description", ""),
                 },
-                keyword,
+                candidate_label,
             )
             if was_saved:
                 saved += 1
@@ -740,7 +784,16 @@ def main() -> None:
 
         st.subheader("YouTube候補検索")
         st.caption("メールアドレスは取得しません。条件に合うチャンネル候補だけを保存します。")
-        yt_keyword = st.text_input("検索キーワード", placeholder="例: 料理 レシピ / ゲーム実況 / 英会話")
+        yt_search_mode = st.radio("検索方法", ["カテゴリー", "キーワード"], horizontal=True)
+        yt_category_name = ""
+        yt_category_id = ""
+        if yt_search_mode == "カテゴリー":
+            yt_category_name = st.selectbox("カテゴリー", options=list(YOUTUBE_VIDEO_CATEGORIES.keys()))
+            yt_category_id = YOUTUBE_VIDEO_CATEGORIES[yt_category_name]
+            yt_keyword = st.text_input("補助キーワード（任意）", placeholder="例: 初心者 / 日本 / レビュー")
+            st.caption("カテゴリー検索は、選んだ動画カテゴリーに出てきた動画の投稿チャンネルを候補化します。")
+        else:
+            yt_keyword = st.text_input("検索キーワード", placeholder="例: 料理 レシピ / ゲーム実況 / 英会話")
         yt_min_subs = st.number_input("登録者数 最小", min_value=0, value=1000, step=1000)
         yt_max_subs = st.number_input("登録者数 最大（0なら上限なし）", min_value=0, value=100000, step=1000)
         yt_max_results = st.number_input("最大取得件数", min_value=1, max_value=200, value=50)
@@ -763,7 +816,7 @@ def main() -> None:
             st.warning("YouTube API使用量が上限に近づいています。")
         yt_submitted = st.button("候補を検索して保存")
         if yt_submitted:
-            if not yt_keyword.strip():
+            if yt_search_mode == "キーワード" and not yt_keyword.strip():
                 st.error("検索キーワードを入力してください")
             elif get_youtube_units_used() + estimate_youtube_units(int(yt_max_results)) > get_youtube_daily_limit():
                 st.error("推定上限を超えるため検索を止めました。最大取得件数を減らすか、明日以降に実行してください。")
@@ -774,6 +827,9 @@ def main() -> None:
                         int(yt_min_subs),
                         int(yt_max_subs),
                         int(yt_max_results),
+                        yt_search_mode,
+                        yt_category_id,
+                        f"カテゴリー: {yt_category_name}" if yt_search_mode == "カテゴリー" else yt_keyword.strip(),
                     )
                     st.success(f"{checked}件を確認し、新規候補を{saved}件保存しました。推定使用量: {units_used} units")
                 except Exception as exc:
