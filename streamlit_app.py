@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from string import Template
+from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
@@ -137,13 +138,6 @@ def smtp_configured() -> bool:
     return all(get_secret(key) for key in required)
 
 
-def normalize_url(url: str) -> str:
-    cleaned = url.strip().rstrip("/")
-    if cleaned and not cleaned.startswith(("http://", "https://")):
-        cleaned = f"https://{cleaned}"
-    return cleaned
-
-
 def render_template(text: str, contact: sqlite3.Row, unsubscribe_url: str) -> str:
     values = {
         "name": contact["name"] or "ご担当者",
@@ -152,6 +146,17 @@ def render_template(text: str, contact: sqlite3.Row, unsubscribe_url: str) -> st
         "unsubscribe_url": unsubscribe_url,
     }
     return Template(text).safe_substitute(values)
+
+
+def build_unsubscribe_mailto(contact: sqlite3.Row) -> str:
+    reply_to = get_secret("UNSUBSCRIBE_EMAIL", "") or get_secret("SMTP_USER", "")
+    subject = "配信停止希望"
+    body = (
+        "配信停止を希望します。\n\n"
+        f"対象メールアドレス: {contact['email']}\n"
+        f"チャンネル名: {contact['channel'] or '-'}\n"
+    )
+    return f"mailto:{reply_to}?subject={quote(subject)}&body={quote(body)}"
 
 
 def send_email(to_email: str, subject: str, body: str) -> tuple[bool, str]:
@@ -214,7 +219,7 @@ def settings_panel() -> None:
     current_host = get_setting("SMTP_HOST", "smtp.gmail.com")
     current_port = get_setting("SMTP_PORT", "587")
     current_ssl = get_setting("SMTP_SSL", "false").lower() in {"1", "true", "yes"}
-    current_app_url = get_setting("APP_BASE_URL")
+    current_unsubscribe_email = get_setting("UNSUBSCRIBE_EMAIL") or current_user
     has_password = bool(get_setting("SMTP_PASS"))
 
     with st.form("mail_settings"):
@@ -223,10 +228,10 @@ def settings_panel() -> None:
         smtp_host = st.text_input("SMTPサーバー", value=current_host)
         smtp_port = st.text_input("SMTPポート", value=current_port)
         smtp_ssl = st.checkbox("SSL接続を使う", value=current_ssl)
-        app_url = st.text_input(
-            "このアプリの公開URL",
-            value=current_app_url,
-            placeholder="例: https://creator-outreach-mailer.streamlit.app",
+        unsubscribe_email = st.text_input(
+            "配信停止受付メールアドレス",
+            value=current_unsubscribe_email,
+            placeholder="例: info@universeapp.jp",
         )
         smtp_pass = st.text_input(
             "SMTPパスワード / アプリパスワード",
@@ -243,22 +248,20 @@ def settings_panel() -> None:
         save_setting("SMTP_USER", sender_email.strip())
         save_setting("MAIL_FROM", mail_from)
         save_setting("SMTP_SSL", "true" if smtp_ssl else "false")
-        save_setting("APP_BASE_URL", normalize_url(app_url))
+        save_setting("UNSUBSCRIBE_EMAIL", unsubscribe_email.strip() or sender_email.strip())
         if smtp_pass:
             save_setting("SMTP_PASS", smtp_pass)
         st.success(f"保存しました。相手には {mail_from} から届きます。")
 
     if current_from:
         st.write(f"現在の表示: `{current_from}`")
-    if current_app_url:
-        st.write(f"配信停止URLの元: `{current_app_url}`")
-    else:
-        st.warning("公開URLが未設定です。配信停止リンクを使うには、StreamlitのアプリURLを保存してください。")
+    if current_unsubscribe_email:
+        st.write(f"配信停止受付: `{current_unsubscribe_email}`")
     if has_password:
         st.caption("パスワードは保存済みです。変更したい時だけ新しいパスワードを入力してください。")
 
     if st.button("送信元設定を削除"):
-        for key in ["SENDER_NAME", "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "MAIL_FROM", "SMTP_SSL", "APP_BASE_URL"]:
+        for key in ["SENDER_NAME", "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "MAIL_FROM", "SMTP_SSL", "APP_BASE_URL", "UNSUBSCRIBE_EMAIL"]:
             delete_setting(key)
         st.success("送信元設定を削除しました")
         st.rerun()
@@ -340,19 +343,52 @@ def main() -> None:
 
     with right:
         st.subheader("メール作成")
-        subject_template = st.text_input("件名", value="${channel}の海外視聴者向け翻訳について")
+        subject_template = st.text_input("件名", value="御社YouTubeチャンネルの海外視聴者向け翻訳について")
         body_template = st.text_area(
             "本文",
-            value="""${name}へ
+            value="""突然のご連絡失礼いたします。
+YouTube多言語化アプリ「UniVerse」開発元チームの綾瀬と申します。
 
-${channel}を拝見しました。
-海外視聴者向けの字幕・翻訳と説明文の多言語化で、お役に立てそうだと思いご連絡しました。
 
-もしご興味があれば、1本だけ無料で翻訳サンプルを作れます。
+貴社様のYouTube動画を拝見させて頂きました。
+
+動画の雰囲気や企画がとても魅力的で「海外視聴者にも届く可能性があるチャンネル」だと感じ、ご連絡させて頂きました。
+
+
+YouTubeアルゴリズムでは
+・タイトル
+・説明文
+・字幕
+
+を多言語化することで、海外からの再生やおすすめ表示が伸びる傾向があります。
+
+
+ただ実際は
+・翻訳作業に時間がかかる
+・複数言語対応が難しい
+・各言語ごとの登録が面倒
+
+などの理由から、海外対応を継続できないor全くやらないというチャンネル運営者様も少なくありません。
+
+
+UniVerseではYouTubeのタイトル・説明文を主要28言語へ自動翻訳し、海外視聴者向けのローカライズ作業を大幅に効率化できます。
+
+これまで何時間もかかっていた作業を、数分レベルまで短縮できるのが特徴です。
+
+
+「海外の視聴者にも動画を届けたい」
+そう考えている方には、非常に相性の良いアプリとなっております。
+
+もしご興味がありましたら、ぜひ一度ご覧ください。
+
+
+YouTubeサブスク型翻訳アプリ｜UniVerse
+https://universeapp.jp/
+
 
 不要な場合はこちらから配信停止できます。
 ${unsubscribe_url}""",
-            height=260,
+            height=560,
         )
         delay = st.number_input("送信間隔（秒）", min_value=1, max_value=60, value=3)
         confirmed = st.checkbox("送信対象が許諾済み、または法的に送信可能な宛先であることを確認しました")
@@ -377,13 +413,12 @@ ${unsubscribe_url}""",
                 progress = st.progress(0)
                 log = st.empty()
                 sent = failed = 0
-                base_url = normalize_url(get_secret("APP_BASE_URL", ""))
-                if not base_url:
-                    st.error("このアプリの公開URLが未設定です。左側の送信元メール設定で公開URLを保存してください。")
+                if not get_secret("UNSUBSCRIBE_EMAIL", "") and not get_secret("SMTP_USER", ""):
+                    st.error("配信停止受付メールアドレスが未設定です。左側の送信元メール設定で保存してください。")
                     st.stop()
 
                 for index, contact in enumerate(contacts):
-                    unsubscribe_url = f"{base_url}/?unsubscribe_token={contact['token']}"
+                    unsubscribe_url = build_unsubscribe_mailto(contact)
                     subject = render_template(subject_template, contact, unsubscribe_url)
                     body = render_template(body_template, contact, unsubscribe_url)
                     ok, result = send_email(contact["email"], subject, body)
