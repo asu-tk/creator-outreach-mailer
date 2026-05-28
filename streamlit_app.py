@@ -116,6 +116,15 @@ def init_db() -> None:
                 usage_date text primary key,
                 units integer not null default 0
             );
+
+            create table if not exists blocked_targets (
+                id integer primary key autoincrement,
+                email text not null default '',
+                youtube_channel_id text not null default '',
+                channel text not null default '',
+                reason text not null default '',
+                created_at text not null
+            );
             """
         )
         columns = [row[1] for row in db.execute("pragma table_info(contacts)").fetchall()]
@@ -233,7 +242,51 @@ def delete_setting(key: str) -> None:
     execute("delete from settings where key = ?", (key,))
 
 
-def delete_contact(contact_id: int) -> None:
+def block_target(email: str = "", youtube_channel_id: str = "", channel: str = "", reason: str = "") -> None:
+    normalized_email = email.strip().lower()
+    channel_id = youtube_channel_id.strip()
+    if not normalized_email and not channel_id:
+        return
+    duplicate = rows(
+        """
+        select id from blocked_targets
+        where (email != '' and email = ?) or (youtube_channel_id != '' and youtube_channel_id = ?)
+        """,
+        (normalized_email, channel_id),
+    )
+    if duplicate:
+        return
+    execute(
+        """
+        insert into blocked_targets(email, youtube_channel_id, channel, reason, created_at)
+        values (?, ?, ?, ?, ?)
+        """,
+        (normalized_email, channel_id, channel.strip(), reason, now_iso()),
+    )
+
+
+def is_blocked(email: str = "", youtube_channel_id: str = "") -> bool:
+    normalized_email = email.strip().lower()
+    channel_id = youtube_channel_id.strip()
+    if not normalized_email and not channel_id:
+        return False
+    return bool(
+        rows(
+            """
+            select id from blocked_targets
+            where (email != '' and email = ?) or (youtube_channel_id != '' and youtube_channel_id = ?)
+            """,
+            (normalized_email, channel_id),
+        )
+    )
+
+
+def delete_contact(contact_id: int, block: bool = False, reason: str = "") -> None:
+    if block:
+        contact = rows("select * from contacts where id = ?", (contact_id,))
+        if contact:
+            item = contact[0]
+            block_target(item["email"], item["youtube_channel_id"], item["channel"], reason)
     execute("delete from sends where contact_id = ?", (contact_id,))
     execute("delete from contacts where id = ?", (contact_id,))
 
@@ -339,6 +392,8 @@ def youtube_api_get(path: str, params: dict[str, str | int]) -> dict:
 
 def save_candidate(candidate: dict, keyword: str) -> bool:
     channel_id = candidate["channel_id"]
+    if is_blocked(youtube_channel_id=channel_id):
+        return False
     if youtube_channel_in_contacts(channel_id) or youtube_channel_in_candidates(channel_id):
         return False
     execute(
@@ -534,6 +589,8 @@ def add_contact(
     youtube_description: str = "",
 ) -> bool:
     normalized_email = email.strip().lower()
+    if is_blocked(normalized_email, youtube_channel_id):
+        return False
     if normalized_email and contact_exists(normalized_email):
         return False
     if youtube_channel_id and youtube_channel_in_contacts(youtube_channel_id):
@@ -922,6 +979,7 @@ https://universeapp.jp/
                 progress = st.progress(0)
                 log = st.empty()
                 sent = failed = 0
+                failed_contacts = []
                 for index, contact in enumerate(contacts):
                     unsubscribe_url = build_unsubscribe_mailto(contact)
                     subject = render_template(subject_template, contact, unsubscribe_url)
@@ -933,12 +991,32 @@ https://universeapp.jp/
                     )
                     sent += 1 if ok else 0
                     failed += 0 if ok else 1
+                    if not ok:
+                        failed_contacts.append(
+                            {
+                                "id": int(contact["id"]),
+                                "email": contact["email"],
+                                "channel": contact["channel"],
+                                "error": result,
+                            }
+                        )
                     progress.progress((index + 1) / max(len(contacts), 1))
                     log.write(f"{index + 1}/{len(contacts)}: {contact['email']} - {result}")
                     if index < len(contacts) - 1:
                         time.sleep(int(delay))
 
                 st.success(f"処理完了: 成功 {sent} 件 / 失敗 {failed} 件")
+                if failed_contacts:
+                    st.error("以下のメールアドレスに送信できませんでした。")
+                    for item in failed_contacts:
+                        columns = st.columns([2.0, 1.6, 3.0, 1.2])
+                        columns[0].write(item["email"])
+                        columns[1].write(item["channel"] or "-")
+                        columns[2].write(item["error"])
+                        if columns[3].button("削除して今後取り込まない", key=f"block_failed_{item['id']}"):
+                            delete_contact(item["id"], block=True, reason="送信失敗")
+                            st.success(f"{item['email']} を削除し、再取り込みしないようにしました")
+                            st.rerun()
 
     query = st.query_params
     token = query.get("unsubscribe_token")
@@ -1034,7 +1112,7 @@ https://universeapp.jp/
                 else:
                     st.error(message)
             if columns[7].button("削除", key=f"delete_contact_{row.id}"):
-                delete_contact(int(row.id))
+                delete_contact(int(row.id), block=True, reason="手動削除")
                 st.success(f"{row.email} を削除しました")
                 st.rerun()
 
