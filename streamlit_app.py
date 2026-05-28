@@ -47,6 +47,7 @@ def init_db() -> None:
                 email text not null unique,
                 name text not null default '',
                 channel text not null default '',
+                youtube_channel_id text not null default '',
                 source text not null default '',
                 consent integer not null default 0,
                 unsubscribed integer not null default 0,
@@ -83,6 +84,10 @@ def init_db() -> None:
             );
             """
         )
+        columns = [row[1] for row in db.execute("pragma table_info(contacts)").fetchall()]
+        if "youtube_channel_id" not in columns:
+            db.execute("alter table contacts add column youtube_channel_id text not null default ''")
+        db.commit()
 
 
 def fetch_contacts() -> pd.DataFrame:
@@ -112,6 +117,7 @@ def fetch_candidates() -> pd.DataFrame:
             """
             select
                 id,
+                channel_id,
                 title,
                 channel_url,
                 subscriber_count,
@@ -174,6 +180,18 @@ def candidate_contact_exists(channel: str) -> bool:
     return bool(rows("select id from contacts where email = '' and channel = ?", (normalized_channel,)))
 
 
+def youtube_channel_in_contacts(channel_id: str) -> bool:
+    if not channel_id:
+        return False
+    return bool(rows("select id from contacts where youtube_channel_id = ?", (channel_id,)))
+
+
+def youtube_channel_in_candidates(channel_id: str) -> bool:
+    if not channel_id:
+        return False
+    return bool(rows("select id from youtube_candidates where channel_id = ?", (channel_id,)))
+
+
 def update_contact(contact_id: int, email: str, name: str, channel: str, consent: bool) -> tuple[bool, str]:
     normalized_email = email.strip().lower()
     duplicate = rows(
@@ -210,6 +228,9 @@ def youtube_api_get(path: str, params: dict[str, str | int]) -> dict:
 
 
 def save_candidate(candidate: dict, keyword: str) -> bool:
+    channel_id = candidate["channel_id"]
+    if youtube_channel_in_contacts(channel_id) or youtube_channel_in_candidates(channel_id):
+        return False
     execute(
         """
         insert or ignore into youtube_candidates
@@ -217,7 +238,7 @@ def save_candidate(candidate: dict, keyword: str) -> bool:
         values (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            candidate["channel_id"],
+            channel_id,
             candidate["title"],
             candidate["channel_url"],
             int(candidate.get("subscriber_count", 0)),
@@ -275,8 +296,7 @@ def search_youtube_channels(keyword: str, min_subs: int, max_subs: int, max_resu
                 continue
 
             channel_id = item["id"]
-            before = rows("select id from youtube_candidates where channel_id = ?", (channel_id,))
-            save_candidate(
+            was_saved = save_candidate(
                 {
                     "channel_id": channel_id,
                     "title": snippet.get("title", ""),
@@ -288,8 +308,7 @@ def search_youtube_channels(keyword: str, min_subs: int, max_subs: int, max_resu
                 },
                 keyword,
             )
-            after = rows("select id from youtube_candidates where channel_id = ?", (channel_id,))
-            if not before and after:
+            if was_saved:
                 saved += 1
 
         found += len(channel_ids)
@@ -361,22 +380,25 @@ def send_email(to_email: str, subject: str, body: str) -> tuple[bool, str]:
         return False, str(exc)
 
 
-def add_contact(email: str, name: str, channel: str, consent: bool) -> bool:
+def add_contact(email: str, name: str, channel: str, consent: bool, youtube_channel_id: str = "") -> bool:
     normalized_email = email.strip().lower()
     if normalized_email and contact_exists(normalized_email):
+        return False
+    if youtube_channel_id and youtube_channel_in_contacts(youtube_channel_id):
         return False
     if not normalized_email and candidate_contact_exists(channel):
         return False
     execute(
         """
         insert into contacts
-        (email, name, channel, source, consent, unsubscribed, token, created_at)
-        values (?, ?, ?, '', ?, 0, ?, ?)
+        (email, name, channel, youtube_channel_id, source, consent, unsubscribed, token, created_at)
+        values (?, ?, ?, ?, '', ?, 0, ?, ?)
         """,
         (
             normalized_email,
             name.strip(),
             channel.strip(),
+            youtube_channel_id.strip(),
             1 if consent else 0,
             secrets.token_urlsafe(24),
             now_iso(),
@@ -739,12 +761,13 @@ https://universeapp.jp/
             columns[4].write(row.keyword or "-")
             columns[5].markdown(f"[YouTubeで開く]({row.channel_url})")
             if columns[6].button("宛先に登録", key=f"candidate_to_contact_{row.id}"):
-                added = add_contact("", "", row.title or "", True)
+                added = add_contact("", "", row.title or "", True, row.channel_id)
                 if added:
+                    delete_candidate(int(row.id))
                     st.success(f"{row.title} を宛先一覧に追加しました。メールアドレスを入力して保存してください。")
                     st.rerun()
                 else:
-                    st.warning("このチャンネルはすでに宛先一覧に仮登録されています")
+                    st.warning("このチャンネルはすでに宛先一覧に登録されています")
             if columns[7].button("削除", key=f"delete_candidate_{row.id}"):
                 delete_candidate(int(row.id))
                 st.success(f"{row.title} を削除しました")
