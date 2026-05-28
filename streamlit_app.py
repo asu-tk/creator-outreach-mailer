@@ -119,6 +119,13 @@ def delete_contact(contact_id: int) -> None:
     execute("delete from contacts where id = ?", (contact_id,))
 
 
+def contact_exists(email: str) -> bool:
+    normalized_email = email.strip().lower()
+    if not normalized_email:
+        return False
+    return bool(rows("select id from contacts where email = ?", (normalized_email,)))
+
+
 def rows(query: str, params: tuple = ()) -> list[sqlite3.Row]:
     with sqlite3.connect(DB_PATH) as db:
         db.row_factory = sqlite3.Row
@@ -176,15 +183,18 @@ def send_email(to_email: str, subject: str, body: str) -> tuple[bool, str]:
         return False, str(exc)
 
 
-def add_contact(email: str, name: str, channel: str, consent: bool) -> None:
+def add_contact(email: str, name: str, channel: str, consent: bool) -> bool:
+    normalized_email = email.strip().lower()
+    if not normalized_email or contact_exists(normalized_email):
+        return False
     execute(
         """
-        insert or replace into contacts
+        insert into contacts
         (email, name, channel, source, consent, unsubscribed, token, created_at)
         values (?, ?, ?, '', ?, 0, ?, ?)
         """,
         (
-            email.strip().lower(),
+            normalized_email,
             name.strip(),
             channel.strip(),
             1 if consent else 0,
@@ -192,6 +202,7 @@ def add_contact(email: str, name: str, channel: str, consent: bool) -> None:
             now_iso(),
         ),
     )
+    return True
 
 
 def settings_panel() -> None:
@@ -253,22 +264,31 @@ def settings_panel() -> None:
         st.rerun()
 
 
-def import_csv(uploaded_file) -> int:
+def import_csv(uploaded_file) -> tuple[int, int]:
     frame = pd.read_csv(uploaded_file).fillna("")
-    count = 0
+    added = 0
+    skipped = 0
+    seen_in_file: set[str] = set()
     for _, row in frame.iterrows():
         email = str(row.get("email", "")).strip().lower()
         if not email:
             continue
+        if email in seen_in_file:
+            skipped += 1
+            continue
+        seen_in_file.add(email)
         consent = str(row.get("consent", "")).strip().lower() in {"1", "yes", "true", "y"}
-        add_contact(
+        was_added = add_contact(
             email=email,
             name=str(row.get("name", "")),
             channel=str(row.get("channel", "")),
             consent=consent,
         )
-        count += 1
-    return count
+        if was_added:
+            added += 1
+        else:
+            skipped += 1
+    return added, skipped
 
 
 def main() -> None:
@@ -303,8 +323,11 @@ def main() -> None:
             submitted = st.form_submit_button("追加")
         if submitted:
             if email:
-                add_contact(email, name, channel, consent)
-                st.success("宛先を追加しました")
+                was_added = add_contact(email, name, channel, consent)
+                if was_added:
+                    st.success("宛先を追加しました")
+                else:
+                    st.warning("このメールアドレスはすでに登録されています")
             else:
                 st.error("メールアドレスを入力してください")
 
@@ -312,8 +335,8 @@ def main() -> None:
         uploaded = st.file_uploader("CSVファイル", type=["csv"])
         st.caption("列: email, name, channel, consent")
         if uploaded and st.button("取り込む"):
-            count = import_csv(uploaded)
-            st.success(f"{count}件を取り込みました")
+            added, skipped = import_csv(uploaded)
+            st.success(f"{added}件を取り込みました。重複は{skipped}件スキップしました。")
 
     with right:
         st.subheader("メール作成")
