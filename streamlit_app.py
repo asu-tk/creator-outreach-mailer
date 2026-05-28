@@ -115,6 +115,11 @@ def delete_setting(key: str) -> None:
     execute("delete from settings where key = ?", (key,))
 
 
+def delete_contact(contact_id: int) -> None:
+    execute("delete from sends where contact_id = ?", (contact_id,))
+    execute("delete from contacts where id = ?", (contact_id,))
+
+
 def rows(query: str, params: tuple = ()) -> list[sqlite3.Row]:
     with sqlite3.connect(DB_PATH) as db:
         db.row_factory = sqlite3.Row
@@ -124,6 +129,13 @@ def rows(query: str, params: tuple = ()) -> list[sqlite3.Row]:
 def smtp_configured() -> bool:
     required = ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "MAIL_FROM"]
     return all(get_secret(key) for key in required)
+
+
+def normalize_url(url: str) -> str:
+    cleaned = url.strip().rstrip("/")
+    if cleaned and not cleaned.startswith(("http://", "https://")):
+        cleaned = f"https://{cleaned}"
+    return cleaned
 
 
 def render_template(text: str, contact: sqlite3.Row, unsubscribe_url: str) -> str:
@@ -193,6 +205,7 @@ def settings_panel() -> None:
     current_host = get_setting("SMTP_HOST", "smtp.gmail.com")
     current_port = get_setting("SMTP_PORT", "587")
     current_ssl = get_setting("SMTP_SSL", "false").lower() in {"1", "true", "yes"}
+    current_app_url = get_setting("APP_BASE_URL")
     has_password = bool(get_setting("SMTP_PASS"))
 
     with st.form("mail_settings"):
@@ -201,6 +214,11 @@ def settings_panel() -> None:
         smtp_host = st.text_input("SMTPサーバー", value=current_host)
         smtp_port = st.text_input("SMTPポート", value=current_port)
         smtp_ssl = st.checkbox("SSL接続を使う", value=current_ssl)
+        app_url = st.text_input(
+            "このアプリの公開URL",
+            value=current_app_url,
+            placeholder="例: https://creator-outreach-mailer.streamlit.app",
+        )
         smtp_pass = st.text_input(
             "SMTPパスワード / アプリパスワード",
             type="password",
@@ -216,17 +234,22 @@ def settings_panel() -> None:
         save_setting("SMTP_USER", sender_email.strip())
         save_setting("MAIL_FROM", mail_from)
         save_setting("SMTP_SSL", "true" if smtp_ssl else "false")
+        save_setting("APP_BASE_URL", normalize_url(app_url))
         if smtp_pass:
             save_setting("SMTP_PASS", smtp_pass)
         st.success(f"保存しました。相手には {mail_from} から届きます。")
 
     if current_from:
         st.write(f"現在の表示: `{current_from}`")
+    if current_app_url:
+        st.write(f"配信停止URLの元: `{current_app_url}`")
+    else:
+        st.warning("公開URLが未設定です。配信停止リンクを使うには、StreamlitのアプリURLを保存してください。")
     if has_password:
         st.caption("パスワードは保存済みです。変更したい時だけ新しいパスワードを入力してください。")
 
     if st.button("送信元設定を削除"):
-        for key in ["SENDER_NAME", "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "MAIL_FROM", "SMTP_SSL"]:
+        for key in ["SENDER_NAME", "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "MAIL_FROM", "SMTP_SSL", "APP_BASE_URL"]:
             delete_setting(key)
         st.success("送信元設定を削除しました")
         st.rerun()
@@ -335,7 +358,10 @@ ${unsubscribe_url}""",
                 progress = st.progress(0)
                 log = st.empty()
                 sent = failed = 0
-                base_url = get_secret("APP_BASE_URL", "http://127.0.0.1:8501")
+                base_url = normalize_url(get_secret("APP_BASE_URL", ""))
+                if not base_url:
+                    st.error("このアプリの公開URLが未設定です。左側の送信元メール設定で公開URLを保存してください。")
+                    st.stop()
 
                 for index, contact in enumerate(contacts):
                     unsubscribe_url = f"{base_url}/?unsubscribe_token={contact['token']}"
@@ -376,6 +402,21 @@ ${unsubscribe_url}""",
             use_container_width=True,
             hide_index=True,
         )
+
+        st.subheader("宛先を削除")
+        delete_options = {
+            f"{row.email} / {row.channel or row.name or '名前なし'}": int(row.id)
+            for row in contacts.itertuples()
+        }
+        selected_contact = st.selectbox("削除する宛先", options=list(delete_options.keys()))
+        confirm_delete = st.checkbox("この宛先を削除することを確認しました")
+        if st.button("選択した宛先を削除", type="secondary"):
+            if not confirm_delete:
+                st.error("削除するには確認チェックを入れてください")
+            else:
+                delete_contact(delete_options[selected_contact])
+                st.success("宛先を削除しました")
+                st.rerun()
 
 
 if __name__ == "__main__":
