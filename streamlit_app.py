@@ -397,25 +397,22 @@ ${unsubscribe_url}""",
             lambda row: "停止" if row["unsubscribed"] else ("送信可" if row["consent"] else "要確認"),
             axis=1,
         )
-        st.dataframe(
-            contacts[["email", "name", "channel", "source", "状態", "last_sent"]],
-            use_container_width=True,
-            hide_index=True,
-        )
+        header = st.columns([2.2, 1.2, 1.5, 2.0, 0.8, 1.4, 0.7])
+        headers = ["email", "name", "channel", "source", "状態", "last_sent", ""]
+        for column, label in zip(header, headers):
+            column.markdown(f"**{label}**")
 
-        st.subheader("宛先を削除")
-        delete_options = {
-            f"{row.email} / {row.channel or row.name or '名前なし'}": int(row.id)
-            for row in contacts.itertuples()
-        }
-        selected_contact = st.selectbox("削除する宛先", options=list(delete_options.keys()))
-        confirm_delete = st.checkbox("この宛先を削除することを確認しました")
-        if st.button("選択した宛先を削除", type="secondary"):
-            if not confirm_delete:
-                st.error("削除するには確認チェックを入れてください")
-            else:
-                delete_contact(delete_options[selected_contact])
-                st.success("宛先を削除しました")
+        for row in contacts.itertuples():
+            columns = st.columns([2.2, 1.2, 1.5, 2.0, 0.8, 1.4, 0.7])
+            columns[0].write(row.email)
+            columns[1].write(row.name or "-")
+            columns[2].write(row.channel or "-")
+            columns[3].write(row.source or "-")
+            columns[4].write(row.状態)
+            columns[5].write(row.last_sent or "-")
+            if columns[6].button("削除", key=f"delete_contact_{row.id}"):
+                delete_contact(int(row.id))
+                st.success(f"{row.email} を削除しました")
                 st.rerun()
 
 
