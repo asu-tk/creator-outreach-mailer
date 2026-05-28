@@ -384,8 +384,10 @@ ${unsubscribe_url}""",
     query = st.query_params
     token = query.get("unsubscribe_token")
     if token:
-        execute("update contacts set unsubscribed = 1 where token = ?", (token,))
-        st.success("配信停止を受け付けました")
+        contact = rows("select id from contacts where token = ?", (token,))
+        if contact:
+            delete_contact(int(contact[0]["id"]))
+        st.success("配信停止を受け付けました。宛先一覧からも削除しました。")
 
     st.divider()
     st.subheader("宛先一覧")
@@ -393,10 +395,28 @@ ${unsubscribe_url}""",
     if contacts.empty:
         st.write("まだ宛先がありません。")
     else:
+        search_text = st.text_input(
+            "宛先一覧を検索",
+            placeholder="メールアドレス、名前、チャンネル名、取得元で検索",
+        ).strip().lower()
         contacts["状態"] = contacts.apply(
             lambda row: "停止" if row["unsubscribed"] else ("送信可" if row["consent"] else "要確認"),
             axis=1,
         )
+
+        if search_text:
+            search_columns = ["email", "name", "channel", "source"]
+            mask = contacts[search_columns].fillna("").astype(str).apply(
+                lambda column: column.str.lower().str.contains(search_text, regex=False)
+            ).any(axis=1)
+            contacts = contacts[mask]
+
+        st.caption(f"{len(contacts)}件表示中")
+
+        if contacts.empty:
+            st.write("検索条件に合う宛先はありません。")
+            return
+
         header = st.columns([2.2, 1.2, 1.5, 2.0, 0.8, 1.4, 0.7])
         headers = ["email", "name", "channel", "source", "状態", "last_sent", ""]
         for column, label in zip(header, headers):
