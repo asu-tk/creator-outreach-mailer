@@ -1007,6 +1007,11 @@ def save_campaign_template_order(names: list[str]) -> None:
         )
 
 
+def change_candidate_page(delta: int, total_pages: int) -> None:
+    current_page = int(st.session_state.get("candidates_page", 1))
+    st.session_state["candidates_page"] = max(1, min(int(total_pages), current_page + int(delta)))
+
+
 def ensure_default_campaign_template() -> None:
     execute("delete from campaign_templates where user_id = ? and name = ?", (current_user_id(), "2通目"))
     existing_names = {template["name"] for template in fetch_campaign_templates()}
@@ -2464,9 +2469,10 @@ def main() -> None:
             key="candidates_prev_page_bottom",
             use_container_width=True,
             disabled=int(candidate_current_page) <= 1,
+            on_click=change_candidate_page,
+            args=(-1, candidate_total_pages),
         ):
-            st.session_state["candidates_page"] = int(candidate_current_page) - 1
-            st.rerun()
+            pass
         page_status_col.markdown(
             f"<div style='text-align:center; padding-top:0.45rem;'>"
             f"{candidate_current_page} / {candidate_total_pages}ページ"
@@ -2478,9 +2484,10 @@ def main() -> None:
             key="candidates_next_page_bottom",
             use_container_width=True,
             disabled=int(candidate_current_page) >= candidate_total_pages,
+            on_click=change_candidate_page,
+            args=(1, candidate_total_pages),
         ):
-            st.session_state["candidates_page"] = int(candidate_current_page) + 1
-            st.rerun()
+            pass
 
 
 if __name__ == "__main__":
