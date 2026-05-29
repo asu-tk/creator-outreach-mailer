@@ -52,8 +52,8 @@ def today_key() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
-def campaign_key(subject_template: str, body_template: str) -> str:
-    normalized = subject_template.strip() + "\n---body---\n" + body_template.strip()
+def campaign_key(campaign_name: str) -> str:
+    normalized = campaign_name.strip()
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
@@ -1085,6 +1085,8 @@ def main() -> None:
 
     with right:
         st.subheader("メール作成")
+        campaign_name = st.text_input("配信名", value=get_setting("CURRENT_CAMPAIGN_NAME", "初回案内"))
+        st.caption("同じ配信名の間は、本文を少し直しても同じ配信として進捗を引き継ぎます。新しい別メールを送る時だけ配信名を変えてください。")
         subject_template = st.text_input("件名", value="${channel}へのご連絡")
         body_template = st.text_area(
             "本文",
@@ -1101,7 +1103,7 @@ ${channel}を拝見し、ご連絡いたしました。
         send_limit = st.number_input("今回送信する件数", min_value=1, max_value=500, value=50)
         confirmed = st.checkbox("送信対象が許諾済み、または法的に送信可能な宛先であることを確認しました")
 
-        current_campaign_key = campaign_key(subject_template, body_template)
+        current_campaign_key = campaign_key(campaign_name)
         target_count = rows(
             "select count(*) as count from contacts where user_id = ? and consent = 1 and unsubscribed = 0 and email != ''",
             (current_user_id(),),
@@ -1135,11 +1137,11 @@ ${channel}を拝見し、ご連絡いたしました。
         )[0]["count"]
         metric_cols = st.columns(3)
         metric_cols[0].metric("送信対象", f"{target_count}件")
-        metric_cols[1].metric("この文章を送信済み", f"{already_sent_count}件")
-        metric_cols[2].metric("この文章の未送信", f"{remaining_count}件")
+        metric_cols[1].metric("この配信を送信済み", f"{already_sent_count}件")
+        metric_cols[2].metric("この配信の未送信", f"{remaining_count}件")
         if remaining_count == 0 and target_count > 0:
-            st.success("この件名・本文は、現在の送信対象すべてに送信済みです。")
-        st.caption("同じ件名・本文をすでに送った宛先は自動で除外します。送信対象は、未送信の宛先を優先し、その後は最終送信日時が古い順に選ばれます。")
+            st.success("この配信名では、現在の送信対象すべてに送信済みです。")
+        st.caption("同じ配信名ですでに送った宛先は自動で除外します。送信対象は、未送信の宛先を優先し、その後は最終送信日時が古い順に選ばれます。")
 
         test_button, send_button = st.columns(2)
         with test_button:
@@ -1148,9 +1150,12 @@ ${channel}を拝見し、ご連絡いたしました。
             run_all = st.button("指定件数を送信", type="primary", use_container_width=True)
 
         if run_test or run_all:
-            if not confirmed:
+            if not campaign_name.strip():
+                st.error("配信名を入力してください")
+            elif not confirmed:
                 st.error("送信前の確認にチェックしてください")
             else:
+                save_setting("CURRENT_CAMPAIGN_NAME", campaign_name.strip())
                 contacts = rows(
                     """
                     select
