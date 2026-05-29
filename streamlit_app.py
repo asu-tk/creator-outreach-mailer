@@ -1282,6 +1282,128 @@ def send_email(to_email: str, subject: str, body: str) -> tuple[bool, str]:
         return False, str(exc)
 
 
+def create_send_job(
+    campaign_name: str,
+    campaign_key_value: str,
+    subject_template: str,
+    body_template: str,
+    contacts: list[sqlite3.Row],
+    delay_seconds: int,
+) -> tuple[bool, str]:
+    if not supabase_configured():
+        return False, "送信予約にはSupabase設定が必要です"
+    account = active_smtp_account()
+    if not smtp_configured():
+        return False, "送信元メール設定が未完了です"
+    user_email = current_user_profile()["email"].strip().lower() or current_user_id()
+    job_payload = {
+        "user_email": user_email,
+        "campaign_key": campaign_key_value,
+        "campaign_name": campaign_name.strip(),
+        "subject_template": subject_template,
+        "body_template": body_template,
+        "sender_label": str(account.get("label") or ""),
+        "sender_name": str(account.get("sender_name") or ""),
+        "sender_email": str(account.get("sender_email") or ""),
+        "smtp_host": str(account.get("smtp_host") or ""),
+        "smtp_port": int(str(account.get("smtp_port") or "587")),
+        "smtp_ssl": int(account.get("smtp_ssl") or 0) == 1,
+        "smtp_pass": str(account.get("smtp_pass") or ""),
+        "delay_seconds": int(delay_seconds),
+        "total_count": len(contacts),
+        "status": "queued",
+        "updated_at": now_iso(),
+    }
+    created_job = supabase_request("POST", "send_jobs", job_payload, prefer="return=representation")
+    if not isinstance(created_job, list) or not created_job:
+        return False, "送信予約の作成に失敗しました"
+    job_id = created_job[0]["id"]
+    start_time = datetime.now(timezone.utc)
+    queue_rows = []
+    for index, contact in enumerate(contacts):
+        unsubscribe_url = build_unsubscribe_mailto(contact)
+        subject = render_template(subject_template, contact, unsubscribe_url)
+        body = render_template(body_template, contact, unsubscribe_url)
+        scheduled_at = (start_time.timestamp() + (index * int(delay_seconds)))
+        queue_rows.append(
+            {
+                "job_id": job_id,
+                "user_email": user_email,
+                "campaign_key": campaign_key_value,
+                "contact_local_id": int(contact["id"]),
+                "contact_email": contact["email"],
+                "contact_name": contact["name"],
+                "contact_channel": contact["channel"],
+                "subject": subject,
+                "body": body,
+                "status": "pending",
+                "scheduled_at": datetime.fromtimestamp(scheduled_at, timezone.utc).isoformat(),
+            }
+        )
+    if queue_rows:
+        supabase_request("POST", "send_queue", queue_rows, prefer="return=representation")
+    for row in queue_rows:
+        execute(
+            "insert into sends(user_id, contact_id, campaign_key, subject, status, error, sent_at) values (?, ?, ?, ?, ?, ?, ?)",
+            (current_user_id(), row["contact_local_id"], campaign_key_value, row["subject"], "queued", "", now_iso()),
+        )
+    return True, f"{len(queue_rows)}件の送信予約を作成しました"
+
+
+def sync_send_queue_results() -> None:
+    if not supabase_configured():
+        return
+    user_email = current_user_profile()["email"].strip().lower()
+    if not user_email:
+        return
+    try:
+        query_email = urllib.parse.quote(user_email, safe="")
+        results = supabase_request(
+            "GET",
+            f"send_queue?user_email=eq.{query_email}&status=in.(sent,failed)&select=contact_local_id,campaign_key,status,error,sent_at,subject",
+        )
+        if not isinstance(results, list):
+            return
+        for item in results:
+            contact_id = item.get("contact_local_id")
+            campaign_key_value = item.get("campaign_key", "")
+            if not contact_id or not campaign_key_value:
+                continue
+            sent_at = item.get("sent_at") or now_iso()
+            status = item.get("status", "")
+            error = item.get("error", "")
+            execute(
+                """
+                update sends
+                set status = ?, error = ?, sent_at = ?
+                where user_id = ?
+                  and contact_id = ?
+                  and campaign_key = ?
+                  and status = 'queued'
+                """,
+                (status, error, sent_at, current_user_id(), int(contact_id), campaign_key_value),
+            )
+    except Exception:
+        return
+
+
+def fetch_recent_send_jobs() -> list[dict]:
+    if not supabase_configured():
+        return []
+    user_email = current_user_profile()["email"].strip().lower()
+    if not user_email:
+        return []
+    try:
+        query_email = urllib.parse.quote(user_email, safe="")
+        result = supabase_request(
+            "GET",
+            f"send_jobs?user_email=eq.{query_email}&select=campaign_name,total_count,sent_count,failed_count,status,created_at&order=created_at.desc&limit=5",
+        )
+        return result if isinstance(result, list) else []
+    except Exception:
+        return []
+
+
 def add_contact(
     email: str,
     name: str,
@@ -1554,6 +1676,7 @@ def main() -> None:
 
     require_active_subscription()
     ensure_default_campaign_template()
+    sync_send_queue_results()
 
     st.title("Creator Outreach Mailer")
     st.caption("許諾済みの宛先だけに、1件ずつ送信する個人用Webアプリ")
@@ -1760,6 +1883,14 @@ def main() -> None:
             """,
             (current_user_id(), current_campaign_key),
         )[0]["count"]
+        queued_count = rows(
+            """
+            select count(distinct contact_id) as count
+            from sends
+            where user_id = ? and campaign_key = ? and status = 'queued'
+            """,
+            (current_user_id(), current_campaign_key),
+        )[0]["count"]
         remaining_count = rows(
             """
             select count(*) as count
@@ -1774,24 +1905,42 @@ def main() -> None:
                   where s.user_id = c.user_id
                     and s.contact_id = c.id
                     and s.campaign_key = ?
-                    and s.status = 'sent'
+                    and s.status in ('sent', 'queued')
               )
             """,
             (current_user_id(), current_campaign_key),
         )[0]["count"]
-        metric_cols = st.columns(3)
+        metric_cols = st.columns(4)
         metric_cols[0].metric("送信対象", f"{target_count}件")
         metric_cols[1].metric("この配信を送信済み", f"{already_sent_count}件")
-        metric_cols[2].metric("この配信の未送信", f"{remaining_count}件")
+        metric_cols[2].metric("予約済み", f"{queued_count}件")
+        metric_cols[3].metric("この配信の未送信", f"{remaining_count}件")
         if remaining_count == 0 and target_count > 0:
-            st.success("この配信名では、現在の送信対象すべてに送信済みです。")
-        st.caption("同じ配信名ですでに送った宛先は自動で除外します。送信対象は、未送信の宛先を優先し、その後は最終送信日時が古い順に選ばれます。")
+            st.success("この配信名では、現在の送信対象すべてが送信済み、または予約済みです。")
+        st.caption("同じ配信名ですでに送った宛先、または予約済みの宛先は自動で除外します。送信対象は、未送信の宛先を優先し、その後は最終送信日時が古い順に選ばれます。")
+        recent_jobs = fetch_recent_send_jobs()
+        if recent_jobs:
+            with st.expander("最近の送信予約"):
+                st.dataframe(
+                    pd.DataFrame(recent_jobs).rename(
+                        columns={
+                            "campaign_name": "配信名",
+                            "total_count": "予約数",
+                            "sent_count": "送信済み",
+                            "failed_count": "失敗",
+                            "status": "状態",
+                            "created_at": "作成日時",
+                        }
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
         test_button, send_button = st.columns(2)
         with test_button:
             run_test = st.button("最初の1件でテスト", use_container_width=True)
         with send_button:
-            run_all = st.button("指定件数を送信", type="primary", use_container_width=True)
+            run_all = st.button("指定件数を送信予約", type="primary", use_container_width=True)
 
         if run_test or run_all:
             if not campaign_name.strip():
@@ -1814,7 +1963,7 @@ def main() -> None:
                           where sent_campaign.user_id = c.user_id
                             and sent_campaign.contact_id = c.id
                             and sent_campaign.campaign_key = ?
-                            and sent_campaign.status = 'sent'
+                            and sent_campaign.status in ('sent', 'queued')
                       )
                     group by c.id
                     order by
@@ -1830,47 +1979,60 @@ def main() -> None:
                 else:
                     contacts = contacts[: int(send_limit)]
 
-                progress = st.progress(0)
-                log = st.empty()
-                sent = failed = 0
-                failed_contacts = []
-                for index, contact in enumerate(contacts):
-                    unsubscribe_url = build_unsubscribe_mailto(contact)
-                    subject = render_template(subject_template, contact, unsubscribe_url)
-                    body = render_template(body_template, contact, unsubscribe_url)
-                    ok, result = send_email(contact["email"], subject, body)
-                    execute(
-                        "insert into sends(user_id, contact_id, campaign_key, subject, status, error, sent_at) values (?, ?, ?, ?, ?, ?, ?)",
-                        (current_user_id(), contact["id"], current_campaign_key, subject, "sent" if ok else "failed", "" if ok else result, now_iso()),
+                if run_all:
+                    ok, message = create_send_job(
+                        campaign_name,
+                        current_campaign_key,
+                        subject_template,
+                        body_template,
+                        contacts,
+                        int(delay),
                     )
-                    sent += 1 if ok else 0
-                    failed += 0 if ok else 1
-                    if not ok:
-                        failed_contacts.append(
-                            {
-                                "id": int(contact["id"]),
-                                "email": contact["email"],
-                                "channel": contact["channel"],
-                                "error": result,
-                            }
+                    if ok:
+                        st.success(message)
+                        st.caption("送信予約はサーバー側で処理されます。タブやPCを閉じても、定期実行が有効なら送信が続きます。")
+                    else:
+                        st.error(message)
+                else:
+                    progress = st.progress(0)
+                    log = st.empty()
+                    sent = failed = 0
+                    failed_contacts = []
+                    for index, contact in enumerate(contacts):
+                        unsubscribe_url = build_unsubscribe_mailto(contact)
+                        subject = render_template(subject_template, contact, unsubscribe_url)
+                        body = render_template(body_template, contact, unsubscribe_url)
+                        ok, result = send_email(contact["email"], subject, body)
+                        execute(
+                            "insert into sends(user_id, contact_id, campaign_key, subject, status, error, sent_at) values (?, ?, ?, ?, ?, ?, ?)",
+                            (current_user_id(), contact["id"], current_campaign_key, subject, "sent" if ok else "failed", "" if ok else result, now_iso()),
                         )
-                    progress.progress((index + 1) / max(len(contacts), 1))
-                    log.write(f"{index + 1}/{len(contacts)}: {contact['email']} - {result}")
-                    if index < len(contacts) - 1:
-                        time.sleep(int(delay))
+                        sent += 1 if ok else 0
+                        failed += 0 if ok else 1
+                        if not ok:
+                            failed_contacts.append(
+                                {
+                                    "id": int(contact["id"]),
+                                    "email": contact["email"],
+                                    "channel": contact["channel"],
+                                    "error": result,
+                                }
+                            )
+                        progress.progress((index + 1) / max(len(contacts), 1))
+                        log.write(f"{index + 1}/{len(contacts)}: {contact['email']} - {result}")
 
-                st.success(f"処理完了: 成功 {sent} 件 / 失敗 {failed} 件")
-                if failed_contacts:
-                    st.error("以下のメールアドレスに送信できませんでした。")
-                    for item in failed_contacts:
-                        columns = st.columns([2.0, 1.6, 3.0, 1.2])
-                        columns[0].write(item["email"])
-                        columns[1].write(item["channel"] or "-")
-                        columns[2].write(item["error"])
-                        if columns[3].button("削除して今後取り込まない", key=f"block_failed_{item['id']}"):
-                            delete_contact(item["id"], block=True, reason="送信失敗")
-                            st.success(f"{item['email']} を削除し、再取り込みしないようにしました")
-                            st.rerun()
+                    st.success(f"処理完了: 成功 {sent} 件 / 失敗 {failed} 件")
+                    if failed_contacts:
+                        st.error("以下のメールアドレスに送信できませんでした。")
+                        for item in failed_contacts:
+                            columns = st.columns([2.0, 1.6, 3.0, 1.2])
+                            columns[0].write(item["email"])
+                            columns[1].write(item["channel"] or "-")
+                            columns[2].write(item["error"])
+                            if columns[3].button("削除して今後取り込まない", key=f"block_failed_{item['id']}"):
+                                delete_contact(item["id"], block=True, reason="送信失敗")
+                                st.success(f"{item['email']} を削除し、再取り込みしないようにしました")
+                                st.rerun()
 
     query = st.query_params
     token = query.get("unsubscribe_token")
