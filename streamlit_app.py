@@ -43,6 +43,16 @@ YOUTUBE_VIDEO_CATEGORIES = {
     "旅行とイベント": "19",
 }
 
+DEFAULT_CAMPAIGN_NAME = "初回案内"
+DEFAULT_CAMPAIGN_SUBJECT = "${channel}へのご連絡"
+DEFAULT_CAMPAIGN_BODY = """突然のご連絡失礼いたします。
+
+${channel}を拝見し、ご連絡いたしました。
+
+もしご興味がありましたら、一度お話しできれば幸いです。
+
+不要な場合は、お手数ですが「配信停止希望」とご返信ください。"""
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -483,6 +493,13 @@ def delete_campaign_template(name: str) -> None:
         "delete from campaign_templates where user_id = ? and name = ?",
         (current_user_id(), name.strip()),
     )
+
+
+def ensure_default_campaign_template() -> None:
+    if fetch_campaign_templates():
+        return
+    save_campaign_template(DEFAULT_CAMPAIGN_NAME, DEFAULT_CAMPAIGN_SUBJECT, DEFAULT_CAMPAIGN_BODY)
+    save_setting("CURRENT_CAMPAIGN_NAME", DEFAULT_CAMPAIGN_NAME)
 
 
 def block_target(email: str = "", youtube_channel_id: str = "", channel: str = "", reason: str = "") -> None:
@@ -1038,6 +1055,8 @@ def main() -> None:
     if not require_login():
         return
 
+    ensure_default_campaign_template()
+
     st.title("Creator Outreach Mailer")
     st.caption("許諾済みの宛先だけに、1件ずつ送信する個人用Webアプリ")
 
@@ -1143,24 +1162,20 @@ def main() -> None:
 
     with right:
         st.subheader("メール作成")
-        default_subject = "${channel}へのご連絡"
-        default_body = """突然のご連絡失礼いたします。
-
-${channel}を拝見し、ご連絡いたしました。
-
-もしご興味がありましたら、一度お話しできれば幸いです。
-
-不要な場合は、お手数ですが「配信停止希望」とご返信ください。"""
+        current_campaign_name = get_setting("CURRENT_CAMPAIGN_NAME", DEFAULT_CAMPAIGN_NAME)
+        current_template = get_campaign_template(current_campaign_name)
         if "campaign_name_input" not in st.session_state:
-            st.session_state["campaign_name_input"] = get_setting("CURRENT_CAMPAIGN_NAME", "初回案内")
+            st.session_state["campaign_name_input"] = current_template["name"] if current_template else current_campaign_name
         if "subject_template_input" not in st.session_state:
-            st.session_state["subject_template_input"] = default_subject
+            st.session_state["subject_template_input"] = current_template["subject"] if current_template else DEFAULT_CAMPAIGN_SUBJECT
         if "body_template_input" not in st.session_state:
-            st.session_state["body_template_input"] = default_body
+            st.session_state["body_template_input"] = current_template["body"] if current_template else DEFAULT_CAMPAIGN_BODY
 
         templates = fetch_campaign_templates()
         template_names = [template["name"] for template in templates]
-        selected_template = st.selectbox("保存済み配信", ["新しく作る"] + template_names)
+        template_options = template_names + ["新しく作る"]
+        selected_index = template_options.index(current_campaign_name) if current_campaign_name in template_options else 0
+        selected_template = st.selectbox("保存済み配信", template_options, index=selected_index)
         load_col, save_col, delete_col = st.columns(3)
         if load_col.button("読み込む", use_container_width=True, disabled=selected_template == "新しく作る"):
             template = get_campaign_template(selected_template)
