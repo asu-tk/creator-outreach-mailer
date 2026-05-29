@@ -101,9 +101,7 @@ def require_login() -> bool:
         return True
     st.title("Creator Outreach Mailer")
     st.write("このアプリを使うにはGoogleログインが必要です。")
-    with st.expander("ログイン設定チェック"):
-        for line in auth_config_status():
-            st.write(line)
+    st.info("ログインできない場合は、Streamlitのプレビューや埋め込み画面ではなく、Chrome / Edge / Safari などの通常ブラウザで開いてください。")
     st.button("Googleでログイン", on_click=st.login)
     st.stop()
 
