@@ -2887,6 +2887,11 @@ def main() -> None:
         st.caption("同じ配信名ですでに送った宛先、または送信待ちの宛先は自動で除外します。送信対象は、未送信の宛先を優先し、その後は最終送信日時が古い順に選ばれます。")
 
         preview_contacts = fetch_next_send_contacts(current_campaign_key, 1) if campaign_name.strip() else []
+        confirmation_contacts = (
+            fetch_next_send_contacts(current_campaign_key, min(int(planned_count), 3))
+            if campaign_name.strip() and planned_count > 0
+            else []
+        )
         safety_messages = safety_check_messages(
             subject_template,
             body_template,
@@ -2916,6 +2921,59 @@ def main() -> None:
                 )
                 st.text_input("プレビュー件名", value=preview_subject, disabled=True)
                 st.text_area("プレビュー本文", value=preview_body, height=260, disabled=True)
+
+        with st.expander("送信前の最終確認", expanded=True):
+            account = active_smtp_account()
+            sender_label = smtp_mail_from(account).strip() or "未設定"
+            finish_label = "-"
+            start_label = "-"
+            duration_label = "-"
+            if planned_count > 0 and preview_schedule:
+                start_label = format_local_datetime(preview_schedule[0])
+                finish_label = format_local_datetime(preview_schedule[-1])
+                duration_minutes = max(1, int((preview_schedule[-1] - preview_schedule[0]).total_seconds() // 60) + 1)
+                duration_label = f"約{duration_minutes:,}分"
+
+            confirm_cols = st.columns(3)
+            confirm_cols[0].metric("今回送信予約する件数", f"{planned_count}件")
+            confirm_cols[1].metric("送信間隔", f"{int(delay)}秒に1通")
+            confirm_cols[2].metric("完了予定", finish_label)
+
+            detail_frame = pd.DataFrame(
+                [
+                    {"確認項目": "配信名", "内容": campaign_name.strip() or "-"},
+                    {"確認項目": "送信元", "内容": sender_label},
+                    {"確認項目": "件名", "内容": subject_template.strip() or "-"},
+                    {"確認項目": "送信してよい時間", "内容": f"{send_window_start:%H:%M} から {send_window_end:%H:%M} まで"},
+                    {"確認項目": "開始予定", "内容": start_label},
+                    {"確認項目": "所要時間の目安", "内容": duration_label},
+                    {"確認項目": "この配信の送信済み", "内容": f"{already_sent_count}件"},
+                    {"確認項目": "この配信の送信待ち", "内容": f"{queued_count}件"},
+                    {"確認項目": "この配信の未送信", "内容": f"{remaining_count}件"},
+                ]
+            )
+            st.dataframe(detail_frame, use_container_width=True, hide_index=True)
+
+            if confirmation_contacts:
+                st.caption("今回の先頭候補です。実際の送信対象は、未送信優先・最終送信が古い順で選ばれます。")
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "チャンネル": contact["channel"] or "-",
+                                "メールアドレス": contact["email"] or "-",
+                                "名前": contact["name"] or "-",
+                                "最終送信": contact["last_sent"] or "未送信",
+                            }
+                            for contact in confirmation_contacts
+                        ]
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                st.warning("今回送信予約できる宛先がありません。")
+            final_confirmed = st.checkbox("上の送信内容・件数・送信元・時間帯を確認しました", key="final_send_confirmed")
 
         recent_jobs = fetch_recent_send_jobs()
         if recent_jobs:
@@ -3014,6 +3072,8 @@ def main() -> None:
                 preflight_errors.append("メールを送ってよい時間は、「この時間まで」を「この時間から」より後にしてください。")
             if not confirmed:
                 preflight_errors.append("送信前の確認にチェックしてください。これは、送信対象が許諾済み、または法的に送信可能な宛先であることを確認するためのチェックです。")
+            if run_all and not final_confirmed:
+                preflight_errors.append("送信前の最終確認にチェックしてください。")
             if preflight_errors:
                 st.error("送信前に直す項目があります。\n\n" + "\n".join(f"- {error}" for error in preflight_errors))
             else:
