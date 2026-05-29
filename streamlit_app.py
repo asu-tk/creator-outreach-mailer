@@ -306,6 +306,7 @@ def init_db() -> None:
                 id integer primary key autoincrement,
                 user_id text not null default 'local-user',
                 name text not null,
+                sort_order integer not null default 0,
                 subject text not null default '',
                 body text not null default '',
                 updated_at text not null
@@ -333,6 +334,10 @@ def init_db() -> None:
         sends_columns = [row[1] for row in db.execute("pragma table_info(sends)").fetchall()]
         if "campaign_key" not in sends_columns:
             db.execute("alter table sends add column campaign_key text not null default ''")
+        campaign_columns = [row[1] for row in db.execute("pragma table_info(campaign_templates)").fetchall()]
+        if "sort_order" not in campaign_columns:
+            db.execute("alter table campaign_templates add column sort_order integer not null default 0")
+            db.execute("update campaign_templates set sort_order = id where sort_order = 0")
         db.commit()
 
 
@@ -449,10 +454,10 @@ def delete_setting(key: str) -> None:
 def fetch_campaign_templates() -> list[sqlite3.Row]:
     return rows(
         """
-        select id, name, subject, body, updated_at
+        select id, name, sort_order, subject, body, updated_at
         from campaign_templates
         where user_id = ?
-        order by id asc
+        order by sort_order asc, id asc
         """,
         (current_user_id(),),
     )
@@ -461,7 +466,7 @@ def fetch_campaign_templates() -> list[sqlite3.Row]:
 def get_campaign_template(name: str) -> sqlite3.Row | None:
     matches = rows(
         """
-        select id, name, subject, body, updated_at
+        select id, name, sort_order, subject, body, updated_at
         from campaign_templates
         where user_id = ? and name = ?
         limit 1
@@ -475,16 +480,25 @@ def save_campaign_template(name: str, subject: str, body: str) -> None:
     clean_name = name.strip()
     if not clean_name:
         return
+    existing = get_campaign_template(clean_name)
+    if existing:
+        sort_order = int(existing["sort_order"])
+    else:
+        max_order = rows(
+            "select coalesce(max(sort_order), 0) as max_order from campaign_templates where user_id = ?",
+            (current_user_id(),),
+        )[0]["max_order"]
+        sort_order = int(max_order) + 10
     execute(
         "delete from campaign_templates where user_id = ? and name = ?",
         (current_user_id(), clean_name),
     )
     execute(
         """
-        insert into campaign_templates(user_id, name, subject, body, updated_at)
-        values(?, ?, ?, ?, ?)
+        insert into campaign_templates(user_id, name, sort_order, subject, body, updated_at)
+        values(?, ?, ?, ?, ?, ?)
         """,
-        (current_user_id(), clean_name, subject, body, now_iso()),
+        (current_user_id(), clean_name, sort_order, subject, body, now_iso()),
     )
 
 
@@ -492,6 +506,27 @@ def delete_campaign_template(name: str) -> None:
     execute(
         "delete from campaign_templates where user_id = ? and name = ?",
         (current_user_id(), name.strip()),
+    )
+
+
+def move_campaign_template(name: str, direction: int) -> None:
+    templates = fetch_campaign_templates()
+    names = [template["name"] for template in templates]
+    if name not in names:
+        return
+    index = names.index(name)
+    new_index = index + direction
+    if new_index < 0 or new_index >= len(templates):
+        return
+    current = templates[index]
+    other = templates[new_index]
+    execute(
+        "update campaign_templates set sort_order = ? where user_id = ? and id = ?",
+        (int(other["sort_order"]), current_user_id(), int(current["id"])),
+    )
+    execute(
+        "update campaign_templates set sort_order = ? where user_id = ? and id = ?",
+        (int(current["sort_order"]), current_user_id(), int(other["id"])),
     )
 
 
@@ -1176,7 +1211,7 @@ def main() -> None:
         template_options = ["新しく作る"] + template_names
         selected_index = template_options.index(current_campaign_name) if current_campaign_name in template_options else 0
         selected_template = st.selectbox("保存済み配信", template_options, index=selected_index)
-        load_col, save_col, delete_col = st.columns(3)
+        load_col, save_col, delete_col, up_col, down_col = st.columns(5)
         if load_col.button("読み込む", use_container_width=True, disabled=selected_template == "新しく作る"):
             template = get_campaign_template(selected_template)
             if template:
@@ -1184,6 +1219,15 @@ def main() -> None:
                 st.session_state["subject_template_input"] = template["subject"]
                 st.session_state["body_template_input"] = template["body"]
                 st.rerun()
+        selected_template_index = template_names.index(selected_template) if selected_template in template_names else -1
+        if up_col.button("上へ", use_container_width=True, disabled=selected_template_index <= 0):
+            move_campaign_template(selected_template, -1)
+            save_setting("CURRENT_CAMPAIGN_NAME", selected_template)
+            st.rerun()
+        if down_col.button("下へ", use_container_width=True, disabled=selected_template_index < 0 or selected_template_index >= len(template_names) - 1):
+            move_campaign_template(selected_template, 1)
+            save_setting("CURRENT_CAMPAIGN_NAME", selected_template)
+            st.rerun()
         campaign_name = st.text_input("配信名", key="campaign_name_input")
         st.caption("同じ配信名の間は、本文を少し直しても同じ配信として進捗を引き継ぎます。新しい別メールを送る時だけ配信名を変えてください。")
         subject_template = st.text_input("件名", key="subject_template_input")
