@@ -1367,6 +1367,8 @@ def blocked_target_reason(email: str = "", youtube_channel_id: str = "") -> str:
 def unblock_target(email: str = "", youtube_channel_id: str = "") -> None:
     normalized_email = email.strip().lower()
     channel_id = youtube_channel_id.strip()
+    if not normalized_email and not channel_id:
+        return
     execute(
         """
         delete from blocked_targets
@@ -1377,7 +1379,36 @@ def unblock_target(email: str = "", youtube_channel_id: str = "") -> None:
 
 
 def unblock_target_by_id(blocked_id: int) -> None:
+    blocked = rows(
+        "select email, youtube_channel_id from blocked_targets where user_id = ? and id = ?",
+        (current_user_id(), int(blocked_id)),
+    )
+    if blocked:
+        unblock_target(str(blocked[0]["email"] or ""), str(blocked[0]["youtube_channel_id"] or ""))
     execute("delete from blocked_targets where user_id = ? and id = ?", (current_user_id(), int(blocked_id)))
+
+
+def cleanup_blocked_targets_for_existing_contacts() -> None:
+    execute(
+        """
+        delete from blocked_targets
+        where user_id = ?
+          and (
+              (email != '' and email in (
+                  select lower(email)
+                  from contacts
+                  where user_id = ? and email != ''
+              ))
+              or
+              (youtube_channel_id != '' and youtube_channel_id in (
+                  select youtube_channel_id
+                  from contacts
+                  where user_id = ? and youtube_channel_id != ''
+              ))
+          )
+        """,
+        (current_user_id(), current_user_id(), current_user_id()),
+    )
 
 
 def delete_contact(contact_id: int, block: bool = False, reason: str = "") -> None:
@@ -2449,6 +2480,7 @@ def main() -> None:
     ensure_default_campaign_template()
     sync_send_queue_results()
     sync_unsubscribes_from_supabase()
+    cleanup_blocked_targets_for_existing_contacts()
 
     st.title("Creator Outreach Mailer")
     st.caption("許諾済みの宛先だけに、1件ずつ送信する個人用Webアプリ")
@@ -3015,6 +3047,7 @@ def main() -> None:
 
     st.divider()
     st.subheader("宛先一覧")
+    cleanup_blocked_targets_for_existing_contacts()
     contacts = fetch_contacts()
     blocked_targets = fetch_blocked_targets()
     if not blocked_targets.empty:
