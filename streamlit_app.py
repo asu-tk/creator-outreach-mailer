@@ -7,6 +7,7 @@ import smtplib
 import sqlite3
 import time
 import json
+import hashlib
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -49,6 +50,11 @@ def now_iso() -> str:
 
 def today_key() -> str:
     return datetime.now().strftime("%Y-%m-%d")
+
+
+def campaign_key(subject_template: str, body_template: str) -> str:
+    normalized = subject_template.strip() + "\n---body---\n" + body_template.strip()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def auth_is_configured() -> bool:
@@ -240,6 +246,7 @@ def init_db() -> None:
                 id integer primary key autoincrement,
                 user_id text not null default 'local-user',
                 contact_id integer not null,
+                campaign_key text not null default '',
                 subject text not null,
                 status text not null,
                 error text not null default '',
@@ -304,6 +311,9 @@ def init_db() -> None:
             table_columns = [row[1] for row in db.execute(f"pragma table_info({table})").fetchall()]
             if "user_id" not in table_columns:
                 db.execute(f"alter table {table} add column user_id text not null default 'local-user'")
+        sends_columns = [row[1] for row in db.execute("pragma table_info(sends)").fetchall()]
+        if "campaign_key" not in sends_columns:
+            db.execute("alter table sends add column campaign_key text not null default ''")
         db.commit()
 
 
@@ -1091,9 +1101,45 @@ ${channel}を拝見し、ご連絡いたしました。
         send_limit = st.number_input("今回送信する件数", min_value=1, max_value=500, value=50)
         confirmed = st.checkbox("送信対象が許諾済み、または法的に送信可能な宛先であることを確認しました")
 
-        target_count = rows("select count(*) as count from contacts where user_id = ? and consent = 1 and unsubscribed = 0 and email != ''", (current_user_id(),))[0]["count"]
-        st.metric("送信対象", f"{target_count}件")
-        st.caption("送信対象は、未送信の宛先を優先し、その後は最終送信日時が古い順に選ばれます。")
+        current_campaign_key = campaign_key(subject_template, body_template)
+        target_count = rows(
+            "select count(*) as count from contacts where user_id = ? and consent = 1 and unsubscribed = 0 and email != ''",
+            (current_user_id(),),
+        )[0]["count"]
+        already_sent_count = rows(
+            """
+            select count(distinct contact_id) as count
+            from sends
+            where user_id = ? and campaign_key = ? and status = 'sent'
+            """,
+            (current_user_id(), current_campaign_key),
+        )[0]["count"]
+        remaining_count = rows(
+            """
+            select count(*) as count
+            from contacts c
+            where c.user_id = ?
+              and c.consent = 1
+              and c.unsubscribed = 0
+              and c.email != ''
+              and not exists (
+                  select 1
+                  from sends s
+                  where s.user_id = c.user_id
+                    and s.contact_id = c.id
+                    and s.campaign_key = ?
+                    and s.status = 'sent'
+              )
+            """,
+            (current_user_id(), current_campaign_key),
+        )[0]["count"]
+        metric_cols = st.columns(3)
+        metric_cols[0].metric("送信対象", f"{target_count}件")
+        metric_cols[1].metric("この文章を送信済み", f"{already_sent_count}件")
+        metric_cols[2].metric("この文章の未送信", f"{remaining_count}件")
+        if remaining_count == 0 and target_count > 0:
+            st.success("この件名・本文は、現在の送信対象すべてに送信済みです。")
+        st.caption("同じ件名・本文をすでに送った宛先は自動で除外します。送信対象は、未送信の宛先を優先し、その後は最終送信日時が古い順に選ばれます。")
 
         test_button, send_button = st.columns(2)
         with test_button:
@@ -1113,6 +1159,14 @@ ${channel}を拝見し、ご連絡いたしました。
                     from contacts c
                     left join sends s on s.contact_id = c.id and s.status = 'sent'
                     where c.user_id = ? and c.consent = 1 and c.unsubscribed = 0 and c.email != ''
+                      and not exists (
+                          select 1
+                          from sends sent_campaign
+                          where sent_campaign.user_id = c.user_id
+                            and sent_campaign.contact_id = c.id
+                            and sent_campaign.campaign_key = ?
+                            and sent_campaign.status = 'sent'
+                      )
                     group by c.id
                     order by
                         case when max(s.sent_at) is null then 0 else 1 end,
@@ -1120,7 +1174,7 @@ ${channel}を拝見し、ご連絡いたしました。
                         c.id asc
                     """
                     ,
-                    (current_user_id(),),
+                    (current_user_id(), current_campaign_key),
                 )
                 if run_test:
                     contacts = contacts[:1]
@@ -1137,8 +1191,8 @@ ${channel}を拝見し、ご連絡いたしました。
                     body = render_template(body_template, contact, unsubscribe_url)
                     ok, result = send_email(contact["email"], subject, body)
                     execute(
-                        "insert into sends(user_id, contact_id, subject, status, error, sent_at) values (?, ?, ?, ?, ?, ?)",
-                        (current_user_id(), contact["id"], subject, "sent" if ok else "failed", "" if ok else result, now_iso()),
+                        "insert into sends(user_id, contact_id, campaign_key, subject, status, error, sent_at) values (?, ?, ?, ?, ?, ?, ?)",
+                        (current_user_id(), contact["id"], current_campaign_key, subject, "sent" if ok else "failed", "" if ok else result, now_iso()),
                     )
                     sent += 1 if ok else 0
                     failed += 0 if ok else 1
