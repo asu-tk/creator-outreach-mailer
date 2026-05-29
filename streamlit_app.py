@@ -683,6 +683,23 @@ def init_db() -> None:
                 campaign_key text not null default '',
                 unsubscribed_at text not null
             );
+
+            create table if not exists scenarios (
+                id integer primary key autoincrement,
+                user_id text not null default 'local-user',
+                name text not null,
+                created_at text not null,
+                updated_at text not null
+            );
+
+            create table if not exists scenario_steps (
+                id integer primary key autoincrement,
+                user_id text not null default 'local-user',
+                scenario_id integer not null,
+                step_number integer not null,
+                template_name text not null,
+                foreign key(scenario_id) references scenarios(id)
+            );
             """
         )
         columns = [row[1] for row in db.execute("pragma table_info(contacts)").fetchall()]
@@ -701,7 +718,7 @@ def init_db() -> None:
         for column, statement in migrations.items():
             if column not in columns:
                 db.execute(statement)
-        for table in ["sends", "settings", "youtube_candidates", "youtube_api_usage", "blocked_targets", "campaign_templates", "smtp_accounts", "unsubscribe_events"]:
+        for table in ["sends", "settings", "youtube_candidates", "youtube_api_usage", "blocked_targets", "campaign_templates", "smtp_accounts", "unsubscribe_events", "scenarios", "scenario_steps"]:
             table_columns = [row[1] for row in db.execute(f"pragma table_info({table})").fetchall()]
             if "user_id" not in table_columns:
                 db.execute(f"alter table {table} add column user_id text not null default 'local-user'")
@@ -812,6 +829,8 @@ APP_STATE_TABLES = [
     "blocked_targets",
     "campaign_templates",
     "unsubscribe_events",
+    "scenarios",
+    "scenario_steps",
 ]
 
 
@@ -868,6 +887,8 @@ def restore_local_app_state(state: dict) -> None:
         "blocked_targets",
         "campaign_templates",
         "unsubscribe_events",
+        "scenario_steps",
+        "scenarios",
     ]
     insert_order = [
         "contacts",
@@ -878,6 +899,8 @@ def restore_local_app_state(state: dict) -> None:
         "blocked_targets",
         "campaign_templates",
         "unsubscribe_events",
+        "scenarios",
+        "scenario_steps",
         "sends",
     ]
 
@@ -1290,6 +1313,81 @@ def save_campaign_template_order(names: list[str]) -> None:
 def campaign_template_list_key(names: list[str]) -> str:
     digest = hashlib.sha1("|".join(names).encode("utf-8")).hexdigest()[:10]
     return f"campaign_template_sort_{digest}"
+
+
+def fetch_scenarios() -> list[sqlite3.Row]:
+    return rows(
+        """
+        select id, name, created_at, updated_at
+        from scenarios
+        where user_id = ?
+        order by id asc
+        """,
+        (current_user_id(),),
+    )
+
+
+def fetch_scenario_steps(scenario_id: int) -> list[sqlite3.Row]:
+    return rows(
+        """
+        select id, scenario_id, step_number, template_name
+        from scenario_steps
+        where user_id = ? and scenario_id = ?
+        order by step_number asc, id asc
+        """,
+        (current_user_id(), int(scenario_id)),
+    )
+
+
+def save_scenario(name: str, template_names: list[str]) -> int | None:
+    clean_name = name.strip()
+    clean_templates = [template.strip() for template in template_names if template.strip()]
+    if not clean_name or not clean_templates:
+        return None
+    existing = rows(
+        "select id from scenarios where user_id = ? and name = ? limit 1",
+        (current_user_id(), clean_name),
+    )
+    if existing:
+        scenario_id = int(existing[0]["id"])
+        execute(
+            "update scenarios set updated_at = ? where user_id = ? and id = ?",
+            (now_iso(), current_user_id(), scenario_id),
+        )
+    else:
+        execute(
+            "insert into scenarios(user_id, name, created_at, updated_at) values (?, ?, ?, ?)",
+            (current_user_id(), clean_name, now_iso(), now_iso()),
+        )
+        scenario_id = int(
+            rows(
+                "select id from scenarios where user_id = ? and name = ? order by id desc limit 1",
+                (current_user_id(), clean_name),
+            )[0]["id"]
+        )
+    execute("delete from scenario_steps where user_id = ? and scenario_id = ?", (current_user_id(), scenario_id))
+    for index, template_name in enumerate(clean_templates, start=1):
+        execute(
+            """
+            insert into scenario_steps(user_id, scenario_id, step_number, template_name)
+            values (?, ?, ?, ?)
+            """,
+            (current_user_id(), scenario_id, index, template_name),
+        )
+    return scenario_id
+
+
+def delete_scenario(scenario_id: int) -> None:
+    execute("delete from scenario_steps where user_id = ? and scenario_id = ?", (current_user_id(), int(scenario_id)))
+    execute("delete from scenarios where user_id = ? and id = ?", (current_user_id(), int(scenario_id)))
+
+
+def scenario_step_campaign_name(scenario_name: str, step_number: int, template_name: str) -> str:
+    return f"{scenario_name}｜{int(step_number)}通目 {template_name}"
+
+
+def scenario_step_campaign_key(scenario_id: int, step_number: int) -> str:
+    return campaign_key(f"scenario:{int(scenario_id)}:step:{int(step_number)}")
 
 
 def change_candidate_page(delta: int, total_pages: int) -> None:
@@ -2236,9 +2334,31 @@ def fetch_recent_send_jobs() -> list[dict]:
         return []
 
 
-def fetch_next_send_contacts(campaign_key_value: str, limit: int) -> list[sqlite3.Row]:
+def prerequisite_sql(prerequisite_keys: list[str], contact_alias: str = "c") -> tuple[str, list[str]]:
+    conditions = []
+    params = []
+    for index, key in enumerate(prerequisite_keys):
+        alias = f"prereq_{index}"
+        conditions.append(
+            f"""
+            and exists (
+                select 1
+                from sends {alias}
+                where {alias}.user_id = {contact_alias}.user_id
+                  and {alias}.contact_id = {contact_alias}.id
+                  and {alias}.campaign_key = ?
+                  and {alias}.status = 'sent'
+            )
+            """
+        )
+        params.append(key)
+    return "\n".join(conditions), params
+
+
+def fetch_next_send_contacts(campaign_key_value: str, limit: int, prerequisite_keys: list[str] | None = None) -> list[sqlite3.Row]:
+    prereq_sql, prereq_params = prerequisite_sql(prerequisite_keys or [])
     return rows(
-        """
+        f"""
         select
             c.*,
             max(s.sent_at) as last_sent
@@ -2254,6 +2374,7 @@ def fetch_next_send_contacts(campaign_key_value: str, limit: int) -> list[sqlite
                 and sent_campaign.campaign_key = ?
                 and sent_campaign.status in ('sent', 'queued')
           )
+        {prereq_sql}
         group by c.id
         order by
             case when max(s.sent_at) is null then 0 else 1 end,
@@ -2261,8 +2382,44 @@ def fetch_next_send_contacts(campaign_key_value: str, limit: int) -> list[sqlite
             c.id asc
         limit ?
         """,
-        (current_user_id(), campaign_key_value, int(limit)),
+        (current_user_id(), campaign_key_value, *prereq_params, int(limit)),
     )
+
+
+def count_next_send_contacts(campaign_key_value: str, prerequisite_keys: list[str] | None = None) -> int:
+    prereq_sql, prereq_params = prerequisite_sql(prerequisite_keys or [])
+    return int(
+        rows(
+            f"""
+            select count(*) as count
+            from contacts c
+            where c.user_id = ?
+              and c.consent = 1
+              and c.unsubscribed = 0
+              and c.email != ''
+              and coalesce(c.contact_status, '送信対象') in ('未確認', 'メール確認済み', '送信対象')
+              and not exists (
+                  select 1
+                  from sends s
+                  where s.user_id = c.user_id
+                    and s.contact_id = c.id
+                    and s.campaign_key = ?
+                    and s.status in ('sent', 'queued')
+              )
+              {prereq_sql}
+            """,
+            (current_user_id(), campaign_key_value, *prereq_params),
+        )[0]["count"]
+        or 0
+    )
+
+
+def count_waiting_for_prerequisites(campaign_key_value: str, prerequisite_keys: list[str]) -> int:
+    if not prerequisite_keys:
+        return 0
+    qualified_count = count_next_send_contacts(campaign_key_value, prerequisite_keys)
+    unrestricted_count = count_next_send_contacts(campaign_key_value, [])
+    return max(0, int(unrestricted_count) - int(qualified_count))
 
 
 def fetch_failed_sends(limit: int = 20) -> pd.DataFrame:
@@ -2964,10 +3121,105 @@ def main() -> None:
                     use_container_width=True,
                     hide_index=True,
                 )
+        if template_names:
+            scenarios = fetch_scenarios()
+            with st.expander("シナリオ設定"):
+                st.caption("テンプレートの並び順とは別に、ステップメールの順番を固定できます。ここで決めた順番は、テンプレート一覧を並び替えても崩れません。")
+                scenario_options = ["新しく作る"] + [scenario["name"] for scenario in scenarios]
+                selected_scenario_name = st.selectbox("編集するシナリオ", scenario_options, key="scenario_editor_select")
+                selected_scenario = None
+                selected_scenario_steps = []
+                if selected_scenario_name != "新しく作る":
+                    selected_scenario = next((scenario for scenario in scenarios if scenario["name"] == selected_scenario_name), None)
+                    if selected_scenario:
+                        selected_scenario_steps = fetch_scenario_steps(int(selected_scenario["id"]))
+                scenario_name_input = st.text_input(
+                    "シナリオ名",
+                    value=selected_scenario["name"] if selected_scenario else "",
+                    placeholder="例: 初回営業シナリオ",
+                    key=f"scenario_name_input_{selected_scenario_name}",
+                )
+                existing_step_map = {
+                    int(step["step_number"]): step["template_name"]
+                    for step in selected_scenario_steps
+                }
+                step_values = []
+                for step_number in range(1, 8):
+                    default_template = existing_step_map.get(step_number, "")
+                    default_index = template_names.index(default_template) + 1 if default_template in template_names else 0
+                    step_template = st.selectbox(
+                        f"{step_number}通目",
+                        ["使わない"] + template_names,
+                        index=default_index,
+                        key=f"scenario_step_{selected_scenario_name}_{step_number}",
+                    )
+                    if step_template != "使わない":
+                        step_values.append(step_template)
+                scenario_save_col, scenario_delete_col = st.columns(2)
+                if scenario_save_col.button("シナリオを保存", key=f"save_scenario_{selected_scenario_name}", use_container_width=True):
+                    if not scenario_name_input.strip():
+                        st.error("シナリオ名を入力してください")
+                    elif not step_values:
+                        st.error("1通目以降に使うテンプレートを選んでください")
+                    else:
+                        save_scenario(scenario_name_input, step_values)
+                        st.success(f"シナリオ「{scenario_name_input}」を保存しました")
+                        st.rerun()
+                if selected_scenario and scenario_delete_col.button("このシナリオを削除", key=f"delete_scenario_{selected_scenario['id']}", use_container_width=True):
+                    delete_scenario(int(selected_scenario["id"]))
+                    st.success(f"シナリオ「{selected_scenario_name}」を削除しました")
+                    st.rerun()
         campaign_name = st.text_input("配信名", key="campaign_name_input")
         st.caption("同じ配信名の間は、本文を少し直しても同じ配信として進捗を引き継ぎます。新しい別メールを送る時だけ配信名を変えてください。")
         subject_template = st.text_input("件名", key="subject_template_input")
         body_template = st.text_area("本文", height=260, key="body_template_input")
+        effective_campaign_name = campaign_name
+        effective_campaign_key = campaign_key(campaign_name)
+        effective_subject_template = subject_template
+        effective_body_template = body_template
+        prerequisite_campaign_keys: list[str] = []
+        scenario_context = ""
+        scenarios_for_send = fetch_scenarios()
+        if scenarios_for_send:
+            send_mode = st.radio("送信方式", ["通常配信", "シナリオ配信"], horizontal=True, key="send_mode")
+            if send_mode == "シナリオ配信":
+                scenario_labels = [scenario["name"] for scenario in scenarios_for_send]
+                scenario_label = st.selectbox("送信するシナリオ", scenario_labels, key="send_scenario_select")
+                send_scenario = next((scenario for scenario in scenarios_for_send if scenario["name"] == scenario_label), None)
+                if send_scenario:
+                    send_steps = fetch_scenario_steps(int(send_scenario["id"]))
+                    if not send_steps:
+                        st.warning("このシナリオにはステップがありません。シナリオ設定でテンプレートを割り当ててください。")
+                    else:
+                        step_labels = [f"{step['step_number']}通目: {step['template_name']}" for step in send_steps]
+                        selected_step_label = st.selectbox("今回送るステップ", step_labels, key="send_scenario_step_select")
+                        selected_step_index = step_labels.index(selected_step_label)
+                        selected_step = send_steps[selected_step_index]
+                        selected_template_for_step = get_campaign_template(selected_step["template_name"])
+                        prerequisite_campaign_keys = [
+                            scenario_step_campaign_key(int(send_scenario["id"]), int(step["step_number"]))
+                            for step in send_steps[:selected_step_index]
+                        ]
+                        effective_campaign_name = scenario_step_campaign_name(
+                            send_scenario["name"],
+                            int(selected_step["step_number"]),
+                            selected_step["template_name"],
+                        )
+                        effective_campaign_key = scenario_step_campaign_key(
+                            int(send_scenario["id"]),
+                            int(selected_step["step_number"]),
+                        )
+                        if selected_template_for_step:
+                            effective_subject_template = selected_template_for_step["subject"]
+                            effective_body_template = selected_template_for_step["body"]
+                        scenario_context = (
+                            f"シナリオ「{send_scenario['name']}」の{selected_step['step_number']}通目です。"
+                            f"{'前のステップを送信済みの宛先だけが対象です。' if prerequisite_campaign_keys else '1通目なので前提条件はありません。'}"
+                        )
+                        st.info(scenario_context)
+                        st.caption(f"このステップで使うテンプレート: {selected_step['template_name']}")
+            else:
+                st.caption("通常配信では、配信名ごとに送信済み・送信待ちを判定します。")
         if save_col.button("保存 / 更新", key="save_campaign_template", use_container_width=True):
             if campaign_name.strip():
                 save_campaign_template(campaign_name, subject_template, body_template)
@@ -2998,7 +3250,7 @@ def main() -> None:
             st.warning("今回の送信件数が多めです。送信先の反応、迷惑メール判定、サーバー制限を確認しながら少しずつ増やしてください。")
         confirmed = st.checkbox("送信対象が許諾済み、または法的に送信可能な宛先であることを確認しました")
 
-        current_campaign_key = campaign_key(campaign_name)
+        current_campaign_key = effective_campaign_key
         target_count = rows(
             """
             select count(*) as count
@@ -3027,31 +3279,15 @@ def main() -> None:
             """,
             (current_user_id(), current_campaign_key),
         )[0]["count"]
-        remaining_count = rows(
-            """
-            select count(*) as count
-            from contacts c
-            where c.user_id = ?
-              and c.consent = 1
-              and c.unsubscribed = 0
-              and c.email != ''
-              and coalesce(c.contact_status, '送信対象') in ('未確認', 'メール確認済み', '送信対象')
-              and not exists (
-                  select 1
-                  from sends s
-                  where s.user_id = c.user_id
-                    and s.contact_id = c.id
-                    and s.campaign_key = ?
-                    and s.status in ('sent', 'queued')
-              )
-            """,
-            (current_user_id(), current_campaign_key),
-        )[0]["count"]
+        remaining_count = count_next_send_contacts(current_campaign_key, prerequisite_campaign_keys)
+        prerequisite_waiting_count = count_waiting_for_prerequisites(current_campaign_key, prerequisite_campaign_keys)
         metric_cols = st.columns(4)
         metric_cols[0].metric("送信対象", f"{target_count}件")
         metric_cols[1].metric("この配信を送信済み", f"{already_sent_count}件")
         metric_cols[2].metric("送信待ち", f"{queued_count}件")
         metric_cols[3].metric("この配信の未送信", f"{remaining_count}件")
+        if prerequisite_waiting_count:
+            st.warning(f"前のステップが未送信のため、{prerequisite_waiting_count}件は今回の対象から外れています。")
         planned_count = min(int(send_limit), int(remaining_count))
         preview_schedule = build_send_schedule(
             planned_count,
@@ -3073,15 +3309,15 @@ def main() -> None:
             st.success("この配信名では、現在の送信対象すべてが送信済み、または送信待ちです。")
         st.caption("同じ配信名ですでに送った宛先、または送信待ちの宛先は自動で除外します。送信対象は、未送信の宛先を優先し、その後は最終送信日時が古い順に選ばれます。")
 
-        preview_contacts = fetch_next_send_contacts(current_campaign_key, 1) if campaign_name.strip() else []
+        preview_contacts = fetch_next_send_contacts(current_campaign_key, 1, prerequisite_campaign_keys) if effective_campaign_name.strip() else []
         confirmation_contacts = (
-            fetch_next_send_contacts(current_campaign_key, min(int(planned_count), 3))
-            if campaign_name.strip() and planned_count > 0
+            fetch_next_send_contacts(current_campaign_key, min(int(planned_count), 3), prerequisite_campaign_keys)
+            if effective_campaign_name.strip() and planned_count > 0
             else []
         )
         safety_messages = safety_check_messages(
-            subject_template,
-            body_template,
+            effective_subject_template,
+            effective_body_template,
             int(send_limit),
             int(planned_count),
             bool(preview_contacts),
@@ -3096,9 +3332,9 @@ def main() -> None:
             else:
                 preview_contact = preview_contacts[0]
                 preview_unsubscribe_url = build_unsubscribe_url(preview_contact)
-                preview_subject = render_template(subject_template, preview_contact, preview_unsubscribe_url)
+                preview_subject = render_template(effective_subject_template, preview_contact, preview_unsubscribe_url)
                 preview_body = render_template(
-                    ensure_unsubscribe_link_template(body_template),
+                    ensure_unsubscribe_link_template(effective_body_template),
                     preview_contact,
                     preview_unsubscribe_url,
                 )
@@ -3128,9 +3364,9 @@ def main() -> None:
 
             detail_frame = pd.DataFrame(
                 [
-                    {"確認項目": "配信名", "内容": campaign_name.strip() or "-"},
+                    {"確認項目": "配信名", "内容": effective_campaign_name.strip() or "-"},
                     {"確認項目": "送信元", "内容": sender_label},
-                    {"確認項目": "件名", "内容": subject_template.strip() or "-"},
+                    {"確認項目": "件名", "内容": effective_subject_template.strip() or "-"},
                     {"確認項目": "送信してよい時間", "内容": f"{send_window_start:%H:%M} から {send_window_end:%H:%M} まで"},
                     {"確認項目": "開始予定", "内容": start_label},
                     {"確認項目": "所要時間の目安", "内容": duration_label},
@@ -3320,7 +3556,7 @@ def main() -> None:
 
         if run_test or run_all:
             preflight_errors = []
-            if not campaign_name.strip():
+            if not effective_campaign_name.strip():
                 preflight_errors.append("配信名を入力してください。")
             if not smtp_configured():
                 preflight_errors.append("送信元メール設定が未完了です。SMTPサーバー、ポート、送信元メールアドレス、SMTPパスワードを確認してください。")
@@ -3333,8 +3569,9 @@ def main() -> None:
             if preflight_errors:
                 st.error("送信前に直す項目があります。\n\n" + "\n".join(f"- {error}" for error in preflight_errors))
             else:
-                save_setting("CURRENT_CAMPAIGN_NAME", campaign_name.strip())
-                contacts = fetch_next_send_contacts(current_campaign_key, int(send_limit))
+                if not scenario_context:
+                    save_setting("CURRENT_CAMPAIGN_NAME", campaign_name.strip())
+                contacts = fetch_next_send_contacts(current_campaign_key, int(send_limit), prerequisite_campaign_keys)
                 if run_test:
                     contacts = contacts[:1]
 
@@ -3342,10 +3579,10 @@ def main() -> None:
                     st.error("送信できる宛先がありません。宛先一覧、送信済み状況、配信名を確認してください。")
                 elif run_all:
                     ok, message = create_send_job(
-                        campaign_name,
+                        effective_campaign_name,
                         current_campaign_key,
-                        subject_template,
-                        body_template,
+                        effective_subject_template,
+                        effective_body_template,
                         contacts,
                         int(delay),
                         send_window_start,
@@ -3365,8 +3602,8 @@ def main() -> None:
                     for index, contact in enumerate(contacts):
                         register_unsubscribe_token(contact, user_email)
                         unsubscribe_url = build_unsubscribe_url(contact)
-                        subject = render_template(subject_template, contact, unsubscribe_url)
-                        body = render_template(ensure_unsubscribe_link_template(body_template), contact, unsubscribe_url)
+                        subject = render_template(effective_subject_template, contact, unsubscribe_url)
+                        body = render_template(ensure_unsubscribe_link_template(effective_body_template), contact, unsubscribe_url)
                         ok, result = send_email(contact["email"], subject, body)
                         execute(
                             "insert into sends(user_id, contact_id, campaign_key, subject, status, error, sent_at) values (?, ?, ?, ?, ?, ?, ?)",
