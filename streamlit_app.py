@@ -2375,13 +2375,36 @@ def prerequisite_sql(prerequisite_keys: list[str], contact_alias: str = "c") -> 
     return "\n".join(conditions), params
 
 
+def exclusion_sql(exclusion_keys: list[str], contact_alias: str = "c") -> tuple[str, list[str]]:
+    conditions = []
+    params = []
+    for index, key in enumerate(exclusion_keys):
+        alias = f"exclude_step_{index}"
+        conditions.append(
+            f"""
+            and not exists (
+                select 1
+                from sends {alias}
+                where {alias}.user_id = {contact_alias}.user_id
+                  and {alias}.contact_id = {contact_alias}.id
+                  and {alias}.campaign_key = ?
+                  and {alias}.status in ('sent', 'queued')
+            )
+            """
+        )
+        params.append(key)
+    return "\n".join(conditions), params
+
+
 def fetch_next_send_contacts(
     campaign_key_value: str,
     limit: int,
     prerequisite_keys: list[str] | None = None,
+    exclusion_keys: list[str] | None = None,
     offset: int = 0,
 ) -> list[sqlite3.Row]:
     prereq_sql, prereq_params = prerequisite_sql(prerequisite_keys or [])
+    exclude_sql, exclude_params = exclusion_sql(exclusion_keys or [])
     return rows(
         f"""
         select
@@ -2400,6 +2423,7 @@ def fetch_next_send_contacts(
                 and sent_campaign.status in ('sent', 'queued')
           )
         {prereq_sql}
+        {exclude_sql}
         group by c.id
         order by
             case when max(s.sent_at) is null then 0 else 1 end,
@@ -2407,12 +2431,17 @@ def fetch_next_send_contacts(
             c.id asc
         limit ? offset ?
         """,
-        (current_user_id(), campaign_key_value, *prereq_params, int(limit), int(offset)),
+        (current_user_id(), campaign_key_value, *prereq_params, *exclude_params, int(limit), int(offset)),
     )
 
 
-def count_next_send_contacts(campaign_key_value: str, prerequisite_keys: list[str] | None = None) -> int:
+def count_next_send_contacts(
+    campaign_key_value: str,
+    prerequisite_keys: list[str] | None = None,
+    exclusion_keys: list[str] | None = None,
+) -> int:
     prereq_sql, prereq_params = prerequisite_sql(prerequisite_keys or [])
+    exclude_sql, exclude_params = exclusion_sql(exclusion_keys or [])
     return int(
         rows(
             f"""
@@ -2432,19 +2461,36 @@ def count_next_send_contacts(campaign_key_value: str, prerequisite_keys: list[st
                     and s.status in ('sent', 'queued')
               )
               {prereq_sql}
+              {exclude_sql}
             """,
-            (current_user_id(), campaign_key_value, *prereq_params),
+            (current_user_id(), campaign_key_value, *prereq_params, *exclude_params),
         )[0]["count"]
         or 0
     )
 
 
-def count_waiting_for_prerequisites(campaign_key_value: str, prerequisite_keys: list[str]) -> int:
+def count_waiting_for_prerequisites(
+    campaign_key_value: str,
+    prerequisite_keys: list[str],
+    exclusion_keys: list[str] | None = None,
+) -> int:
     if not prerequisite_keys:
         return 0
-    qualified_count = count_next_send_contacts(campaign_key_value, prerequisite_keys)
-    unrestricted_count = count_next_send_contacts(campaign_key_value, [])
+    qualified_count = count_next_send_contacts(campaign_key_value, prerequisite_keys, exclusion_keys or [])
+    unrestricted_count = count_next_send_contacts(campaign_key_value, [], exclusion_keys or [])
     return max(0, int(unrestricted_count) - int(qualified_count))
+
+
+def count_excluded_by_later_steps(
+    campaign_key_value: str,
+    prerequisite_keys: list[str],
+    exclusion_keys: list[str],
+) -> int:
+    if not exclusion_keys:
+        return 0
+    unrestricted_count = count_next_send_contacts(campaign_key_value, prerequisite_keys, [])
+    allowed_count = count_next_send_contacts(campaign_key_value, prerequisite_keys, exclusion_keys)
+    return max(0, int(unrestricted_count) - int(allowed_count))
 
 
 def fetch_failed_sends(limit: int = 20) -> pd.DataFrame:
@@ -3228,6 +3274,7 @@ def main() -> None:
         effective_subject_template = subject_template
         effective_body_template = body_template
         prerequisite_campaign_keys: list[str] = []
+        later_step_campaign_keys: list[str] = []
         scenario_context = ""
         if send_mode == "シナリオ配信":
             scenario_labels = [scenario["name"] for scenario in scenarios_for_send]
@@ -3247,6 +3294,10 @@ def main() -> None:
                         scenario_step_campaign_key(int(send_scenario["id"]), int(step["step_number"]))
                         for step in send_steps[:selected_step_index]
                     ]
+                    later_step_campaign_keys = [
+                        scenario_step_campaign_key(int(send_scenario["id"]), int(step["step_number"]))
+                        for step in send_steps[selected_step_index + 1 :]
+                    ]
                     effective_campaign_name = scenario_step_campaign_name(
                         send_scenario["name"],
                         int(selected_step["step_number"]),
@@ -3261,7 +3312,8 @@ def main() -> None:
                         effective_body_template = selected_template_for_step["body"]
                     scenario_context = (
                         f"シナリオ「{send_scenario['name']}」の{selected_step['step_number']}通目です。"
-                        f"{'前のステップを送信済みの宛先だけが対象です。' if prerequisite_campaign_keys else '1通目なので前提条件はありません。'}"
+                        f"{'前のステップを送信済みの宛先だけが対象です。' if prerequisite_campaign_keys else '1通目なので前のステップ条件はありません。'}"
+                        "後ろのステップをすでに送っている宛先は、戻り送信を防ぐため対象外にします。"
                     )
                     st.info(scenario_context)
                     st.caption(f"このステップで使うテンプレート: {selected_step['template_name']}")
@@ -3338,8 +3390,17 @@ def main() -> None:
             """,
             (current_user_id(), current_campaign_key),
         )[0]["count"]
-        remaining_count = count_next_send_contacts(current_campaign_key, prerequisite_campaign_keys)
-        prerequisite_waiting_count = count_waiting_for_prerequisites(current_campaign_key, prerequisite_campaign_keys)
+        remaining_count = count_next_send_contacts(current_campaign_key, prerequisite_campaign_keys, later_step_campaign_keys)
+        prerequisite_waiting_count = count_waiting_for_prerequisites(
+            current_campaign_key,
+            prerequisite_campaign_keys,
+            later_step_campaign_keys,
+        )
+        later_step_excluded_count = count_excluded_by_later_steps(
+            current_campaign_key,
+            prerequisite_campaign_keys,
+            later_step_campaign_keys,
+        )
         metric_cols = st.columns(4)
         metric_cols[0].metric("送信対象", f"{target_count}件")
         metric_cols[1].metric("この配信を送信済み", f"{already_sent_count}件")
@@ -3347,6 +3408,8 @@ def main() -> None:
         metric_cols[3].metric("この配信の未送信", f"{remaining_count}件")
         if prerequisite_waiting_count:
             st.warning(f"前のステップが未送信のため、{prerequisite_waiting_count}件は今回の対象から外れています。")
+        if later_step_excluded_count:
+            st.warning(f"後ろのステップを送信済み、または送信待ちのため、{later_step_excluded_count}件は今回の対象から外れています。")
         planned_count = min(int(send_limit), int(remaining_count))
         preview_schedule = build_send_schedule(
             planned_count,
@@ -3368,7 +3431,12 @@ def main() -> None:
             st.success("この配信名では、現在の送信対象すべてが送信済み、または送信待ちです。")
         st.caption("同じ配信名ですでに送った宛先、または送信待ちの宛先は自動で除外します。送信対象は、未送信の宛先を優先し、その後は最終送信日時が古い順に選ばれます。")
 
-        preview_contacts = fetch_next_send_contacts(current_campaign_key, 1, prerequisite_campaign_keys) if effective_campaign_name.strip() else []
+        preview_contacts = fetch_next_send_contacts(
+            current_campaign_key,
+            1,
+            prerequisite_campaign_keys,
+            later_step_campaign_keys,
+        ) if effective_campaign_name.strip() else []
         confirmation_page_size = 10
         confirmation_total_pages = max(1, (int(planned_count) + confirmation_page_size - 1) // confirmation_page_size)
         if "final_confirmation_page" not in st.session_state:
@@ -3384,6 +3452,7 @@ def main() -> None:
                 current_campaign_key,
                 confirmation_page_size,
                 prerequisite_campaign_keys,
+                later_step_campaign_keys,
                 confirmation_offset,
             )
             if effective_campaign_name.strip() and planned_count > 0
@@ -3663,7 +3732,12 @@ def main() -> None:
             else:
                 if not scenario_context:
                     save_setting("CURRENT_CAMPAIGN_NAME", campaign_name.strip())
-                contacts = fetch_next_send_contacts(current_campaign_key, int(send_limit), prerequisite_campaign_keys)
+                contacts = fetch_next_send_contacts(
+                    current_campaign_key,
+                    int(send_limit),
+                    prerequisite_campaign_keys,
+                    later_step_campaign_keys,
+                )
                 if run_test:
                     contacts = contacts[:1]
 
