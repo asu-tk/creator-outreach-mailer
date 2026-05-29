@@ -1830,6 +1830,29 @@ def fetch_next_send_contacts(campaign_key_value: str, limit: int) -> list[sqlite
     )
 
 
+def fetch_failed_sends(limit: int = 20) -> pd.DataFrame:
+    with sqlite3.connect(DB_PATH) as db:
+        return pd.read_sql_query(
+            """
+            select
+                s.id as send_id,
+                c.id as contact_id,
+                c.channel,
+                c.email,
+                s.subject,
+                s.error,
+                s.sent_at
+            from sends s
+            left join contacts c on c.id = s.contact_id and c.user_id = s.user_id
+            where s.user_id = ? and s.status = 'failed'
+            order by s.sent_at desc, s.id desc
+            limit ?
+            """,
+            db,
+            params=(current_user_id(), int(limit)),
+        )
+
+
 def add_contact(
     email: str,
     name: str,
@@ -2531,6 +2554,26 @@ def main() -> None:
                     use_container_width=True,
                     hide_index=True,
                 )
+
+        failed_sends = fetch_failed_sends()
+        if not failed_sends.empty:
+            with st.expander(f"送信失敗理由の一覧（直近{len(failed_sends)}件）"):
+                st.caption("送信できなかった宛先だけを表示します。不要な宛先は削除して、今後取り込まないようにできます。")
+                header = st.columns([1.5, 2.0, 2.1, 3.0, 1.3, 1.3])
+                headers = ["チャンネル", "メールアドレス", "件名", "失敗理由", "日時", "操作"]
+                for column, label in zip(header, headers):
+                    column.markdown(f"**{label}**")
+                for row in failed_sends.itertuples():
+                    columns = st.columns([1.5, 2.0, 2.1, 3.0, 1.3, 1.3])
+                    columns[0].write(row.channel or "-")
+                    columns[1].write(row.email or "-")
+                    columns[2].write(row.subject or "-")
+                    columns[3].write(row.error or "-")
+                    columns[4].write(row.sent_at or "-")
+                    if row.contact_id and columns[5].button("削除して除外", key=f"delete_failed_send_{row.send_id}"):
+                        delete_contact(int(row.contact_id), block=True, reason="送信失敗")
+                        st.success(f"{row.email} を削除し、再取り込みしないようにしました")
+                        st.rerun()
 
         test_button, send_button = st.columns(2)
         with test_button:
