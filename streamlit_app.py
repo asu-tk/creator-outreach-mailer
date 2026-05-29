@@ -4488,7 +4488,10 @@ def main() -> None:
                             st.error(message)
                         st.rerun()
 
-    if contacts.empty:
+    show_contacts_list = st.toggle("宛先一覧を表示する", value=False, key="show_contacts_list")
+    if not show_contacts_list:
+        st.caption(f"非表示中（{len(contacts)}件）。画面共有や紹介時はこのまま閉じておけます。")
+    elif contacts.empty:
         st.write("まだ宛先がありません。")
     else:
         replied_contacts = contacts[contacts["contact_status"].fillna("") == "返信あり"]
@@ -4653,7 +4656,10 @@ def main() -> None:
     st.divider()
     st.subheader("YouTube候補一覧")
     candidates = fetch_candidates()
-    if candidates.empty:
+    show_candidates_list = st.toggle("YouTube候補一覧を表示する", value=False, key="show_youtube_candidates_list")
+    if not show_candidates_list:
+        st.caption(f"非表示中（{len(candidates)}件）。候補チャンネルの情報を見せたくない時はこのまま閉じておけます。")
+    elif candidates.empty:
         st.write("まだ候補チャンネルがありません。")
     else:
         st.markdown("<div id='youtube-candidates-search-top'></div>", unsafe_allow_html=True)
