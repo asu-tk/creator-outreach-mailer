@@ -817,6 +817,37 @@ def contacts_export_frame(contacts: pd.DataFrame) -> pd.DataFrame:
     return contacts[available_columns].rename(columns=export_columns)
 
 
+def candidates_outsource_frame(candidates: pd.DataFrame) -> pd.DataFrame:
+    if candidates.empty:
+        return pd.DataFrame(
+            columns=[
+                "チャンネル名",
+                "YouTube URL",
+                "メールアドレス",
+                "メモ",
+                "状態",
+                "候補ID（編集しない）",
+                "チャンネルID（編集しない）",
+                "検索キーワード",
+                "作成日時",
+            ]
+        )
+    export = pd.DataFrame(
+        {
+            "チャンネル名": candidates["title"].fillna("").astype(str),
+            "YouTube URL": candidates["channel_url"].fillna("").astype(str),
+            "メールアドレス": candidates["email"].fillna("").astype(str) if "email" in candidates.columns else "",
+            "メモ": "",
+            "状態": "",
+            "候補ID（編集しない）": candidates["id"].fillna("").astype(str),
+            "チャンネルID（編集しない）": candidates["channel_id"].fillna("").astype(str),
+            "検索キーワード": candidates["keyword"].fillna("").astype(str),
+            "作成日時": candidates["created_at"].fillna("").astype(str),
+        }
+    )
+    return export
+
+
 def dataframe_to_xlsx(frame: pd.DataFrame, sheet_name: str = "宛先一覧") -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -1699,6 +1730,56 @@ def youtube_channel_in_candidates(channel_id: str) -> bool:
     return bool(rows("select id from youtube_candidates where user_id = ? and channel_id = ?", (current_user_id(), channel_id)))
 
 
+def find_candidate_for_import(
+    candidate_id: str = "",
+    channel_id: str = "",
+    channel_url: str = "",
+    channel: str = "",
+) -> sqlite3.Row | None:
+    normalized_candidate_id = str(candidate_id or "").strip()
+    if re.fullmatch(r"\d+(?:\.0+)?", normalized_candidate_id):
+        found = rows(
+            "select * from youtube_candidates where user_id = ? and id = ?",
+            (current_user_id(), int(float(normalized_candidate_id))),
+        )
+        if found:
+            return found[0]
+
+    normalized_channel_id = str(channel_id or "").strip()
+    if normalized_channel_id:
+        found = rows(
+            "select * from youtube_candidates where user_id = ? and channel_id = ?",
+            (current_user_id(), normalized_channel_id),
+        )
+        if found:
+            return found[0]
+
+    normalized_url = str(channel_url or "").strip()
+    if normalized_url:
+        found = rows(
+            "select * from youtube_candidates where user_id = ? and channel_url = ?",
+            (current_user_id(), normalized_url),
+        )
+        if found:
+            return found[0]
+
+    normalized_channel = str(channel or "").strip()
+    if normalized_channel:
+        found = rows(
+            """
+            select *
+            from youtube_candidates
+            where user_id = ? and title = ?
+            order by id desc
+            limit 2
+            """,
+            (current_user_id(), normalized_channel),
+        )
+        if len(found) == 1:
+            return found[0]
+    return None
+
+
 def update_contact(contact_id: int, email: str, memo: str, channel: str, consent: bool, contact_status: str) -> tuple[bool, str]:
     normalized_email = email.strip().lower()
     clean_status = contact_status if contact_status in CONTACT_STATUS_OPTIONS else "送信対象"
@@ -2357,6 +2438,136 @@ def delete_local_queued_sends_for_job(send_job_id: str, queue_rows: list[dict]) 
     return deleted_count
 
 
+def delete_pending_sends_for_unsubscribe(
+    contact_id: int = 0,
+    contact_email: str = "",
+    youtube_channel_id: str = "",
+) -> int:
+    user_id = current_user_id()
+    normalized_email = contact_email.strip().lower()
+    channel_id = youtube_channel_id.strip()
+    local_contact_ids: set[int] = set()
+    if contact_id:
+        local_contact_ids.add(int(contact_id))
+    if normalized_email:
+        local_contact_ids.update(
+            int(row["id"])
+            for row in rows(
+                "select id from contacts where user_id = ? and email = ?",
+                (user_id, normalized_email),
+            )
+        )
+    if channel_id:
+        local_contact_ids.update(
+            int(row["id"])
+            for row in rows(
+                "select id from contacts where user_id = ? and youtube_channel_id = ?",
+                (user_id, channel_id),
+            )
+        )
+
+    deleted_count = 0
+    affected_job_ids: set[str] = set()
+    if supabase_configured():
+        user_email = current_user_profile()["email"].strip().lower()
+        if user_email:
+            query_email = urllib.parse.quote(user_email, safe="")
+            deleted_remote_keys: set[tuple[str, int, str]] = set()
+            remote_filters: list[str] = []
+            for local_contact_id in sorted(local_contact_ids):
+                remote_filters.append(f"contact_local_id=eq.{local_contact_id}")
+            if normalized_email:
+                remote_filters.append(f"contact_email=eq.{urllib.parse.quote(normalized_email, safe='')}")
+
+            for remote_filter in remote_filters:
+                try:
+                    deleted_rows = supabase_request(
+                        "DELETE",
+                        (
+                            "send_queue"
+                            f"?user_email=eq.{query_email}"
+                            "&status=eq.pending"
+                            f"&{remote_filter}"
+                            "&select=job_id,contact_local_id,campaign_key,subject"
+                        ),
+                        prefer="return=representation",
+                    )
+                except Exception:
+                    deleted_rows = []
+                if not isinstance(deleted_rows, list):
+                    continue
+                for item in deleted_rows:
+                    job_id = str(item.get("job_id") or "")
+                    if job_id:
+                        affected_job_ids.add(job_id)
+                    key = (
+                        job_id,
+                        int(item.get("contact_local_id") or 0),
+                        str(item.get("subject") or ""),
+                    )
+                    deleted_remote_keys.add(key)
+            deleted_count += len(deleted_remote_keys)
+            refresh_supabase_send_jobs(affected_job_ids)
+
+    local_deleted = 0
+    if local_contact_ids:
+        placeholders = ",".join("?" for _ in local_contact_ids)
+        with sqlite3.connect(DB_PATH) as db:
+            cursor = db.execute(
+                f"""
+                delete from sends
+                where user_id = ?
+                  and status = 'queued'
+                  and contact_id in ({placeholders})
+                """,
+                (user_id, *sorted(local_contact_ids)),
+            )
+            local_deleted = max(cursor.rowcount, 0)
+            db.commit()
+    if local_deleted:
+        mark_app_state_dirty()
+    return max(deleted_count, local_deleted)
+
+
+def refresh_supabase_send_jobs(job_ids: set[str]) -> None:
+    if not supabase_configured():
+        return
+    for job_id in sorted(job_ids):
+        if not job_id:
+            continue
+        try:
+            query_job_id = urllib.parse.quote(job_id, safe="")
+            queue_rows = supabase_request(
+                "GET",
+                f"send_queue?job_id=eq.{query_job_id}&select=status",
+            )
+            if not isinstance(queue_rows, list):
+                continue
+            sent_count = sum(1 for row in queue_rows if row.get("status") == "sent")
+            failed_count = sum(1 for row in queue_rows if row.get("status") == "failed")
+            pending_count = sum(1 for row in queue_rows if row.get("status") in ["pending", "sending"])
+            status = "finished" if pending_count == 0 else "sending"
+            payload = {
+                "total_count": len(queue_rows),
+                "sent_count": sent_count,
+                "failed_count": failed_count,
+                "status": status,
+                "updated_at": now_iso(),
+            }
+            if status == "finished":
+                payload["finished_at"] = now_iso()
+            else:
+                payload["started_at"] = now_iso()
+            supabase_request(
+                "PATCH",
+                f"send_jobs?id=eq.{query_job_id}",
+                payload,
+                prefer="return=minimal",
+            )
+        except Exception:
+            continue
+
+
 def cancel_send_job(job: dict) -> tuple[bool, str]:
     if not supabase_configured():
         return False, "送信予約の取消にはSupabase設定が必要です。"
@@ -2498,6 +2709,7 @@ def sync_unsubscribes_from_supabase() -> None:
             channel = str(item.get("channel") or "").strip()
             unsubscribed_at = str(item.get("unsubscribed_at") or now_iso())
             record_unsubscribe_event(contact_id, contact_email, youtube_channel_id, channel, unsubscribed_at)
+            delete_pending_sends_for_unsubscribe(contact_id, contact_email, youtube_channel_id)
             block_target(contact_email, youtube_channel_id, channel, "配信停止URL")
             if contact_id:
                 delete_contact(contact_id)
@@ -3291,12 +3503,52 @@ def import_contacts_frame(frame: pd.DataFrame) -> tuple[int, int, dict[str, str 
             "youtubeチャンネル名",
         },
     )
+    candidate_id_column = find_column(
+        frame,
+        {
+            "candidate_id",
+            "candidateid",
+            "候補id",
+            "候補ID",
+            "候補ID（編集しない）",
+            "候補id編集しない",
+            "候補ID編集しない",
+        },
+    )
+    channel_id_column = find_column(
+        frame,
+        {
+            "channel_id",
+            "channelid",
+            "youtube_channel_id",
+            "youtubechannelid",
+            "チャンネルid",
+            "チャンネルID",
+            "チャンネルID（編集しない）",
+            "チャンネルID編集しない",
+        },
+    )
+    youtube_url_column = find_column(
+        frame,
+        {
+            "url",
+            "youtubeurl",
+            "youtube_url",
+            "youtubeチャンネルurl",
+            "youtubeチャンネルURL",
+            "youtube url",
+            "YouTube URL",
+            "チャンネルurl",
+            "チャンネルURL",
+        },
+    )
 
     if not email_column:
         raise ValueError("メールアドレスの列を見つけられませんでした。列名に email または メールアドレス を入れてください。")
 
     added = 0
     skipped = 0
+    removed_candidates = 0
     seen_in_file: set[str] = set()
     for _, row in frame.iterrows():
         email = str(row.get(email_column, "")).strip().lower()
@@ -3306,17 +3558,48 @@ def import_contacts_frame(frame: pd.DataFrame) -> tuple[int, int, dict[str, str 
             skipped += 1
             continue
         seen_in_file.add(email)
+        channel = str(row.get(channel_column, "")) if channel_column else ""
+        candidate = find_candidate_for_import(
+            str(row.get(candidate_id_column, "")) if candidate_id_column else "",
+            str(row.get(channel_id_column, "")) if channel_id_column else "",
+            str(row.get(youtube_url_column, "")) if youtube_url_column else "",
+            channel,
+        )
+        if candidate:
+            channel = str(candidate["title"] or channel)
+        memo = str(row.get(memo_column, "")) if memo_column else ""
         was_added = add_contact(
             email=email,
-            memo=str(row.get(memo_column, "")) if memo_column else "",
-            channel=str(row.get(channel_column, "")) if channel_column else "",
+            memo=memo,
+            channel=channel,
             consent=True,
+            youtube_channel_id=str(candidate["channel_id"] or "") if candidate else "",
+            youtube_channel_url=str(candidate["channel_url"] or "") if candidate else "",
+            youtube_subscriber_count=int(candidate["subscriber_count"] or 0) if candidate else 0,
+            youtube_video_count=int(candidate["video_count"] or 0) if candidate else 0,
+            youtube_view_count=int(candidate["view_count"] or 0) if candidate else 0,
+            youtube_keyword=str(candidate["keyword"] or "") if candidate else "",
+            youtube_description=str(candidate["description"] or "") if candidate else "",
         )
         if was_added:
             added += 1
+            if candidate:
+                delete_candidate(int(candidate["id"]))
+                removed_candidates += 1
         else:
+            if candidate and (
+                contact_exists(email) or youtube_channel_in_contacts(str(candidate["channel_id"] or ""))
+            ):
+                delete_candidate(int(candidate["id"]))
+                removed_candidates += 1
             skipped += 1
-    return added, skipped, {"email": email_column, "memo": memo_column, "channel": channel_column}
+    return added, skipped, {
+        "email": email_column,
+        "memo": memo_column,
+        "channel": channel_column,
+        "candidate_id": candidate_id_column,
+        "candidate_removed": str(removed_candidates),
+    }
 
 
 def import_contacts_file(uploaded_file) -> tuple[int, int, dict[str, str | None]]:
@@ -3364,6 +3647,11 @@ def import_contacts_google_url(url: str) -> tuple[int, int, dict[str, str | None
 def queue_google_contacts_url_import() -> None:
     st.session_state["pending_google_contacts_url"] = str(st.session_state.get("google_contacts_url", "")).strip()
     st.session_state["google_contacts_url"] = ""
+
+
+def queue_outsource_google_url_import() -> None:
+    st.session_state["pending_outsource_google_url"] = str(st.session_state.get("outsource_google_url", "")).strip()
+    st.session_state["outsource_google_url"] = ""
 
 
 def main() -> None:
@@ -3466,6 +3754,9 @@ def main() -> None:
                     f"判別した列: email={mapping['email'] or '-'} / "
                     f"channel={mapping['channel'] or '-'} / memo={mapping['memo'] or '-'}"
                 )
+                removed_candidates = int(mapping.get("candidate_removed") or 0)
+                if removed_candidates:
+                    st.caption(f"YouTube候補一覧から取込済み候補を{removed_candidates}件外しました。")
             except Exception as exc:
                 st.error(str(exc))
 
@@ -3494,6 +3785,9 @@ def main() -> None:
                         f"判別した項目: email={mapping['email'] or '-'} / "
                         f"channel={mapping['channel'] or '-'} / memo={mapping['memo'] or '-'}"
                     )
+                    removed_candidates = int(mapping.get("candidate_removed") or 0)
+                    if removed_candidates:
+                        st.caption(f"YouTube候補一覧から取込済み候補を{removed_candidates}件外しました。")
                 except Exception as exc:
                     st.error(str(exc))
 
@@ -4442,11 +4736,23 @@ def main() -> None:
     query = st.query_params
     token = query.get("unsubscribe_token")
     if token:
-        contact = rows("select id from contacts where token = ?", (token,))
+        contact = rows("select id, email, youtube_channel_id, channel from contacts where token = ?", (token,))
         if contact:
-            record_unsubscribe_event(int(contact[0]["id"]))
-            delete_contact(int(contact[0]["id"]))
-        st.success("配信停止を受け付けました。宛先一覧からも削除しました。")
+            item = contact[0]
+            record_unsubscribe_event(
+                int(item["id"]),
+                str(item["email"] or ""),
+                str(item["youtube_channel_id"] or ""),
+                str(item["channel"] or ""),
+            )
+            delete_pending_sends_for_unsubscribe(
+                int(item["id"]),
+                str(item["email"] or ""),
+                str(item["youtube_channel_id"] or ""),
+            )
+            block_target(str(item["email"] or ""), str(item["youtube_channel_id"] or ""), str(item["channel"] or ""), "配信停止URL")
+            delete_contact(int(item["id"]))
+        st.success("配信停止を受け付けました。宛先一覧と未送信の予約から削除しました。")
 
     st.divider()
     st.subheader("宛先一覧")
@@ -4656,6 +4962,62 @@ def main() -> None:
     st.divider()
     st.subheader("YouTube候補一覧")
     candidates = fetch_candidates()
+    with st.expander("外注用Googleシートを作る / 回収する"):
+        st.caption(
+            "候補一覧を外注さん向けの表にできます。外注さんはメールアドレス欄だけ入力し、"
+            "戻ってきたGoogleスプレッドシートURLを取り込むと、メールありの候補を宛先一覧へ移します。"
+        )
+        outsource_frame = candidates_outsource_frame(candidates)
+        export_name = datetime.now(APP_TIMEZONE).strftime("youtube_candidates_outsource_%Y%m%d_%H%M")
+        download_csv_col, download_xlsx_col = st.columns(2)
+        download_csv_col.download_button(
+            "外注用CSVをダウンロード",
+            data=outsource_frame.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"{export_name}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            disabled=candidates.empty,
+        )
+        download_xlsx_col.download_button(
+            "外注用Excelをダウンロード",
+            data=dataframe_to_xlsx(outsource_frame, "外注用候補"),
+            file_name=f"{export_name}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            disabled=candidates.empty,
+        )
+        st.caption(
+            "ダウンロードしたExcel/CSVをGoogle Driveへアップロードして、Googleスプレッドシートとして外注さんに共有してください。"
+            "候補IDとチャンネルIDの列は、取り込み時に候補一覧と照合するための列なので編集しないでください。"
+        )
+
+        outsource_google_url = st.text_input(
+            "外注さんが入力したGoogleスプレッドシートURL",
+            placeholder="外注用シートのURL",
+            key="outsource_google_url",
+        )
+        if st.button(
+            "外注シートから宛先一覧へ取り込む",
+            key="import_outsource_google_url",
+            use_container_width=True,
+            disabled=not outsource_google_url.strip(),
+            on_click=queue_outsource_google_url_import,
+        ):
+            target_outsource_url = str(st.session_state.pop("pending_outsource_google_url", "")).strip()
+            try:
+                added, skipped, mapping, source_type = import_contacts_google_url(target_outsource_url)
+                st.success(f"{source_type}から{added}件を宛先一覧へ取り込みました。重複や空欄は{skipped}件スキップしました。")
+                removed_candidates = int(mapping.get("candidate_removed") or 0)
+                if removed_candidates:
+                    st.caption(f"YouTube候補一覧から取込済み候補を{removed_candidates}件外しました。")
+                st.caption(
+                    f"判別した項目: email={mapping['email'] or '-'} / "
+                    f"channel={mapping['channel'] or '-'} / memo={mapping['memo'] or '-'} / "
+                    f"候補ID={mapping.get('candidate_id') or '-'}"
+                )
+            except Exception as exc:
+                st.error(str(exc))
+
     show_candidates_list = st.toggle("YouTube候補一覧を表示する", value=False, key="show_youtube_candidates_list")
     if not show_candidates_list:
         st.caption(f"非表示中（{len(candidates)}件）。候補チャンネルの情報を見せたくない時はこのまま閉じておけます。")
