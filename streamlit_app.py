@@ -1235,7 +1235,37 @@ def main() -> None:
         if len(template_names) > 1:
             with st.expander("配信テンプレートの並び替え"):
                 if sort_items:
-                    sorted_template_names = sort_items(template_names, key="campaign_template_sort")
+                    vertical_sort_style = """
+                    .sortable-component {
+                        border: 1px solid #E5E7EB;
+                        border-radius: 6px;
+                        padding: 8px;
+                    }
+                    .sortable-container-body {
+                        display: flex;
+                        flex-direction: column;
+                        gap: 8px;
+                    }
+                    .sortable-item, .sortable-item:hover {
+                        display: block;
+                        width: 100%;
+                        box-sizing: border-box;
+                        background-color: #F8FAFC;
+                        border: 1px solid #CBD5E1;
+                        border-radius: 6px;
+                        padding: 10px 12px;
+                        color: #111827;
+                    }
+                    .sortable-item::before {
+                        content: "↕ ";
+                        color: #64748B;
+                    }
+                    """
+                    sorted_template_names = sort_items(
+                        template_names,
+                        key="campaign_template_sort",
+                        custom_style=vertical_sort_style,
+                    )
                     if sorted_template_names != template_names:
                         if st.button("この順番で保存", use_container_width=True):
                             save_campaign_template_order(sorted_template_names)
