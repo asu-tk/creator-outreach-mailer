@@ -1166,6 +1166,10 @@ def unblock_target(email: str = "", youtube_channel_id: str = "") -> None:
     )
 
 
+def unblock_target_by_id(blocked_id: int) -> None:
+    execute("delete from blocked_targets where user_id = ? and id = ?", (current_user_id(), int(blocked_id)))
+
+
 def delete_contact(contact_id: int, block: bool = False, reason: str = "") -> None:
     if block:
         contact = rows("select * from contacts where user_id = ? and id = ?", (current_user_id(), contact_id))
@@ -1850,6 +1854,26 @@ def fetch_failed_sends(limit: int = 20) -> pd.DataFrame:
             """,
             db,
             params=(current_user_id(), int(limit)),
+        )
+
+
+def fetch_blocked_targets() -> pd.DataFrame:
+    with sqlite3.connect(DB_PATH) as db:
+        return pd.read_sql_query(
+            """
+            select
+                id,
+                email,
+                youtube_channel_id,
+                channel,
+                reason,
+                created_at
+            from blocked_targets
+            where user_id = ?
+            order by id desc
+            """,
+            db,
+            params=(current_user_id(),),
         )
 
 
@@ -2672,6 +2696,39 @@ def main() -> None:
     st.divider()
     st.subheader("宛先一覧")
     contacts = fetch_contacts()
+    blocked_targets = fetch_blocked_targets()
+    if not blocked_targets.empty:
+        with st.expander(f"配信停止済み・削除済みリスト（{len(blocked_targets)}件）"):
+            st.caption("ここにあるメールアドレスやYouTubeチャンネルは、CSV取り込みや候補検索から自動で戻らないようにしています。必要な場合だけ除外を解除してください。")
+            blocked_search = st.text_input(
+                "除外リストを検索",
+                placeholder="メールアドレス、チャンネル名、理由で検索",
+                key="blocked_targets_search",
+            ).strip().lower()
+            visible_blocked = blocked_targets
+            if blocked_search:
+                mask = visible_blocked[["email", "channel", "reason"]].fillna("").astype(str).apply(
+                    lambda column: column.str.lower().str.contains(blocked_search, regex=False)
+                ).any(axis=1)
+                visible_blocked = visible_blocked[mask]
+            if visible_blocked.empty:
+                st.write("検索条件に合う除外データはありません。")
+            else:
+                header = st.columns([2.0, 2.0, 1.4, 1.5, 1.2])
+                headers = ["メールアドレス", "チャンネル", "理由", "登録日時", "操作"]
+                for column, label in zip(header, headers):
+                    column.markdown(f"**{label}**")
+                for row in visible_blocked.itertuples():
+                    columns = st.columns([2.0, 2.0, 1.4, 1.5, 1.2])
+                    columns[0].write(row.email or "-")
+                    columns[1].write(row.channel or row.youtube_channel_id or "-")
+                    columns[2].write(row.reason or "-")
+                    columns[3].write(row.created_at or "-")
+                    if columns[4].button("除外を解除", key=f"unblock_target_{row.id}"):
+                        unblock_target_by_id(int(row.id))
+                        st.success("除外を解除しました。必要であれば宛先を再登録してください。")
+                        st.rerun()
+
     if contacts.empty:
         st.write("まだ宛先がありません。")
     else:
