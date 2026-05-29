@@ -139,6 +139,58 @@ def get_json(url: str) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
+def parse_bool(value: str | bool, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def read_secret(name: str, default: str = "") -> str:
+    try:
+        return str(st.secrets.get(name, default))
+    except Exception:
+        return os.getenv(name, default)
+
+
+def get_nested_secret(section: str, name: str, default: str = "") -> str:
+    try:
+        return str(st.secrets.get(section, {}).get(name, default))
+    except Exception:
+        return os.getenv(f"{section.upper()}_{name.upper()}", default)
+
+
+def supabase_config() -> dict[str, str]:
+    return {
+        "url": get_nested_secret("supabase", "url") or read_secret("SUPABASE_URL"),
+        "service_role_key": get_nested_secret("supabase", "service_role_key") or read_secret("SUPABASE_SERVICE_ROLE_KEY"),
+    }
+
+
+def supabase_configured() -> bool:
+    config = supabase_config()
+    return bool(config["url"] and config["service_role_key"])
+
+
+def supabase_request(method: str, path: str, payload: dict | None = None, prefer: str = "") -> list[dict] | dict:
+    config = supabase_config()
+    base_url = config["url"].rstrip("/")
+    url = f"{base_url}/rest/v1/{path.lstrip('/')}"
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {
+        "apikey": config["service_role_key"],
+        "Authorization": f"Bearer {config['service_role_key']}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(request, timeout=30) as response:
+        body = response.read().decode("utf-8")
+        return json.loads(body) if body else []
+
+
 def handle_google_callback() -> None:
     code = st.query_params.get("code")
     if not code:
@@ -195,6 +247,105 @@ def current_user_id() -> str:
     except Exception:
         pass
     return "local-user"
+
+
+def current_user_profile() -> dict[str, str]:
+    manual_user = st.session_state.get("google_user")
+    if manual_user:
+        return {
+            "email": str(manual_user.get("email") or ""),
+            "sub": str(manual_user.get("sub") or ""),
+            "name": str(manual_user.get("name") or ""),
+        }
+    try:
+        if auth_is_configured() and st.user.is_logged_in:
+            return {
+                "email": str(st.user.get("email") or ""),
+                "sub": str(st.user.get("sub") or ""),
+                "name": str(st.user.get("name") or ""),
+            }
+    except Exception:
+        pass
+    return {"email": current_user_id(), "sub": "", "name": ""}
+
+
+def ensure_supabase_user() -> None:
+    if not supabase_configured() or current_user_id() == "local-user":
+        return
+    profile = current_user_profile()
+    email = profile["email"].strip().lower()
+    if not email:
+        return
+    try:
+        supabase_request(
+            "POST",
+            "app_users?on_conflict=email",
+            {
+                "email": email,
+                "google_sub": profile["sub"],
+                "name": profile["name"],
+                "updated_at": now_iso(),
+            },
+            prefer="resolution=merge-duplicates",
+        )
+    except Exception as exc:
+        st.warning(f"Supabaseのユーザー登録に失敗しました: {exc}")
+
+
+def admin_emails() -> set[str]:
+    raw = read_secret("ADMIN_EMAILS")
+    return {email.strip().lower() for email in raw.split(",") if email.strip()}
+
+
+def subscription_required() -> bool:
+    return parse_bool(read_secret("SUBSCRIPTION_REQUIRED", "false"))
+
+
+def get_subscription_status(email: str) -> dict:
+    query_email = urllib.parse.quote(email.lower(), safe="")
+    result = supabase_request(
+        "GET",
+        f"subscriptions?user_email=eq.{query_email}&select=status,plan_name,current_period_end",
+    )
+    return result[0] if isinstance(result, list) and result else {}
+
+
+def subscription_active(subscription: dict) -> bool:
+    status = str(subscription.get("status", "")).lower()
+    if status in {"active", "trialing"}:
+        period_end = str(subscription.get("current_period_end") or "")
+        if not period_end:
+            return True
+        try:
+            normalized = period_end.replace("Z", "+00:00")
+            return datetime.fromisoformat(normalized) > datetime.now(timezone.utc)
+        except ValueError:
+            return True
+    return False
+
+
+def require_active_subscription() -> None:
+    ensure_supabase_user()
+    if not subscription_required():
+        return
+    if not supabase_configured():
+        st.error("課金チェック用のSupabase設定が未設定です。")
+        st.stop()
+    email = current_user_profile()["email"].strip().lower()
+    if email in admin_emails():
+        st.caption("管理者アカウントとして利用中です。")
+        return
+    subscription = get_subscription_status(email)
+    if subscription_active(subscription):
+        return
+    st.title("Creator Outreach Mailer")
+    st.warning("このアプリを使うには有料プランへの登録が必要です。")
+    checkout_url = read_secret("STRIPE_CHECKOUT_URL")
+    if checkout_url:
+        st.link_button("有料プランに登録する", checkout_url)
+    else:
+        st.info("現在、決済ページを準備中です。管理者にお問い合わせください。")
+    st.stop()
 
 
 def require_login() -> bool:
@@ -1103,6 +1254,7 @@ def main() -> None:
     if not require_login():
         return
 
+    require_active_subscription()
     ensure_default_campaign_template()
 
     st.title("Creator Outreach Mailer")
