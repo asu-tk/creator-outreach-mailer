@@ -776,6 +776,170 @@ def execute(query: str, params: tuple = ()) -> None:
     with sqlite3.connect(DB_PATH) as db:
         db.execute(query, params)
         db.commit()
+    mark_app_state_dirty()
+
+
+APP_STATE_TABLES = [
+    "contacts",
+    "sends",
+    "settings",
+    "smtp_accounts",
+    "youtube_candidates",
+    "youtube_api_usage",
+    "blocked_targets",
+    "campaign_templates",
+]
+
+
+def app_state_user_email() -> str:
+    return current_user_profile().get("email", "").strip().lower()
+
+
+def app_state_can_sync() -> bool:
+    return bool(supabase_configured() and app_state_user_email())
+
+
+def table_columns(db: sqlite3.Connection, table: str) -> list[str]:
+    return [row[1] for row in db.execute(f"pragma table_info({table})").fetchall()]
+
+
+def export_local_app_state() -> dict:
+    user_id = current_user_id()
+    state_tables: dict[str, list[dict]] = {}
+    with sqlite3.connect(DB_PATH) as db:
+        db.row_factory = sqlite3.Row
+        for table in APP_STATE_TABLES:
+            columns = table_columns(db, table)
+            if not columns:
+                continue
+            if "user_id" in columns:
+                records = db.execute(
+                    f"select * from {table} where user_id = ? order by rowid asc",
+                    (user_id,),
+                ).fetchall()
+            else:
+                records = db.execute(f"select * from {table} order by rowid asc").fetchall()
+            state_tables[table] = [dict(record) for record in records]
+    return {
+        "version": 1,
+        "saved_at": now_iso(),
+        "user_id": user_id,
+        "tables": state_tables,
+    }
+
+
+def restore_local_app_state(state: dict) -> None:
+    tables = state.get("tables") if isinstance(state, dict) else None
+    if not isinstance(tables, dict):
+        return
+
+    user_id = current_user_id()
+    delete_order = [
+        "sends",
+        "contacts",
+        "settings",
+        "smtp_accounts",
+        "youtube_candidates",
+        "youtube_api_usage",
+        "blocked_targets",
+        "campaign_templates",
+    ]
+    insert_order = [
+        "contacts",
+        "settings",
+        "smtp_accounts",
+        "youtube_candidates",
+        "youtube_api_usage",
+        "blocked_targets",
+        "campaign_templates",
+        "sends",
+    ]
+
+    st.session_state["_restoring_app_state"] = True
+    try:
+        with sqlite3.connect(DB_PATH) as db:
+            for table in delete_order:
+                columns = table_columns(db, table)
+                if "user_id" in columns:
+                    db.execute(f"delete from {table} where user_id = ?", (user_id,))
+
+            for table in insert_order:
+                columns = table_columns(db, table)
+                if not columns:
+                    continue
+                for record in tables.get(table, []):
+                    if not isinstance(record, dict):
+                        continue
+                    clean = {key: value for key, value in record.items() if key in columns}
+                    if "user_id" in columns:
+                        clean["user_id"] = user_id
+                    if not clean:
+                        continue
+                    column_names = list(clean.keys())
+                    placeholders = ", ".join(["?"] * len(column_names))
+                    db.execute(
+                        f"insert or replace into {table} ({', '.join(column_names)}) values ({placeholders})",
+                        tuple(clean[column] for column in column_names),
+                    )
+            db.commit()
+    finally:
+        st.session_state["_restoring_app_state"] = False
+
+
+def save_app_state_to_supabase() -> None:
+    if not app_state_can_sync() or st.session_state.get("_restoring_app_state"):
+        return
+    try:
+        supabase_request(
+            "POST",
+            "app_state?on_conflict=user_email",
+            {
+                "user_email": app_state_user_email(),
+                "state": export_local_app_state(),
+                "updated_at": now_iso(),
+            },
+            prefer="resolution=merge-duplicates,return=minimal",
+        )
+        st.session_state.pop("_last_app_state_save_error", None)
+    except Exception as exc:
+        st.session_state["_last_app_state_save_error"] = str(exc)
+
+
+def load_app_state_from_supabase() -> None:
+    if not app_state_can_sync():
+        return
+    email = app_state_user_email()
+    loaded_key = f"_app_state_loaded::{email}"
+    if st.session_state.get(loaded_key):
+        return
+    try:
+        query_email = urllib.parse.quote(email, safe="")
+        result = supabase_request(
+            "GET",
+            f"app_state?user_email=eq.{query_email}&select=state&limit=1",
+        )
+        if isinstance(result, list) and result:
+            restore_local_app_state(result[0].get("state", {}))
+        else:
+            save_app_state_to_supabase()
+        st.session_state[loaded_key] = True
+    except Exception as exc:
+        st.session_state["_last_app_state_load_error"] = str(exc)
+
+
+def mark_app_state_dirty() -> None:
+    if st.session_state.get("_restoring_app_state"):
+        return
+    if app_state_can_sync() and st.session_state.get(f"_app_state_loaded::{app_state_user_email()}"):
+        st.session_state["_app_state_dirty"] = True
+
+
+def flush_app_state_if_dirty() -> None:
+    if not st.session_state.get("_app_state_dirty"):
+        return
+    save_app_state_to_supabase()
+    if "_last_app_state_save_error" not in st.session_state:
+        st.session_state["_app_state_dirty"] = False
 
 
 def get_youtube_daily_limit() -> int:
@@ -2245,6 +2409,7 @@ def main() -> None:
         return
 
     require_active_subscription()
+    load_app_state_from_supabase()
     ensure_default_campaign_template()
     sync_send_queue_results()
     sync_unsubscribes_from_supabase()
@@ -3158,6 +3323,8 @@ def main() -> None:
             args=(1, candidate_total_pages),
         ):
             pass
+
+    flush_app_state_if_dirty()
 
 
 if __name__ == "__main__":
