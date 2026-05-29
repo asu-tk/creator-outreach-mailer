@@ -742,8 +742,10 @@ def get_youtube_daily_limit() -> int:
         return 10000
 
 
-def estimate_youtube_units(max_results: int) -> int:
+def estimate_youtube_units(max_results: int, search_mode: str = "キーワード") -> int:
     pages = max(1, (max(1, int(max_results)) + 49) // 50)
+    if search_mode == "カテゴリー":
+        return pages * 2
     return pages * 101
 
 
@@ -1217,43 +1219,66 @@ def search_youtube_channels(
     units_used = 0
     page_token = ""
     max_results = max(1, min(max_results, 200))
+    max_pages = max(1, (max_results + 49) // 50)
+    checked_pages = 0
     candidate_label = display_label or keyword
 
-    while found < max_results:
-        units_used += 100
-        search_params = {
-            "part": "snippet",
-            "maxResults": min(50, max_results - found),
-            "pageToken": page_token,
-        }
+    while found < max_results and checked_pages < max_pages:
+        checked_pages += 1
         if search_mode == "カテゴリー":
-            search_params.update(
+            units_used += 1
+            video_data = youtube_api_get(
+                "videos",
                 {
-                    "type": "video",
-                    "videoCategoryId": category_id,
+                    "part": "snippet",
+                    "chart": "mostPopular",
                     "regionCode": "JP",
-                    "order": "relevance",
-                }
+                    "videoCategoryId": category_id,
+                    "maxResults": min(50, max_results - found),
+                    "pageToken": page_token,
+                },
             )
-            if keyword:
-                search_params["q"] = keyword
+            keyword_filter = keyword.strip().lower()
+            raw_channel_ids = []
+            for item in video_data.get("items", []):
+                snippet = item.get("snippet", {})
+                searchable_text = " ".join(
+                    [
+                        snippet.get("title", ""),
+                        snippet.get("channelTitle", ""),
+                        snippet.get("description", ""),
+                    ]
+                ).lower()
+                if keyword_filter and keyword_filter not in searchable_text:
+                    continue
+                channel_id = snippet.get("channelId", "")
+                if channel_id:
+                    raw_channel_ids.append(channel_id)
+            page_token = video_data.get("nextPageToken", "")
         else:
-            search_params.update(
-                {
-                    "type": "channel",
-                    "q": keyword,
-                }
+            units_used += 100
+            search_params = {
+                "part": "snippet",
+                "maxResults": min(50, max_results - found),
+                "pageToken": page_token,
+                "type": "channel",
+                "q": keyword,
+            }
+            search_data = youtube_api_get(
+                "search",
+                search_params,
             )
-        search_data = youtube_api_get(
-            "search",
-            search_params,
-        )
-        channel_ids = [
-            item["snippet"]["channelId"]
-            for item in search_data.get("items", [])
-            if item.get("snippet", {}).get("channelId")
-        ]
+            raw_channel_ids = [
+                item["snippet"]["channelId"]
+                for item in search_data.get("items", [])
+                if item.get("snippet", {}).get("channelId")
+            ]
+            page_token = search_data.get("nextPageToken", "")
+
+        channel_ids = list(dict.fromkeys(raw_channel_ids))
         if not channel_ids:
+            if page_token:
+                continue
             break
 
         units_used += 1
@@ -1292,7 +1317,6 @@ def search_youtube_channels(
                 saved += 1
 
         found += len(channel_ids)
-        page_token = search_data.get("nextPageToken", "")
         if not page_token:
             break
 
@@ -1901,7 +1925,7 @@ def main() -> None:
             yt_category_name = st.selectbox("カテゴリー", options=list(YOUTUBE_VIDEO_CATEGORIES.keys()))
             yt_category_id = YOUTUBE_VIDEO_CATEGORIES[yt_category_name]
             yt_keyword = st.text_input("補助キーワード（任意）", placeholder="例: 初心者 / 日本 / レビュー")
-            st.caption("カテゴリー検索は、選んだ動画カテゴリーに出てきた動画の投稿チャンネルを候補化します。")
+            st.caption("カテゴリー検索は、チャンネル自体ではなく、そのカテゴリーの人気動画を出しているチャンネルを候補化します。補助キーワードを入れると動画タイトル・説明文・チャンネル名で絞り込みます。")
         else:
             yt_keyword = st.text_input("検索キーワード", placeholder="例: 料理 レシピ / ゲーム実況 / 英会話")
         yt_min_subs = st.number_input("登録者数 最小", min_value=0, value=1000, step=1000)
@@ -1909,7 +1933,7 @@ def main() -> None:
         yt_max_results = st.number_input("最大取得件数", min_value=1, max_value=200, value=50)
         daily_limit = get_youtube_daily_limit()
         used_units = get_youtube_units_used()
-        estimated_units = estimate_youtube_units(int(yt_max_results))
+        estimated_units = estimate_youtube_units(int(yt_max_results), yt_search_mode)
         remaining_units = max(0, daily_limit - used_units)
         usage_ratio = min(1.0, used_units / daily_limit)
         st.progress(usage_ratio)
@@ -1917,7 +1941,7 @@ def main() -> None:
             f"YouTube API使用量（概算）: 今日 {used_units:,} / {daily_limit:,} units、"
             f"残り目安 {remaining_units:,} units、今回予定 約{estimated_units:,} units"
         )
-        st.caption("目安: YouTube APIは50件ごとに1ページ扱いです。1〜50件は約101 units、51〜100件は約202 units、101〜150件は約303 unitsです。")
+        st.caption("目安: キーワード検索は50件ごとに約101 unitsです。カテゴリー検索は人気動画から拾う方式なので50件ごとに約2 unitsです。")
         if used_units >= daily_limit:
             st.error("今日の推定上限に達しています。Google側のリセット後に再度試してください。")
         elif used_units + estimated_units > daily_limit:
@@ -1928,7 +1952,7 @@ def main() -> None:
         if yt_submitted:
             if yt_search_mode == "キーワード" and not yt_keyword.strip():
                 st.error("検索キーワードを入力してください")
-            elif get_youtube_units_used() + estimate_youtube_units(int(yt_max_results)) > get_youtube_daily_limit():
+            elif get_youtube_units_used() + estimate_youtube_units(int(yt_max_results), yt_search_mode) > get_youtube_daily_limit():
                 st.error("推定上限を超えるため検索を止めました。最大取得件数を減らすか、明日以降に実行してください。")
             else:
                 try:
