@@ -673,6 +673,16 @@ def init_db() -> None:
                 body text not null default '',
                 updated_at text not null
             );
+
+            create table if not exists unsubscribe_events (
+                id integer primary key autoincrement,
+                user_id text not null default 'local-user',
+                contact_email text not null default '',
+                youtube_channel_id text not null default '',
+                channel text not null default '',
+                campaign_key text not null default '',
+                unsubscribed_at text not null
+            );
             """
         )
         columns = [row[1] for row in db.execute("pragma table_info(contacts)").fetchall()]
@@ -691,7 +701,7 @@ def init_db() -> None:
         for column, statement in migrations.items():
             if column not in columns:
                 db.execute(statement)
-        for table in ["sends", "settings", "youtube_candidates", "youtube_api_usage", "blocked_targets", "campaign_templates", "smtp_accounts"]:
+        for table in ["sends", "settings", "youtube_candidates", "youtube_api_usage", "blocked_targets", "campaign_templates", "smtp_accounts", "unsubscribe_events"]:
             table_columns = [row[1] for row in db.execute(f"pragma table_info({table})").fetchall()]
             if "user_id" not in table_columns:
                 db.execute(f"alter table {table} add column user_id text not null default 'local-user'")
@@ -801,6 +811,7 @@ APP_STATE_TABLES = [
     "youtube_api_usage",
     "blocked_targets",
     "campaign_templates",
+    "unsubscribe_events",
 ]
 
 
@@ -856,6 +867,7 @@ def restore_local_app_state(state: dict) -> None:
         "youtube_api_usage",
         "blocked_targets",
         "campaign_templates",
+        "unsubscribe_events",
     ]
     insert_order = [
         "contacts",
@@ -865,6 +877,7 @@ def restore_local_app_state(state: dict) -> None:
         "youtube_api_usage",
         "blocked_targets",
         "campaign_templates",
+        "unsubscribe_events",
         "sends",
     ]
 
@@ -2092,6 +2105,82 @@ def sync_send_queue_results() -> None:
         return
 
 
+def record_unsubscribe_event(
+    contact_id: int = 0,
+    contact_email: str = "",
+    youtube_channel_id: str = "",
+    channel: str = "",
+    unsubscribed_at: str = "",
+) -> None:
+    user_id = current_user_id()
+    contact_rows = []
+    if contact_id:
+        contact_rows = rows(
+            "select id, email, youtube_channel_id, channel from contacts where user_id = ? and id = ?",
+            (user_id, int(contact_id)),
+        )
+    if not contact_rows and contact_email:
+        contact_rows = rows(
+            "select id, email, youtube_channel_id, channel from contacts where user_id = ? and email = ?",
+            (user_id, contact_email.strip().lower()),
+        )
+    if not contact_rows and youtube_channel_id:
+        contact_rows = rows(
+            "select id, email, youtube_channel_id, channel from contacts where user_id = ? and youtube_channel_id = ?",
+            (user_id, youtube_channel_id.strip()),
+        )
+
+    target_rows = contact_rows or [
+        {
+            "id": int(contact_id or 0),
+            "email": contact_email.strip().lower(),
+            "youtube_channel_id": youtube_channel_id.strip(),
+            "channel": channel.strip(),
+        }
+    ]
+    event_time = unsubscribed_at or now_iso()
+    for contact in target_rows:
+        local_contact_id = int(contact["id"] or 0)
+        campaign_row = None
+        if local_contact_id:
+            matches = rows(
+                """
+                select campaign_key
+                from sends
+                where user_id = ?
+                  and contact_id = ?
+                  and campaign_key != ''
+                  and status in ('sent', 'queued')
+                order by sent_at desc, id desc
+                limit 1
+                """,
+                (user_id, local_contact_id),
+            )
+            campaign_row = matches[0] if matches else None
+        campaign_key_value = campaign_row["campaign_key"] if campaign_row else ""
+        email_value = str(contact["email"] or contact_email).strip().lower()
+        channel_id_value = str(contact["youtube_channel_id"] or youtube_channel_id).strip()
+        channel_value = str(contact["channel"] or channel).strip()
+        exists = rows(
+            """
+            select id
+            from unsubscribe_events
+            where user_id = ? and contact_email = ? and campaign_key = ?
+            limit 1
+            """,
+            (user_id, email_value, campaign_key_value),
+        )
+        if exists:
+            continue
+        execute(
+            """
+            insert into unsubscribe_events(user_id, contact_email, youtube_channel_id, channel, campaign_key, unsubscribed_at)
+            values (?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, email_value, channel_id_value, channel_value, campaign_key_value, event_time),
+        )
+
+
 def sync_unsubscribes_from_supabase() -> None:
     if not supabase_configured():
         return
@@ -2102,7 +2191,7 @@ def sync_unsubscribes_from_supabase() -> None:
         query_email = urllib.parse.quote(user_email, safe="")
         results = supabase_request(
             "GET",
-            f"unsubscribe_tokens?user_email=eq.{query_email}&unsubscribed_at=not.is.null&select=contact_local_id,contact_email,youtube_channel_id,channel",
+            f"unsubscribe_tokens?user_email=eq.{query_email}&unsubscribed_at=not.is.null&select=contact_local_id,contact_email,youtube_channel_id,channel,unsubscribed_at",
         )
         if not isinstance(results, list):
             return
@@ -2111,16 +2200,20 @@ def sync_unsubscribes_from_supabase() -> None:
             contact_email = str(item.get("contact_email") or "").strip().lower()
             youtube_channel_id = str(item.get("youtube_channel_id") or "").strip()
             channel = str(item.get("channel") or "").strip()
+            unsubscribed_at = str(item.get("unsubscribed_at") or now_iso())
+            record_unsubscribe_event(contact_id, contact_email, youtube_channel_id, channel, unsubscribed_at)
             block_target(contact_email, youtube_channel_id, channel, "配信停止URL")
             if contact_id:
                 delete_contact(contact_id)
             elif contact_email:
                 matched = rows("select id from contacts where user_id = ? and email = ?", (current_user_id(), contact_email))
                 for row in matched:
+                    record_unsubscribe_event(int(row["id"]), contact_email, youtube_channel_id, channel, unsubscribed_at)
                     delete_contact(int(row["id"]))
             elif youtube_channel_id:
                 matched = rows("select id from contacts where user_id = ? and youtube_channel_id = ?", (current_user_id(), youtube_channel_id))
                 for row in matched:
+                    record_unsubscribe_event(int(row["id"]), contact_email, youtube_channel_id, channel, unsubscribed_at)
                     delete_contact(int(row["id"]))
     except Exception:
         return
@@ -2267,12 +2360,24 @@ def fetch_campaign_template_stats(template_names: list[str]) -> pd.DataFrame:
             """,
             (current_user_id(), key),
         )[0]
+        unsubscribe_count = rows(
+            """
+            select count(*) as count
+            from unsubscribe_events
+            where user_id = ? and campaign_key = ?
+            """,
+            (current_user_id(), key),
+        )[0]["count"]
+        sent_count = int(counts["sent_count"] or 0)
+        unsubscribe_rate = (int(unsubscribe_count or 0) / sent_count * 100) if sent_count else 0
         records.append(
             {
                 "配信テンプレート": name,
-                "送信済み": int(counts["sent_count"] or 0),
+                "送信済み": sent_count,
                 "送信失敗": int(counts["failed_count"] or 0),
                 "送信待ち": int(counts["queued_count"] or 0),
+                "配信停止": int(unsubscribe_count or 0),
+                "配信停止率": f"{unsubscribe_rate:.1f}%",
                 "記録合計": int(counts["total_count"] or 0),
             }
         )
@@ -2853,7 +2958,7 @@ def main() -> None:
                     st.caption("ドラッグで並び替えるには、依存パッケージの反映後にアプリを再起動してください。")
         if template_names:
             with st.expander("配信テンプレートごとの成績"):
-                st.caption("配信名ごとの送信済み・失敗・送信待ちを確認できます。")
+                st.caption("配信名ごとの送信済み・失敗・送信待ち・配信停止を確認できます。配信停止は、その宛先へ最後に送った配信テンプレートに紐づけて記録します。")
                 st.dataframe(
                     fetch_campaign_template_stats(template_names),
                     use_container_width=True,
@@ -3299,6 +3404,7 @@ def main() -> None:
     if token:
         contact = rows("select id from contacts where token = ?", (token,))
         if contact:
+            record_unsubscribe_event(int(contact[0]["id"]))
             delete_contact(int(contact[0]["id"]))
         st.success("配信停止を受け付けました。宛先一覧からも削除しました。")
 
