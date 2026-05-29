@@ -1314,6 +1314,72 @@ def smtp_configured() -> bool:
     )
 
 
+def friendly_smtp_error(raw_error: str) -> str:
+    message = str(raw_error or "").strip()
+    lower = message.lower()
+    reasons = []
+
+    if "535" in lower or "authentication failed" in lower or "authentication unsuccessful" in lower:
+        reasons.extend(
+            [
+                "SMTP認証に失敗しています。送信元メールアドレスとSMTPパスワードを確認してください。",
+                "Xserverの場合、ユーザー名は基本的にメールアドレス全体です。例: noreply@example.com",
+                "パスワード欄を空のまま保存すると、古い保存済みパスワードが使われます。変更したい場合は新しいパスワードを入力して保存してください。",
+            ]
+        )
+    if "getaddrinfo" in lower or "name or service not known" in lower or "nodename" in lower:
+        reasons.append("SMTPサーバー名が間違っている可能性があります。Xserverなら sv数字.xserver.jp の形式を確認してください。")
+    if "timed out" in lower or "connection refused" in lower or "network is unreachable" in lower:
+        reasons.extend(
+            [
+                "SMTPサーバーまたはポート番号に接続できていません。",
+                "587を使う場合はSSL接続をOFF、465を使う場合はSSL接続をONにしてください。",
+            ]
+        )
+    if "wrong version number" in lower or "unknown protocol" in lower or "ssl" in lower and "wrong" in lower:
+        reasons.append("SSL設定とポート番号の組み合わせが合っていない可能性があります。587はSSL OFF、465はSSL ONです。")
+    if "starttls" in lower:
+        reasons.append("STARTTLSの開始に失敗しています。587でSSL OFF、または465でSSL ONを試してください。")
+    if "sender address rejected" in lower or "relay access denied" in lower or "553" in lower:
+        reasons.append("送信元メールアドレスがSMTPアカウントと合っていない可能性があります。送信元メールアドレスとSMTPユーザーを同じメールアドレスにしてください。")
+    if not reasons:
+        reasons.extend(
+            [
+                "SMTP設定のどこかで接続または送信に失敗しています。",
+                "まずは SMTPサーバー、ポート、SSL接続、送信元メールアドレス、SMTPパスワードを確認してください。",
+            ]
+        )
+
+    bullet_list = "\n".join(f"- {reason}" for reason in reasons)
+    return f"SMTP送信に失敗しました。\n\n考えられる原因と直し方:\n{bullet_list}\n\n実際のエラー:\n`{message}`"
+
+
+def check_smtp_login() -> tuple[bool, str]:
+    if not smtp_configured():
+        return False, "送信元メール設定が未完了です。SMTPサーバー、ポート、送信元メールアドレス、SMTPパスワードを入力してください。"
+
+    account = active_smtp_account()
+    host = str(account.get("smtp_host") or "")
+    port = int(str(account.get("smtp_port") or "587"))
+    use_ssl = int(account.get("smtp_ssl") or 0) == 1
+    sender_email = str(account.get("sender_email") or "")
+    smtp_pass = str(account.get("smtp_pass") or "")
+
+    try:
+        if use_ssl:
+            with smtplib.SMTP_SSL(host, port, timeout=30) as smtp:
+                smtp.login(sender_email, smtp_pass)
+        else:
+            with smtplib.SMTP(host, port, timeout=30) as smtp:
+                smtp.ehlo()
+                smtp.starttls()
+                smtp.ehlo()
+                smtp.login(sender_email, smtp_pass)
+        return True, "SMTPログイン確認OK"
+    except Exception as exc:
+        return False, friendly_smtp_error(str(exc))
+
+
 def render_template(text: str, contact: sqlite3.Row, unsubscribe_url: str) -> str:
     values = {
         "name": contact["name"] or "ご担当者",
@@ -1360,12 +1426,14 @@ def send_email(to_email: str, subject: str, body: str) -> tuple[bool, str]:
                 smtp.send_message(message)
         else:
             with smtplib.SMTP(host, port, timeout=30) as smtp:
+                smtp.ehlo()
                 smtp.starttls()
+                smtp.ehlo()
                 smtp.login(sender_email, smtp_pass)
                 smtp.send_message(message)
         return True, "送信しました"
     except Exception as exc:
-        return False, str(exc)
+        return False, friendly_smtp_error(str(exc))
 
 
 def create_send_job(
@@ -1381,6 +1449,9 @@ def create_send_job(
     account = active_smtp_account()
     if not smtp_configured():
         return False, "送信元メール設定が未完了です"
+    smtp_ok, smtp_message = check_smtp_login()
+    if not smtp_ok:
+        return False, smtp_message
     user_email = current_user_profile()["email"].strip().lower() or current_user_id()
     job_payload = {
         "user_email": user_email,
@@ -2082,10 +2153,15 @@ def main() -> None:
         st.info("送信予約を作成すると、送信処理はサーバー側で進みます。予約後はこのタブを閉じても、パソコンの電源を切っても、設定した間隔で送信が続きます。進捗は「最近の送信予約」で確認できます。すべて完了すると、ログイン中のGoogleメールアドレスに完了メールが届きます。")
 
         if run_test or run_all:
+            preflight_errors = []
             if not campaign_name.strip():
-                st.error("配信名を入力してください")
-            elif not confirmed:
-                st.error("送信前の確認にチェックしてください")
+                preflight_errors.append("配信名を入力してください。")
+            if not smtp_configured():
+                preflight_errors.append("送信元メール設定が未完了です。SMTPサーバー、ポート、送信元メールアドレス、SMTPパスワードを確認してください。")
+            if not confirmed:
+                preflight_errors.append("送信前の確認にチェックしてください。これは、送信対象が許諾済み、または法的に送信可能な宛先であることを確認するためのチェックです。")
+            if preflight_errors:
+                st.error("送信前に直す項目があります。\n\n" + "\n".join(f"- {error}" for error in preflight_errors))
             else:
                 save_setting("CURRENT_CAMPAIGN_NAME", campaign_name.strip())
                 contacts = rows(
@@ -2118,7 +2194,9 @@ def main() -> None:
                 else:
                     contacts = contacts[: int(send_limit)]
 
-                if run_all:
+                if not contacts:
+                    st.error("送信できる宛先がありません。宛先一覧、送信済み状況、配信名を確認してください。")
+                elif run_all:
                     ok, message = create_send_job(
                         campaign_name,
                         current_campaign_key,
