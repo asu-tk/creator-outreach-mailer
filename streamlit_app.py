@@ -2920,6 +2920,57 @@ def guess_email_column(frame: pd.DataFrame) -> str | None:
     return best_column if best_count else None
 
 
+def decode_downloaded_bytes(data: bytes) -> str:
+    for encoding in ["utf-8-sig", "utf-8", "cp932"]:
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def fetch_public_google_url(url: str) -> bytes:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 CreatorOutreachMailer",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return response.read()
+
+
+def extract_google_file_id(url: str, expected_kind: str) -> str:
+    pattern = rf"docs\.google\.com/{expected_kind}/d/([^/?#]+)"
+    match = re.search(pattern, url)
+    if not match:
+        raise ValueError("GoogleファイルのURLを読み取れませんでした。ブラウザのアドレスバーからURLをコピーしてください。")
+    return match.group(1)
+
+
+def read_google_sheet_url(url: str) -> pd.DataFrame:
+    sheet_id = extract_google_file_id(url, "spreadsheets")
+    parsed = urllib.parse.urlparse(url)
+    query = urllib.parse.parse_qs(parsed.query)
+    fragment_query = urllib.parse.parse_qs(parsed.fragment)
+    gid = (query.get("gid") or fragment_query.get("gid") or ["0"])[0]
+    export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={urllib.parse.quote(gid)}"
+    data = fetch_public_google_url(export_url)
+    text = decode_downloaded_bytes(data)
+    if "<html" in text[:300].lower():
+        raise ValueError("スプレッドシートを読み込めませんでした。共有設定を「リンクを知っている全員が閲覧可」にしてから再度お試しください。")
+    return pd.read_csv(BytesIO(text.encode("utf-8"))).fillna("")
+
+
+def read_google_doc_url(url: str) -> str:
+    document_id = extract_google_file_id(url, "document")
+    export_url = f"https://docs.google.com/document/d/{document_id}/export?format=txt"
+    text = decode_downloaded_bytes(fetch_public_google_url(export_url))
+    if "<html" in text[:300].lower():
+        raise ValueError("Googleドキュメントを読み込めませんでした。共有設定を「リンクを知っている全員が閲覧可」にしてから再度お試しください。")
+    return text
+
+
 def read_contacts_file(uploaded_file) -> pd.DataFrame:
     name = uploaded_file.name.lower()
     if name.endswith(".csv"):
@@ -2931,8 +2982,7 @@ def read_contacts_file(uploaded_file) -> pd.DataFrame:
     raise ValueError("対応している形式は CSV / TSV / XLSX / XLS です")
 
 
-def import_contacts_file(uploaded_file) -> tuple[int, int, dict[str, str | None]]:
-    frame = read_contacts_file(uploaded_file)
+def import_contacts_frame(frame: pd.DataFrame) -> tuple[int, int, dict[str, str | None]]:
     email_column = find_column(
         frame,
         {
@@ -2985,6 +3035,48 @@ def import_contacts_file(uploaded_file) -> tuple[int, int, dict[str, str | None]
         else:
             skipped += 1
     return added, skipped, {"email": email_column, "name": name_column, "channel": channel_column}
+
+
+def import_contacts_file(uploaded_file) -> tuple[int, int, dict[str, str | None]]:
+    return import_contacts_frame(read_contacts_file(uploaded_file))
+
+
+def import_contacts_text(text: str) -> tuple[int, int, dict[str, str | None]]:
+    email_pattern = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+    added = 0
+    skipped = 0
+    seen: set[str] = set()
+    for line in text.splitlines():
+        matches = email_pattern.findall(line)
+        if not matches:
+            continue
+        for email in matches:
+            normalized_email = email.strip().lower()
+            if normalized_email in seen:
+                skipped += 1
+                continue
+            seen.add(normalized_email)
+            inferred_channel = email_pattern.sub("", line).strip(" \t-–—:：,，/／|｜")
+            if len(inferred_channel) > 80:
+                inferred_channel = ""
+            if add_contact(normalized_email, "", inferred_channel, True):
+                added += 1
+            else:
+                skipped += 1
+    if not seen:
+        raise ValueError("Googleドキュメント内にメールアドレスを見つけられませんでした。")
+    return added, skipped, {"email": "本文から抽出", "name": None, "channel": "メール行から推定"}
+
+
+def import_contacts_google_url(url: str) -> tuple[int, int, dict[str, str | None], str]:
+    clean_url = url.strip()
+    if "docs.google.com/spreadsheets/" in clean_url:
+        added, skipped, mapping = import_contacts_frame(read_google_sheet_url(clean_url))
+        return added, skipped, mapping, "Googleスプレッドシート"
+    if "docs.google.com/document/" in clean_url:
+        added, skipped, mapping = import_contacts_text(read_google_doc_url(clean_url))
+        return added, skipped, mapping, "Googleドキュメント"
+    raise ValueError("対応しているURLは、GoogleスプレッドシートまたはGoogleドキュメントです。")
 
 
 def main() -> None:
@@ -3089,6 +3181,27 @@ def main() -> None:
                 )
             except Exception as exc:
                 st.error(str(exc))
+
+        with st.expander("Googleスプレッドシート / ドキュメントURLから取り込む"):
+            google_contacts_url = st.text_input(
+                "GoogleファイルのURL",
+                placeholder="Googleスプレッドシート、またはGoogleドキュメントのURL",
+                key="google_contacts_url",
+            )
+            st.caption(
+                "Google側の共有設定を「リンクを知っている全員が閲覧可」にしてください。"
+                "スプレッドシートは列名と中身から自動判別し、ドキュメントは本文中のメールアドレスを抽出します。"
+            )
+            if st.button("URLから取り込む", key="import_google_contacts_url", use_container_width=True, disabled=not google_contacts_url.strip()):
+                try:
+                    added, skipped, mapping, source_type = import_contacts_google_url(google_contacts_url)
+                    st.success(f"{source_type}から{added}件を取り込みました。重複や空欄は{skipped}件スキップしました。")
+                    st.caption(
+                        f"判別した項目: email={mapping['email'] or '-'} / "
+                        f"channel={mapping['channel'] or '-'} / name={mapping['name'] or '-'}"
+                    )
+                except Exception as exc:
+                    st.error(str(exc))
 
         st.subheader("YouTube候補検索")
         st.caption("メールアドレスは取得しません。条件に合うチャンネル候補だけを保存します。")
