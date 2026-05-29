@@ -48,8 +48,7 @@ GOOGLE_APP_SCOPES = [
 ]
 OUTSOURCE_SHEET_NAME = "外注用候補"
 GOOGLE_SHEET_WRITE_DISABLED_MESSAGE = (
-    "Googleの審査前アプリでは、アプリからGoogleシートを自動作成する権限を安全に使えません。"
-    "ログインできなくなるのを避けるため、この機能は一時停止しています。"
+    "外注用GoogleシートはURL登録方式で運用しています。"
 )
 
 YOUTUBE_VIDEO_CATEGORIES = {
@@ -5176,45 +5175,37 @@ def main() -> None:
     st.divider()
     st.subheader("YouTube候補一覧")
     candidates = fetch_candidates()
-    with st.expander("外注用Googleシートを作る / 回収する"):
+    with st.expander("外注用Googleシートを登録 / 回収する"):
         st.caption(
-            "候補一覧と連動する外注用Googleスプレッドシートを作成・更新できます。"
-            "外注さんはメールアドレス欄だけ入力し、戻ってきたシートを取り込むと宛先一覧へ移します。"
+            "外注用に用意したGoogleスプレッドシートのURLを登録できます。"
+            "登録したシートを開き、メールアドレスが入力されたら宛先一覧へ取り込みます。"
         )
         stored_outsource_url = get_setting("OUTSOURCE_SPREADSHEET_URL").strip()
-        ready_for_sheet, sheet_ready_message = google_sheet_write_ready()
-        if not ready_for_sheet:
-            st.info(sheet_ready_message)
-            st.caption("GoogleシートURLからの回収はそのまま使えます。自動作成は審査不要の方式に切り替えてから再開します。")
+        registered_outsource_url = st.text_input(
+            "外注用GoogleスプレッドシートURL",
+            value=stored_outsource_url,
+            placeholder="https://docs.google.com/spreadsheets/d/...",
+            key="registered_outsource_sheet_url",
+        )
+        save_url_col, open_url_col = st.columns(2)
+        if save_url_col.button("このURLを保存", key="save_outsource_sheet_url", use_container_width=True):
+            cleaned_outsource_url = registered_outsource_url.strip()
+            save_setting("OUTSOURCE_SPREADSHEET_URL", cleaned_outsource_url)
+            st.session_state["last_outsource_sheet_url"] = cleaned_outsource_url
+            if cleaned_outsource_url:
+                st.success("外注用GoogleシートURLを保存しました。")
+            else:
+                st.success("外注用GoogleシートURLを空にしました。")
+            st.rerun()
 
-        share_with_link = False
-        if ready_for_sheet:
-            share_with_link = st.checkbox(
-                "作成したシートを「リンクを知っている全員が編集可」にする",
-                value=False,
-                key="outsource_sheet_share_with_link",
-            )
-            if share_with_link:
-                st.warning("この設定にすると、URLを知っている人は誰でも編集できます。外注用URLの共有先に注意してください。")
-
-        if st.button(
-            "外注用Googleシートを作成 / 更新する",
-            key="create_or_update_outsource_google_sheet",
-            use_container_width=True,
-            disabled=candidates.empty or not ready_for_sheet,
-        ):
-            try:
-                spreadsheet_url, exported_count = update_outsource_spreadsheet(candidates, share_with_link)
-                st.session_state["last_outsource_sheet_url"] = spreadsheet_url
-                st.success(f"外注用Googleシートを更新しました。候補{exported_count}件を反映しています。")
-                st.link_button("外注用Googleシートを開く", spreadsheet_url, use_container_width=True)
-            except Exception as exc:
-                st.error(str(exc))
-
-        active_outsource_url = str(st.session_state.get("last_outsource_sheet_url") or stored_outsource_url)
-        if active_outsource_url:
-            st.link_button("外注用Googleシートを開く", active_outsource_url, use_container_width=True)
-            st.caption("外注さんにはこのGoogleスプレッドシートのURLを共有してください。候補IDとチャンネルIDの列は編集しない運用にしてください。")
+        active_outsource_url = str(
+            st.session_state.get("last_outsource_sheet_url") or registered_outsource_url.strip() or stored_outsource_url
+        )
+        if active_outsource_url.startswith("http"):
+            open_url_col.link_button("登録したGoogleシートを開く", active_outsource_url, use_container_width=True)
+        else:
+            open_url_col.button("登録したGoogleシートを開く", key="open_empty_outsource_sheet_url", use_container_width=True, disabled=True)
+        st.caption("列名は「チャンネル名」「YouTube URL」「メールアドレス」「メモ」があれば取り込めます。外注さんにはメールアドレス欄を入力してもらってください。")
 
         with st.expander("CSV / Excelで作る場合の予備ダウンロード"):
             outsource_frame = candidates_outsource_frame(candidates)
@@ -5238,8 +5229,8 @@ def main() -> None:
             )
 
         outsource_google_url = st.text_input(
-            "外注さんが入力したGoogleスプレッドシートURL",
-            placeholder="空欄なら上の外注用Googleシートを取り込みます",
+            "今回取り込むGoogleスプレッドシートURL",
+            placeholder="空欄なら登録済みの外注用Googleシートを取り込みます",
             key="outsource_google_url",
         )
         if st.button(
