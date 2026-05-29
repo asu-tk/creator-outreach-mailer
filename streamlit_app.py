@@ -2381,28 +2381,51 @@ def main() -> None:
                 st.rerun()
 
     st.divider()
-    st.markdown("<div id='youtube-candidates-top'></div>", unsafe_allow_html=True)
     st.subheader("YouTube候補一覧")
-    if st.session_state.pop("scroll_to_candidates_top", False):
-        components.html(
-            """
-            <script>
-            const target = window.parent.document.getElementById("youtube-candidates-top");
-            if (target) {
-                target.scrollIntoView({ behavior: "smooth", block: "start" });
-            }
-            </script>
-            """,
-            height=0,
-        )
     candidates = fetch_candidates()
     if candidates.empty:
         st.write("まだ候補チャンネルがありません。")
     else:
+        st.markdown("<div id='youtube-candidates-search-top'></div>", unsafe_allow_html=True)
         candidate_search = st.text_input(
             "候補一覧を検索",
             placeholder="チャンネル名、検索キーワードで検索",
         ).strip().lower()
+        if st.session_state.pop("scroll_to_candidates_top", False):
+            components.html(
+                """
+                <script>
+                const doc = window.parent.document;
+
+                function findCandidateSearchTarget() {
+                    const anchor = doc.getElementById("youtube-candidates-search-top");
+                    const inputs = Array.from(doc.querySelectorAll("input"));
+                    const searchInput = inputs.find((input) => {
+                        const label = input.getAttribute("aria-label") || "";
+                        const placeholder = input.getAttribute("placeholder") || "";
+                        return label.includes("候補一覧を検索") || placeholder.includes("チャンネル名、検索キーワード");
+                    });
+                    if (searchInput) {
+                        return searchInput.closest('[data-testid="stTextInput"]') || searchInput;
+                    }
+                    return anchor;
+                }
+
+                function scrollToCandidateSearch() {
+                    const target = findCandidateSearchTarget();
+                    if (!target) return;
+                    const top = target.getBoundingClientRect().top + window.parent.scrollY - 90;
+                    window.parent.scrollTo({ top, behavior: "smooth" });
+                    target.scrollIntoView({ behavior: "smooth", block: "start" });
+                }
+
+                setTimeout(scrollToCandidateSearch, 100);
+                setTimeout(scrollToCandidateSearch, 450);
+                setTimeout(scrollToCandidateSearch, 900);
+                </script>
+                """,
+                height=0,
+            )
         if candidate_search:
             mask = candidates[["title", "keyword"]].fillna("").astype(str).apply(
                 lambda column: column.str.lower().str.contains(candidate_search, regex=False)
