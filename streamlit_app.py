@@ -1012,6 +1012,7 @@ def change_candidate_page(delta: int, total_pages: int) -> None:
     current_page = int(st.session_state.get("candidates_page", 1))
     st.session_state["candidates_page"] = max(1, min(int(total_pages), current_page + int(delta)))
     st.session_state["scroll_to_candidates_top"] = True
+    st.session_state["scroll_to_candidates_nonce"] = int(st.session_state.get("scroll_to_candidates_nonce", 0)) + 1
 
 
 def ensure_default_campaign_template() -> None:
@@ -2392,9 +2393,11 @@ def main() -> None:
             placeholder="チャンネル名、検索キーワードで検索",
         ).strip().lower()
         if st.session_state.pop("scroll_to_candidates_top", False):
+            scroll_nonce = int(st.session_state.get("scroll_to_candidates_nonce", 0))
             components.html(
-                """
+                f"""
                 <script>
+                const scrollNonce = {scroll_nonce};
                 const doc = window.parent.document;
 
                 function findCandidateSearchTarget() {
@@ -2424,7 +2427,7 @@ def main() -> None:
                 setTimeout(scrollToCandidateSearch, 900);
                 </script>
                 """,
-                height=0,
+                height=1,
             )
         if candidate_search:
             mask = candidates[["title", "keyword"]].fillna("").astype(str).apply(
