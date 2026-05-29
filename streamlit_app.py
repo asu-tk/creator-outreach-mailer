@@ -2072,7 +2072,7 @@ def main() -> None:
             run_test = st.button("最初の1件でテスト", use_container_width=True)
         with send_button:
             run_all = st.button("指定件数を送信予約", type="primary", use_container_width=True)
-        st.info("送信予約を作成すると、送信処理はサーバー側で進みます。予約後はこのタブを閉じても、パソコンの電源を切っても、設定した間隔で送信が続きます。進捗は「最近の送信予約」で確認できます。")
+        st.info("送信予約を作成すると、送信処理はサーバー側で進みます。予約後はこのタブを閉じても、パソコンの電源を切っても、設定した間隔で送信が続きます。進捗は「最近の送信予約」で確認できます。すべて完了すると、ログイン中のGoogleメールアドレスに完了メールが届きます。")
 
         if run_test or run_all:
             if not campaign_name.strip():
