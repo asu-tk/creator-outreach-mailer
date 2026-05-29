@@ -616,6 +616,7 @@ def init_db() -> None:
                 id integer primary key autoincrement,
                 user_id text not null default 'local-user',
                 channel_id text not null,
+                email text not null default '',
                 title text not null default '',
                 channel_url text not null default '',
                 subscriber_count integer not null default 0,
@@ -672,6 +673,9 @@ def init_db() -> None:
             table_columns = [row[1] for row in db.execute(f"pragma table_info({table})").fetchall()]
             if "user_id" not in table_columns:
                 db.execute(f"alter table {table} add column user_id text not null default 'local-user'")
+        candidate_columns = [row[1] for row in db.execute("pragma table_info(youtube_candidates)").fetchall()]
+        if "email" not in candidate_columns:
+            db.execute("alter table youtube_candidates add column email text not null default ''")
         sends_columns = [row[1] for row in db.execute("pragma table_info(sends)").fetchall()]
         if "campaign_key" not in sends_columns:
             db.execute("alter table sends add column campaign_key text not null default ''")
@@ -713,6 +717,7 @@ def fetch_candidates() -> pd.DataFrame:
             select
                 id,
                 channel_id,
+                email,
                 title,
                 channel_url,
                 subscriber_count,
@@ -1098,18 +1103,27 @@ def save_candidate_from_contact(contact_id: int) -> tuple[bool, str]:
     if not channel_id:
         return False, "この宛先はYouTube候補から登録されたものではありません"
     if youtube_channel_in_candidates(channel_id):
+        execute(
+            """
+            update youtube_candidates
+            set email = case when email = '' then ? else email end
+            where user_id = ? and channel_id = ?
+            """,
+            (item["email"], current_user_id(), channel_id),
+        )
         delete_contact(contact_id)
         return True, "すでに候補一覧にあるため、宛先一覧からだけ削除しました"
 
     execute(
         """
         insert into youtube_candidates
-        (user_id, channel_id, title, channel_url, subscriber_count, video_count, view_count, description, keyword, created_at)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (user_id, channel_id, email, title, channel_url, subscriber_count, video_count, view_count, description, keyword, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             current_user_id(),
             channel_id,
+            item["email"],
             item["channel"],
             item["youtube_channel_url"] or f"https://www.youtube.com/channel/{channel_id}",
             int(item["youtube_subscriber_count"]),
@@ -1194,12 +1208,13 @@ def save_candidate(candidate: dict, keyword: str) -> bool:
     execute(
         """
         insert or ignore into youtube_candidates
-        (user_id, channel_id, title, channel_url, subscriber_count, video_count, view_count, description, keyword, created_at)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (user_id, channel_id, email, title, channel_url, subscriber_count, video_count, view_count, description, keyword, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             current_user_id(),
             channel_id,
+            candidate.get("email", ""),
             candidate["title"],
             candidate["channel_url"],
             int(candidate.get("subscriber_count", 0)),
@@ -2549,7 +2564,7 @@ def main() -> None:
                 candidate_detail = rows("select * from youtube_candidates where user_id = ? and id = ?", (current_user_id(), int(row.id)))
                 candidate = candidate_detail[0] if candidate_detail else None
                 added = add_contact(
-                    "",
+                    candidate["email"] if candidate else "",
                     "",
                     row.title or "",
                     True,
@@ -2563,7 +2578,10 @@ def main() -> None:
                 )
                 if added:
                     delete_candidate(int(row.id))
-                    st.success(f"{row.title} を宛先一覧に追加しました。メールアドレスを入力して保存してください。")
+                    if candidate and candidate["email"]:
+                        st.success(f"{row.title} を宛先一覧に追加しました。登録済みメールアドレスも引き継ぎました。")
+                    else:
+                        st.success(f"{row.title} を宛先一覧に追加しました。メールアドレスを入力して保存してください。")
                     st.rerun()
                 else:
                     st.warning("このチャンネルはすでに宛先一覧に登録されています")
