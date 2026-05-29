@@ -63,6 +63,73 @@ ${channel}を拝見し、ご連絡いたしました。
 
 不要な場合は、お手数ですが「配信停止希望」とご返信ください。"""
 
+DEFAULT_CAMPAIGN_TEMPLATES = [
+    (
+        "初回案内",
+        "${channel}へのご連絡",
+        """突然のご連絡失礼いたします。
+
+${channel}を拝見し、ご連絡いたしました。
+
+貴チャンネルの運営に関して、こちらでお役に立てそうな点があると感じています。
+もしご興味がありましたら、一度だけ概要をお送りできれば幸いです。
+
+不要な場合は、お手数ですが「配信停止希望」とご返信ください。""",
+    ),
+    (
+        "2通目 課題提起",
+        "${channel}の運営で気になった点について",
+        """先日ご連絡しました件で、補足のご連絡です。
+
+${channel}を拝見して、今後さらに伸ばせそうな余地がある一方で、日々の運営の中では後回しになりやすい作業も多いのではないかと感じました。
+
+弊社では、そのような作業負担を減らしながら、運営の成果につながる部分を支援しています。
+もし少しでもご関心がありましたら、簡単な資料をお送りします。
+
+不要な場合は、お手数ですが「配信停止希望」とご返信ください。""",
+    ),
+    (
+        "3通目 価値説明",
+        "${channel}に合いそうな活用イメージ",
+        """何度も失礼いたします。
+
+${channel}のように継続して発信されている場合、すでにあるコンテンツや取り組みを少し整えるだけで、新しい反応につながることがあります。
+
+弊社サービスでは、そうした改善や運用の手間を減らすことを目的にしています。
+大きな作業を増やすのではなく、今ある運営の延長で使える形を重視しています。
+
+必要でしたら、貴チャンネルに合わせた簡単な活用案を無料で作成します。
+
+不要な場合は、お手数ですが「配信停止希望」とご返信ください。""",
+    ),
+    (
+        "4通目 軽い提案",
+        "一度だけ無料で確認できます",
+        """ご確認ありがとうございます。
+
+もし判断材料が必要でしたら、一度だけ無料で簡単な確認・提案を作成できます。
+その内容を見て、必要なければそのまま見送っていただいて問題ありません。
+
+無理な営業ではなく、まず相性があるかだけ確認できればと思っています。
+
+ご希望でしたら「確認希望」とだけご返信ください。
+
+不要な場合は、お手数ですが「配信停止希望」とご返信ください。""",
+    ),
+    (
+        "5通目 最終確認",
+        "最後のご連絡です",
+        """何度もご連絡失礼いたしました。
+
+本件については、今回で最後のご連絡にいたします。
+もし今後、運営改善や作業効率化について検討されるタイミングがありましたら、その際に思い出していただけますと幸いです。
+
+ご興味がありましたら、このメールにそのままご返信ください。
+
+不要な場合は、お手数ですが「配信停止希望」とご返信ください。""",
+    ),
+]
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -939,10 +1006,12 @@ def save_campaign_template_order(names: list[str]) -> None:
 
 
 def ensure_default_campaign_template() -> None:
-    if fetch_campaign_templates():
-        return
-    save_campaign_template(DEFAULT_CAMPAIGN_NAME, DEFAULT_CAMPAIGN_SUBJECT, DEFAULT_CAMPAIGN_BODY)
-    save_setting("CURRENT_CAMPAIGN_NAME", DEFAULT_CAMPAIGN_NAME)
+    existing_names = {template["name"] for template in fetch_campaign_templates()}
+    for name, subject, body in DEFAULT_CAMPAIGN_TEMPLATES:
+        if name not in existing_names:
+            save_campaign_template(name, subject, body)
+    if not get_setting("CURRENT_CAMPAIGN_NAME"):
+        save_setting("CURRENT_CAMPAIGN_NAME", DEFAULT_CAMPAIGN_NAME)
 
 
 def block_target(email: str = "", youtube_channel_id: str = "", channel: str = "", reason: str = "") -> None:
