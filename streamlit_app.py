@@ -41,6 +41,14 @@ DB_PATH = DATA_DIR / "mailer.sqlite3"
 APP_TIMEZONE = ZoneInfo("Asia/Tokyo")
 CONTACT_STATUS_OPTIONS = ["未確認", "メール確認済み", "送信対象", "返信あり", "見込みあり", "除外"]
 SENDABLE_CONTACT_STATUSES = {"未確認", "メール確認済み", "送信対象"}
+GOOGLE_APP_SCOPES = [
+    "openid",
+    "email",
+    "profile",
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.file",
+]
+OUTSOURCE_SHEET_NAME = "外注用候補"
 
 YOUTUBE_VIDEO_CATEGORIES = {
     "エンターテイメント": "24",
@@ -207,8 +215,9 @@ def build_google_login_url() -> str:
         "client_id": config["client_id"],
         "redirect_uri": config["redirect_uri"],
         "response_type": "code",
-        "scope": "openid email profile",
-        "prompt": "select_account",
+        "scope": " ".join(GOOGLE_APP_SCOPES),
+        "prompt": "select_account consent",
+        "include_granted_scopes": "true",
         "access_type": "online",
     }
     return "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
@@ -229,6 +238,54 @@ def post_form(url: str, payload: dict[str, str]) -> dict:
 def get_json(url: str) -> dict:
     with urllib.request.urlopen(url, timeout=30) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def google_access_token() -> str:
+    manual_user = st.session_state.get("google_user") or {}
+    token = str(manual_user.get("access_token") or "")
+    expires_at = float(manual_user.get("expires_at") or 0)
+    if token and expires_at and time.time() < expires_at - 60:
+        return token
+    return ""
+
+
+def google_sheet_write_ready() -> tuple[bool, str]:
+    token = google_access_token()
+    if not token:
+        return False, "Googleスプレッドシートを作成するには、Googleログインをやり直してください。"
+    granted_scopes = set(str((st.session_state.get("google_user") or {}).get("scope") or "").split())
+    required_scopes = {
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive.file",
+    }
+    if not required_scopes.issubset(granted_scopes):
+        return False, "Googleスプレッドシート作成の権限が不足しています。ログアウトして、もう一度Googleログインしてください。"
+    return True, ""
+
+
+def google_api_request(method: str, url: str, token: str, payload: dict | None = None) -> dict:
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = response.read().decode("utf-8")
+            return json.loads(body) if body else {}
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(detail)
+            message = parsed.get("error", {}).get("message") or detail
+        except Exception:
+            message = detail or str(exc)
+        raise ValueError(f"Google APIで処理できませんでした: {message}") from exc
 
 
 def parse_bool(value: str | bool, default: bool = False) -> bool:
@@ -327,6 +384,9 @@ def handle_google_callback() -> None:
             "email": user_info.get("email", ""),
             "sub": user_info.get("sub", ""),
             "name": user_info.get("name", ""),
+            "access_token": token_data.get("access_token", ""),
+            "scope": token_data.get("scope", ""),
+            "expires_at": time.time() + int(token_data.get("expires_in", 0) or 0),
         }
         st.query_params.clear()
         st.rerun()
@@ -846,6 +906,162 @@ def candidates_outsource_frame(candidates: pd.DataFrame) -> pd.DataFrame:
         }
     )
     return export
+
+
+def outsource_sheet_values(candidates: pd.DataFrame) -> list[list[str]]:
+    frame = candidates_outsource_frame(candidates).fillna("")
+    values = [list(frame.columns)]
+    values.extend(frame.astype(str).values.tolist())
+    return values
+
+
+def create_outsource_spreadsheet(token: str) -> tuple[str, str]:
+    title = f"Creator Outreach Mailer 外注用候補 {datetime.now(APP_TIMEZONE).strftime('%Y-%m-%d %H:%M')}"
+    result = google_api_request(
+        "POST",
+        "https://sheets.googleapis.com/v4/spreadsheets",
+        token,
+        {
+            "properties": {"title": title},
+            "sheets": [
+                {
+                    "properties": {
+                        "title": OUTSOURCE_SHEET_NAME,
+                        "gridProperties": {"frozenRowCount": 1},
+                    }
+                }
+            ],
+        },
+    )
+    spreadsheet_id = str(result.get("spreadsheetId") or "")
+    spreadsheet_url = str(result.get("spreadsheetUrl") or "")
+    if not spreadsheet_id:
+        raise ValueError("Googleスプレッドシートを作成できませんでした。")
+    save_setting("OUTSOURCE_SPREADSHEET_ID", spreadsheet_id)
+    save_setting("OUTSOURCE_SPREADSHEET_URL", spreadsheet_url)
+    return spreadsheet_id, spreadsheet_url
+
+
+def get_or_create_outsource_spreadsheet(token: str) -> tuple[str, str]:
+    spreadsheet_id = get_setting("OUTSOURCE_SPREADSHEET_ID").strip()
+    spreadsheet_url = get_setting("OUTSOURCE_SPREADSHEET_URL").strip()
+    if spreadsheet_id and spreadsheet_url:
+        return spreadsheet_id, spreadsheet_url
+    return create_outsource_spreadsheet(token)
+
+
+def get_outsource_sheet_id(token: str, spreadsheet_id: str) -> int:
+    metadata = google_api_request(
+        "GET",
+        f"https://sheets.googleapis.com/v4/spreadsheets/{urllib.parse.quote(spreadsheet_id, safe='')}",
+        token,
+    )
+    for sheet in metadata.get("sheets", []):
+        properties = sheet.get("properties", {})
+        if properties.get("title") == OUTSOURCE_SHEET_NAME:
+            return int(properties.get("sheetId") or 0)
+    result = google_api_request(
+        "POST",
+        f"https://sheets.googleapis.com/v4/spreadsheets/{urllib.parse.quote(spreadsheet_id, safe='')}:batchUpdate",
+        token,
+        {"requests": [{"addSheet": {"properties": {"title": OUTSOURCE_SHEET_NAME}}}]},
+    )
+    return int(
+        result.get("replies", [{}])[0]
+        .get("addSheet", {})
+        .get("properties", {})
+        .get("sheetId", 0)
+    )
+
+
+def update_outsource_spreadsheet(candidates: pd.DataFrame, share_with_link: bool = False) -> tuple[str, int]:
+    ready, message = google_sheet_write_ready()
+    if not ready:
+        raise ValueError(message)
+    token = google_access_token()
+    spreadsheet_id, spreadsheet_url = get_or_create_outsource_spreadsheet(token)
+    sheet_id = get_outsource_sheet_id(token, spreadsheet_id)
+    encoded_id = urllib.parse.quote(spreadsheet_id, safe="")
+    encoded_range = urllib.parse.quote(f"{OUTSOURCE_SHEET_NAME}!A:Z", safe="")
+    google_api_request(
+        "POST",
+        f"https://sheets.googleapis.com/v4/spreadsheets/{encoded_id}/values/{encoded_range}:clear",
+        token,
+        {},
+    )
+    values = outsource_sheet_values(candidates)
+    update_range = urllib.parse.quote(f"{OUTSOURCE_SHEET_NAME}!A1", safe="")
+    google_api_request(
+        "PUT",
+        f"https://sheets.googleapis.com/v4/spreadsheets/{encoded_id}/values/{update_range}?valueInputOption=RAW",
+        token,
+        {"values": values},
+    )
+    google_api_request(
+        "POST",
+        f"https://sheets.googleapis.com/v4/spreadsheets/{encoded_id}:batchUpdate",
+        token,
+        {
+            "requests": [
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 0,
+                            "endRowIndex": 1,
+                        },
+                        "cell": {
+                            "userEnteredFormat": {
+                                "backgroundColor": {"red": 0.94, "green": 0.96, "blue": 1.0},
+                                "textFormat": {"bold": True},
+                            }
+                        },
+                        "fields": "userEnteredFormat(backgroundColor,textFormat)",
+                    }
+                },
+                {
+                    "updateSheetProperties": {
+                        "properties": {
+                            "sheetId": sheet_id,
+                            "gridProperties": {"frozenRowCount": 1},
+                        },
+                        "fields": "gridProperties.frozenRowCount",
+                    }
+                },
+                {
+                    "autoResizeDimensions": {
+                        "dimensions": {
+                            "sheetId": sheet_id,
+                            "dimension": "COLUMNS",
+                            "startIndex": 0,
+                            "endIndex": 9,
+                        }
+                    }
+                },
+            ]
+        },
+    )
+    if share_with_link:
+        google_api_request(
+            "POST",
+            f"https://www.googleapis.com/drive/v3/files/{encoded_id}/permissions",
+            token,
+            {"type": "anyone", "role": "writer"},
+        )
+    return spreadsheet_url, max(0, len(values) - 1)
+
+
+def refresh_outsource_sheet_if_possible() -> str:
+    if not get_setting("OUTSOURCE_SPREADSHEET_ID").strip():
+        return ""
+    ready, _message = google_sheet_write_ready()
+    if not ready:
+        return ""
+    try:
+        _url, count = update_outsource_spreadsheet(fetch_candidates(), False)
+        return f"外注用Googleシートも更新しました。残り候補は{count}件です。"
+    except Exception:
+        return ""
 
 
 def dataframe_to_xlsx(frame: pd.DataFrame, sheet_name: str = "宛先一覧") -> bytes:
@@ -3757,6 +3973,9 @@ def main() -> None:
                 removed_candidates = int(mapping.get("candidate_removed") or 0)
                 if removed_candidates:
                     st.caption(f"YouTube候補一覧から取込済み候補を{removed_candidates}件外しました。")
+                    refreshed_message = refresh_outsource_sheet_if_possible()
+                    if refreshed_message:
+                        st.caption(refreshed_message)
             except Exception as exc:
                 st.error(str(exc))
 
@@ -3788,6 +4007,9 @@ def main() -> None:
                     removed_candidates = int(mapping.get("candidate_removed") or 0)
                     if removed_candidates:
                         st.caption(f"YouTube候補一覧から取込済み候補を{removed_candidates}件外しました。")
+                        refreshed_message = refresh_outsource_sheet_if_possible()
+                        if refreshed_message:
+                            st.caption(refreshed_message)
                 except Exception as exc:
                     st.error(str(exc))
 
@@ -4964,52 +5186,85 @@ def main() -> None:
     candidates = fetch_candidates()
     with st.expander("外注用Googleシートを作る / 回収する"):
         st.caption(
-            "候補一覧を外注さん向けの表にできます。外注さんはメールアドレス欄だけ入力し、"
-            "戻ってきたGoogleスプレッドシートURLを取り込むと、メールありの候補を宛先一覧へ移します。"
+            "候補一覧と連動する外注用Googleスプレッドシートを作成・更新できます。"
+            "外注さんはメールアドレス欄だけ入力し、戻ってきたシートを取り込むと宛先一覧へ移します。"
         )
-        outsource_frame = candidates_outsource_frame(candidates)
-        export_name = datetime.now(APP_TIMEZONE).strftime("youtube_candidates_outsource_%Y%m%d_%H%M")
-        download_csv_col, download_xlsx_col = st.columns(2)
-        download_csv_col.download_button(
-            "外注用CSVをダウンロード",
-            data=outsource_frame.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"{export_name}.csv",
-            mime="text/csv",
+        stored_outsource_url = get_setting("OUTSOURCE_SPREADSHEET_URL").strip()
+        ready_for_sheet, sheet_ready_message = google_sheet_write_ready()
+        if not ready_for_sheet:
+            st.info(sheet_ready_message)
+            st.caption("ログアウトしてからもう一度Googleログインすると、シート作成の権限確認が出ます。")
+
+        share_with_link = st.checkbox(
+            "作成したシートを「リンクを知っている全員が編集可」にする",
+            value=False,
+            key="outsource_sheet_share_with_link",
+        )
+        if share_with_link:
+            st.warning("この設定にすると、URLを知っている人は誰でも編集できます。外注用URLの共有先に注意してください。")
+
+        if st.button(
+            "外注用Googleシートを作成 / 更新する",
+            key="create_or_update_outsource_google_sheet",
             use_container_width=True,
-            disabled=candidates.empty,
-        )
-        download_xlsx_col.download_button(
-            "外注用Excelをダウンロード",
-            data=dataframe_to_xlsx(outsource_frame, "外注用候補"),
-            file_name=f"{export_name}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            disabled=candidates.empty,
-        )
-        st.caption(
-            "ダウンロードしたExcel/CSVをGoogle Driveへアップロードして、Googleスプレッドシートとして外注さんに共有してください。"
-            "候補IDとチャンネルIDの列は、取り込み時に候補一覧と照合するための列なので編集しないでください。"
-        )
+            disabled=candidates.empty or not ready_for_sheet,
+        ):
+            try:
+                spreadsheet_url, exported_count = update_outsource_spreadsheet(candidates, share_with_link)
+                st.session_state["last_outsource_sheet_url"] = spreadsheet_url
+                st.success(f"外注用Googleシートを更新しました。候補{exported_count}件を反映しています。")
+                st.link_button("外注用Googleシートを開く", spreadsheet_url, use_container_width=True)
+            except Exception as exc:
+                st.error(str(exc))
+
+        active_outsource_url = str(st.session_state.get("last_outsource_sheet_url") or stored_outsource_url)
+        if active_outsource_url:
+            st.link_button("外注用Googleシートを開く", active_outsource_url, use_container_width=True)
+            st.caption("外注さんにはこのGoogleスプレッドシートのURLを共有してください。候補IDとチャンネルIDの列は編集しない運用にしてください。")
+
+        with st.expander("CSV / Excelで作る場合の予備ダウンロード"):
+            outsource_frame = candidates_outsource_frame(candidates)
+            export_name = datetime.now(APP_TIMEZONE).strftime("youtube_candidates_outsource_%Y%m%d_%H%M")
+            download_csv_col, download_xlsx_col = st.columns(2)
+            download_csv_col.download_button(
+                "外注用CSVをダウンロード",
+                data=outsource_frame.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"{export_name}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                disabled=candidates.empty,
+            )
+            download_xlsx_col.download_button(
+                "外注用Excelをダウンロード",
+                data=dataframe_to_xlsx(outsource_frame, "外注用候補"),
+                file_name=f"{export_name}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                disabled=candidates.empty,
+            )
 
         outsource_google_url = st.text_input(
             "外注さんが入力したGoogleスプレッドシートURL",
-            placeholder="外注用シートのURL",
+            placeholder="空欄なら上の外注用Googleシートを取り込みます",
             key="outsource_google_url",
         )
         if st.button(
             "外注シートから宛先一覧へ取り込む",
             key="import_outsource_google_url",
             use_container_width=True,
-            disabled=not outsource_google_url.strip(),
+            disabled=not (outsource_google_url.strip() or active_outsource_url),
             on_click=queue_outsource_google_url_import,
         ):
-            target_outsource_url = str(st.session_state.pop("pending_outsource_google_url", "")).strip()
+            target_outsource_url = str(st.session_state.pop("pending_outsource_google_url", "")).strip() or active_outsource_url
             try:
                 added, skipped, mapping, source_type = import_contacts_google_url(target_outsource_url)
                 st.success(f"{source_type}から{added}件を宛先一覧へ取り込みました。重複や空欄は{skipped}件スキップしました。")
                 removed_candidates = int(mapping.get("candidate_removed") or 0)
                 if removed_candidates:
                     st.caption(f"YouTube候補一覧から取込済み候補を{removed_candidates}件外しました。")
+                    refreshed_message = refresh_outsource_sheet_if_possible()
+                    if refreshed_message:
+                        st.caption(refreshed_message)
                 st.caption(
                     f"判別した項目: email={mapping['email'] or '-'} / "
                     f"channel={mapping['channel'] or '-'} / memo={mapping['memo'] or '-'} / "
