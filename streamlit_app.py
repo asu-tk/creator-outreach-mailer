@@ -3124,7 +3124,12 @@ def main() -> None:
         if template_names:
             scenarios = fetch_scenarios()
             with st.expander("シナリオ設定"):
-                st.caption("テンプレートの並び順とは別に、ステップメールの順番を固定できます。ここで決めた順番は、テンプレート一覧を並び替えても崩れません。")
+                st.caption("テンプレートの並び順とは別に、ステップメールの順番を最大10通まで固定できます。ここで決めた順番は、テンプレート一覧を並び替えても崩れません。")
+                reset_scenario_key = st.session_state.pop("_reset_scenario_editor_keys", "")
+                if reset_scenario_key:
+                    st.session_state.pop(f"scenario_name_input_{reset_scenario_key}", None)
+                    for step_number in range(1, 11):
+                        st.session_state.pop(f"scenario_step_{reset_scenario_key}_{step_number}", None)
                 scenario_options = ["新しく作る"] + [scenario["name"] for scenario in scenarios]
                 selected_scenario_name = st.selectbox("編集するシナリオ", scenario_options, key="scenario_editor_select")
                 selected_scenario = None
@@ -3144,7 +3149,7 @@ def main() -> None:
                     for step in selected_scenario_steps
                 }
                 step_values = []
-                for step_number in range(1, 8):
+                for step_number in range(1, 11):
                     default_template = existing_step_map.get(step_number, "")
                     default_index = template_names.index(default_template) + 1 if default_template in template_names else 0
                     step_template = st.selectbox(
@@ -3164,6 +3169,7 @@ def main() -> None:
                     else:
                         save_scenario(scenario_name_input, step_values)
                         st.success(f"シナリオ「{scenario_name_input}」を保存しました")
+                        st.session_state["_reset_scenario_editor_keys"] = selected_scenario_name
                         st.rerun()
                 if selected_scenario and scenario_delete_col.button("このシナリオを削除", key=f"delete_scenario_{selected_scenario['id']}", use_container_width=True):
                     delete_scenario(int(selected_scenario["id"]))
