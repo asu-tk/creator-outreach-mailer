@@ -45,10 +45,12 @@ GOOGLE_APP_SCOPES = [
     "openid",
     "email",
     "profile",
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive.file",
 ]
 OUTSOURCE_SHEET_NAME = "外注用候補"
+GOOGLE_SHEET_WRITE_DISABLED_MESSAGE = (
+    "Googleの審査前アプリでは、アプリからGoogleシートを自動作成する権限を安全に使えません。"
+    "ログインできなくなるのを避けるため、この機能は一時停止しています。"
+)
 
 YOUTUBE_VIDEO_CATEGORIES = {
     "エンターテイメント": "24",
@@ -250,17 +252,7 @@ def google_access_token() -> str:
 
 
 def google_sheet_write_ready() -> tuple[bool, str]:
-    token = google_access_token()
-    if not token:
-        return False, "Googleスプレッドシートを作成するには、Googleログインをやり直してください。"
-    granted_scopes = set(str((st.session_state.get("google_user") or {}).get("scope") or "").split())
-    required_scopes = {
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive.file",
-    }
-    if not required_scopes.issubset(granted_scopes):
-        return False, "Googleスプレッドシート作成の権限が不足しています。ログアウトして、もう一度Googleログインしてください。"
-    return True, ""
+    return False, GOOGLE_SHEET_WRITE_DISABLED_MESSAGE
 
 
 def google_api_request(method: str, url: str, token: str, payload: dict | None = None) -> dict:
@@ -5193,15 +5185,17 @@ def main() -> None:
         ready_for_sheet, sheet_ready_message = google_sheet_write_ready()
         if not ready_for_sheet:
             st.info(sheet_ready_message)
-            st.caption("ログアウトしてからもう一度Googleログインすると、シート作成の権限確認が出ます。")
+            st.caption("GoogleシートURLからの回収はそのまま使えます。自動作成は審査不要の方式に切り替えてから再開します。")
 
-        share_with_link = st.checkbox(
-            "作成したシートを「リンクを知っている全員が編集可」にする",
-            value=False,
-            key="outsource_sheet_share_with_link",
-        )
-        if share_with_link:
-            st.warning("この設定にすると、URLを知っている人は誰でも編集できます。外注用URLの共有先に注意してください。")
+        share_with_link = False
+        if ready_for_sheet:
+            share_with_link = st.checkbox(
+                "作成したシートを「リンクを知っている全員が編集可」にする",
+                value=False,
+                key="outsource_sheet_share_with_link",
+            )
+            if share_with_link:
+                st.warning("この設定にすると、URLを知っている人は誰でも編集できます。外注用URLの共有先に注意してください。")
 
         if st.button(
             "外注用Googleシートを作成 / 更新する",
