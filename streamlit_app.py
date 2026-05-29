@@ -3312,6 +3312,11 @@ def import_contacts_google_url(url: str) -> tuple[int, int, dict[str, str | None
     raise ValueError("対応しているURLは、GoogleスプレッドシートまたはGoogleドキュメントです。")
 
 
+def queue_google_contacts_url_import() -> None:
+    st.session_state["pending_google_contacts_url"] = str(st.session_state.get("google_contacts_url", "")).strip()
+    st.session_state["google_contacts_url"] = ""
+
+
 def main() -> None:
     st.set_page_config(page_title="Creator Outreach Mailer", layout="wide")
     init_db()
@@ -3425,9 +3430,16 @@ def main() -> None:
                 "Google側の共有設定を「リンクを知っている全員が閲覧可」にしてください。"
                 "スプレッドシートは列名と中身から自動判別し、ドキュメントは本文中のメールアドレスを抽出します。"
             )
-            if st.button("URLから取り込む", key="import_google_contacts_url", use_container_width=True, disabled=not google_contacts_url.strip()):
+            if st.button(
+                "URLから取り込む",
+                key="import_google_contacts_url",
+                use_container_width=True,
+                disabled=not google_contacts_url.strip(),
+                on_click=queue_google_contacts_url_import,
+            ):
+                target_google_contacts_url = str(st.session_state.pop("pending_google_contacts_url", "")).strip()
                 try:
-                    added, skipped, mapping, source_type = import_contacts_google_url(google_contacts_url)
+                    added, skipped, mapping, source_type = import_contacts_google_url(target_google_contacts_url)
                     st.success(f"{source_type}から{added}件を取り込みました。重複や空欄は{skipped}件スキップしました。")
                     st.caption(
                         f"判別した項目: email={mapping['email'] or '-'} / "
