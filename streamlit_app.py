@@ -5313,6 +5313,17 @@ def main() -> None:
             "登録したシートを開き、メールアドレスが入力されたら宛先一覧へ取り込みます。"
         )
         stored_outsource_url = get_setting("OUTSOURCE_SPREADSHEET_URL").strip()
+        create_sheet_col, sheet_home_col = st.columns(2)
+        create_sheet_col.link_button(
+            "新しいGoogleスプレッドシートを作る",
+            "https://sheets.new",
+            use_container_width=True,
+        )
+        sheet_home_col.link_button(
+            "Googleスプレッドシート一覧を開く",
+            "https://docs.google.com/spreadsheets/u/0/",
+            use_container_width=True,
+        )
         registered_outsource_url = st.text_input(
             "外注用GoogleスプレッドシートURL",
             value=stored_outsource_url,
