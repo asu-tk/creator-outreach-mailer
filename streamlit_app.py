@@ -1931,6 +1931,39 @@ def main() -> None:
                     sync_send_queue_results()
                     st.rerun()
                 note_col.caption("送信予約の進捗は30秒ごとに自動更新されます。")
+                st.markdown(
+                    """
+                    <style>
+                    @keyframes refreshCountdown {
+                        from { width: 100%; }
+                        to { width: 0%; }
+                    }
+                    .refresh-countdown-wrap {
+                        width: 100%;
+                        height: 10px;
+                        background: #E5E7EB;
+                        border-radius: 999px;
+                        overflow: hidden;
+                        margin: 2px 0 8px;
+                    }
+                    .refresh-countdown-bar {
+                        height: 100%;
+                        background: #2563EB;
+                        animation: refreshCountdown 30s linear forwards;
+                    }
+                    .refresh-countdown-text {
+                        color: #64748B;
+                        font-size: 0.85rem;
+                        margin-bottom: 4px;
+                    }
+                    </style>
+                    <div class="refresh-countdown-text">次の自動更新まで約30秒</div>
+                    <div class="refresh-countdown-wrap">
+                        <div class="refresh-countdown-bar"></div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
                 if st_autorefresh:
                     st_autorefresh(interval=30_000, key="send_jobs_autorefresh")
                 else:
