@@ -53,7 +53,13 @@ def today_key() -> str:
 def auth_is_configured() -> bool:
     try:
         auth_config = st.secrets.get("auth", {})
-        return bool(auth_config.get("redirect_uri") and auth_config.get("cookie_secret"))
+        return bool(
+            auth_config.get("redirect_uri")
+            and auth_config.get("cookie_secret")
+            and auth_config.get("client_id")
+            and auth_config.get("client_secret")
+            and auth_config.get("server_metadata_url")
+        )
     except Exception:
         return False
 
@@ -80,7 +86,7 @@ def require_login() -> bool:
     st.title("Creator Outreach Mailer")
     st.write("このアプリを使うにはGoogleログインが必要です。")
     if st.button("Googleでログイン"):
-        st.login("google")
+        st.login()
     return False
 
 
