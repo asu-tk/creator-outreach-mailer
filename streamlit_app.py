@@ -3169,65 +3169,78 @@ def main() -> None:
                     delete_scenario(int(selected_scenario["id"]))
                     st.success(f"シナリオ「{selected_scenario_name}」を削除しました")
                     st.rerun()
-        campaign_name = st.text_input("配信名", key="campaign_name_input")
-        st.caption("同じ配信名の間は、本文を少し直しても同じ配信として進捗を引き継ぎます。新しい別メールを送る時だけ配信名を変えてください。")
-        subject_template = st.text_input("件名", key="subject_template_input")
-        body_template = st.text_area("本文", height=260, key="body_template_input")
+        scenarios_for_send = fetch_scenarios()
+        send_mode = "通常配信"
+        if scenarios_for_send:
+            send_mode = st.radio("送信方式", ["通常配信", "シナリオ配信"], horizontal=True, key="send_mode")
+
+        campaign_name = str(st.session_state.get("campaign_name_input", ""))
+        subject_template = str(st.session_state.get("subject_template_input", ""))
+        body_template = str(st.session_state.get("body_template_input", ""))
         effective_campaign_name = campaign_name
         effective_campaign_key = campaign_key(campaign_name)
         effective_subject_template = subject_template
         effective_body_template = body_template
         prerequisite_campaign_keys: list[str] = []
         scenario_context = ""
-        scenarios_for_send = fetch_scenarios()
-        if scenarios_for_send:
-            send_mode = st.radio("送信方式", ["通常配信", "シナリオ配信"], horizontal=True, key="send_mode")
-            if send_mode == "シナリオ配信":
-                scenario_labels = [scenario["name"] for scenario in scenarios_for_send]
-                scenario_label = st.selectbox("送信するシナリオ", scenario_labels, key="send_scenario_select")
-                send_scenario = next((scenario for scenario in scenarios_for_send if scenario["name"] == scenario_label), None)
-                if send_scenario:
-                    send_steps = fetch_scenario_steps(int(send_scenario["id"]))
-                    if not send_steps:
-                        st.warning("このシナリオにはステップがありません。シナリオ設定でテンプレートを割り当ててください。")
-                    else:
-                        step_labels = [f"{step['step_number']}通目: {step['template_name']}" for step in send_steps]
-                        selected_step_label = st.selectbox("今回送るステップ", step_labels, key="send_scenario_step_select")
-                        selected_step_index = step_labels.index(selected_step_label)
-                        selected_step = send_steps[selected_step_index]
-                        selected_template_for_step = get_campaign_template(selected_step["template_name"])
-                        prerequisite_campaign_keys = [
-                            scenario_step_campaign_key(int(send_scenario["id"]), int(step["step_number"]))
-                            for step in send_steps[:selected_step_index]
-                        ]
-                        effective_campaign_name = scenario_step_campaign_name(
-                            send_scenario["name"],
-                            int(selected_step["step_number"]),
-                            selected_step["template_name"],
-                        )
-                        effective_campaign_key = scenario_step_campaign_key(
-                            int(send_scenario["id"]),
-                            int(selected_step["step_number"]),
-                        )
-                        if selected_template_for_step:
-                            effective_subject_template = selected_template_for_step["subject"]
-                            effective_body_template = selected_template_for_step["body"]
-                        scenario_context = (
-                            f"シナリオ「{send_scenario['name']}」の{selected_step['step_number']}通目です。"
-                            f"{'前のステップを送信済みの宛先だけが対象です。' if prerequisite_campaign_keys else '1通目なので前提条件はありません。'}"
-                        )
-                        st.info(scenario_context)
-                        st.caption(f"このステップで使うテンプレート: {selected_step['template_name']}")
-            else:
-                st.caption("通常配信では、配信名ごとに送信済み・送信待ちを判定します。")
-        if save_col.button("保存 / 更新", key="save_campaign_template", use_container_width=True):
-            if campaign_name.strip():
-                save_campaign_template(campaign_name, subject_template, body_template)
-                save_setting("CURRENT_CAMPAIGN_NAME", campaign_name.strip())
-                reset_campaign_template_session(campaign_name.strip(), subject_template, body_template)
-                st.success(f"{campaign_name} を保存しました")
-            else:
-                st.error("配信名を入力してください")
+        if send_mode == "シナリオ配信":
+            scenario_labels = [scenario["name"] for scenario in scenarios_for_send]
+            scenario_label = st.selectbox("送信するシナリオ", scenario_labels, key="send_scenario_select")
+            send_scenario = next((scenario for scenario in scenarios_for_send if scenario["name"] == scenario_label), None)
+            if send_scenario:
+                send_steps = fetch_scenario_steps(int(send_scenario["id"]))
+                if not send_steps:
+                    st.warning("このシナリオにはステップがありません。シナリオ設定でテンプレートを割り当ててください。")
+                else:
+                    step_labels = [f"{step['step_number']}通目: {step['template_name']}" for step in send_steps]
+                    selected_step_label = st.selectbox("今回送るステップ", step_labels, key="send_scenario_step_select")
+                    selected_step_index = step_labels.index(selected_step_label)
+                    selected_step = send_steps[selected_step_index]
+                    selected_template_for_step = get_campaign_template(selected_step["template_name"])
+                    prerequisite_campaign_keys = [
+                        scenario_step_campaign_key(int(send_scenario["id"]), int(step["step_number"]))
+                        for step in send_steps[:selected_step_index]
+                    ]
+                    effective_campaign_name = scenario_step_campaign_name(
+                        send_scenario["name"],
+                        int(selected_step["step_number"]),
+                        selected_step["template_name"],
+                    )
+                    effective_campaign_key = scenario_step_campaign_key(
+                        int(send_scenario["id"]),
+                        int(selected_step["step_number"]),
+                    )
+                    if selected_template_for_step:
+                        effective_subject_template = selected_template_for_step["subject"]
+                        effective_body_template = selected_template_for_step["body"]
+                    scenario_context = (
+                        f"シナリオ「{send_scenario['name']}」の{selected_step['step_number']}通目です。"
+                        f"{'前のステップを送信済みの宛先だけが対象です。' if prerequisite_campaign_keys else '1通目なので前提条件はありません。'}"
+                    )
+                    st.info(scenario_context)
+                    st.caption(f"このステップで使うテンプレート: {selected_step['template_name']}")
+                    with st.expander("このステップで送る内容を確認", expanded=False):
+                        st.text_input("配信名", value=effective_campaign_name, disabled=True, key="scenario_effective_campaign_name")
+                        st.text_input("件名", value=effective_subject_template, disabled=True, key="scenario_effective_subject")
+                        st.text_area("本文", value=effective_body_template, height=220, disabled=True, key="scenario_effective_body")
+        else:
+            st.caption("通常配信では、配信名ごとに送信済み・送信待ちを判定します。")
+            campaign_name = st.text_input("配信名", key="campaign_name_input")
+            st.caption("同じ配信名の間は、本文を少し直しても同じ配信として進捗を引き継ぎます。新しい別メールを送る時だけ配信名を変えてください。")
+            subject_template = st.text_input("件名", key="subject_template_input")
+            body_template = st.text_area("本文", height=260, key="body_template_input")
+            effective_campaign_name = campaign_name
+            effective_campaign_key = campaign_key(campaign_name)
+            effective_subject_template = subject_template
+            effective_body_template = body_template
+            if save_col.button("保存 / 更新", key="save_campaign_template", use_container_width=True):
+                if campaign_name.strip():
+                    save_campaign_template(campaign_name, subject_template, body_template)
+                    save_setting("CURRENT_CAMPAIGN_NAME", campaign_name.strip())
+                    reset_campaign_template_session(campaign_name.strip(), subject_template, body_template)
+                    st.success(f"{campaign_name} を保存しました")
+                else:
+                    st.error("配信名を入力してください")
         delay = st.number_input("送信間隔（秒）", min_value=30, max_value=300, value=90, step=10)
         st.caption("送信間隔は90秒を初期値にしています。短すぎる間隔は迷惑メール判定やサーバー制限の原因になるため、実運用では60〜120秒以上を目安にしてください。")
         send_limit = st.number_input("今回送信する件数", min_value=1, max_value=500, value=50)
