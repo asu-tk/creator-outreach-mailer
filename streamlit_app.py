@@ -1006,12 +1006,24 @@ def save_campaign_template_order(names: list[str]) -> None:
 
 
 def ensure_default_campaign_template() -> None:
+    execute("delete from campaign_templates where user_id = ? and name = ?", (current_user_id(), "2通目"))
     existing_names = {template["name"] for template in fetch_campaign_templates()}
     for name, subject, body in DEFAULT_CAMPAIGN_TEMPLATES:
         if name not in existing_names:
             save_campaign_template(name, subject, body)
     if not get_setting("CURRENT_CAMPAIGN_NAME"):
         save_setting("CURRENT_CAMPAIGN_NAME", DEFAULT_CAMPAIGN_NAME)
+
+
+def load_campaign_template_into_session(template_name: str) -> bool:
+    template = get_campaign_template(template_name)
+    if not template:
+        return False
+    st.session_state["campaign_name_input"] = template["name"]
+    st.session_state["subject_template_input"] = template["subject"]
+    st.session_state["body_template_input"] = template["body"]
+    st.session_state["loaded_campaign_template"] = template["name"]
+    return True
 
 
 def block_target(email: str = "", youtube_channel_id: str = "", channel: str = "", reason: str = "") -> None:
@@ -1859,6 +1871,12 @@ def main() -> None:
         st.subheader("メール作成")
         current_campaign_name = get_setting("CURRENT_CAMPAIGN_NAME", DEFAULT_CAMPAIGN_NAME)
         current_template = get_campaign_template(current_campaign_name)
+        if (
+            current_template
+            and "campaign_name_input" not in st.session_state
+            and "loaded_campaign_template" not in st.session_state
+        ):
+            load_campaign_template_into_session(current_campaign_name)
         if "campaign_name_input" not in st.session_state:
             st.session_state["campaign_name_input"] = current_template["name"] if current_template else current_campaign_name
         if "subject_template_input" not in st.session_state:
@@ -1873,11 +1891,8 @@ def main() -> None:
         selected_template = st.selectbox("保存済み配信", template_options, index=selected_index)
         load_col, save_col, delete_col = st.columns(3)
         if load_col.button("読み込む", key="load_campaign_template", use_container_width=True, disabled=selected_template == "新しく作る"):
-            template = get_campaign_template(selected_template)
-            if template:
-                st.session_state["campaign_name_input"] = template["name"]
-                st.session_state["subject_template_input"] = template["subject"]
-                st.session_state["body_template_input"] = template["body"]
+            if load_campaign_template_into_session(selected_template):
+                save_setting("CURRENT_CAMPAIGN_NAME", selected_template)
                 st.rerun()
         if len(template_names) > 1:
             with st.expander("配信テンプレートの並び替え"):
