@@ -1006,10 +1006,20 @@ def save_campaign_template(name: str, subject: str, body: str) -> None:
 
 
 def delete_campaign_template(name: str) -> None:
+    clean_name = name.strip()
     execute(
         "delete from campaign_templates where user_id = ? and name = ?",
-        (current_user_id(), name.strip()),
+        (current_user_id(), clean_name),
     )
+    default_names = {template_name for template_name, _, _ in DEFAULT_CAMPAIGN_TEMPLATES}
+    if clean_name in default_names:
+        deleted_defaults = {
+            item.strip()
+            for item in get_setting("DELETED_DEFAULT_CAMPAIGN_TEMPLATES", "").split("|")
+            if item.strip()
+        }
+        deleted_defaults.add(clean_name)
+        save_setting("DELETED_DEFAULT_CAMPAIGN_TEMPLATES", "|".join(sorted(deleted_defaults)))
 
 
 def move_campaign_template(name: str, direction: int) -> None:
@@ -1055,8 +1065,15 @@ def change_candidate_page(delta: int, total_pages: int) -> None:
 
 def ensure_default_campaign_template() -> None:
     execute("delete from campaign_templates where user_id = ? and name = ?", (current_user_id(), "2通目"))
+    deleted_defaults = {
+        item.strip()
+        for item in get_setting("DELETED_DEFAULT_CAMPAIGN_TEMPLATES", "").split("|")
+        if item.strip()
+    }
     existing_names = {template["name"] for template in fetch_campaign_templates()}
     for name, subject, body in DEFAULT_CAMPAIGN_TEMPLATES:
+        if name in deleted_defaults:
+            continue
         if name not in existing_names:
             save_campaign_template(name, subject, body)
     if not get_setting("CURRENT_CAMPAIGN_NAME"):
