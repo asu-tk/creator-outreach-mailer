@@ -3124,12 +3124,17 @@ def main() -> None:
         if template_names:
             scenarios = fetch_scenarios()
             with st.expander("シナリオ設定"):
-                st.caption("テンプレートの並び順とは別に、ステップメールの順番を最大10通まで固定できます。ここで決めた順番は、テンプレート一覧を並び替えても崩れません。")
+                st.caption("テンプレートの並び順とは別に、ステップメールの順番を固定できます。最初は10通分を表示し、必要なら11通目以降も追加できます。")
+                if st.session_state.pop("_force_new_scenario_editor", False):
+                    st.session_state.pop("scenario_editor_select", None)
                 reset_scenario_key = st.session_state.pop("_reset_scenario_editor_keys", "")
                 if reset_scenario_key:
                     st.session_state.pop(f"scenario_name_input_{reset_scenario_key}", None)
-                    for step_number in range(1, 11):
+                    step_count_key = f"scenario_step_count_{reset_scenario_key}"
+                    step_count = int(st.session_state.get(step_count_key, 10))
+                    for step_number in range(1, max(10, step_count) + 1):
                         st.session_state.pop(f"scenario_step_{reset_scenario_key}_{step_number}", None)
+                    st.session_state.pop(step_count_key, None)
                 scenario_options = ["新しく作る"] + [scenario["name"] for scenario in scenarios]
                 selected_scenario_name = st.selectbox("編集するシナリオ", scenario_options, key="scenario_editor_select")
                 selected_scenario = None
@@ -3148,8 +3153,12 @@ def main() -> None:
                     int(step["step_number"]): step["template_name"]
                     for step in selected_scenario_steps
                 }
+                step_count_key = f"scenario_step_count_{selected_scenario_name}"
+                if step_count_key not in st.session_state:
+                    st.session_state[step_count_key] = max(10, len(existing_step_map))
+                step_count = int(st.session_state.get(step_count_key, 10))
                 step_values = []
-                for step_number in range(1, 11):
+                for step_number in range(1, step_count + 1):
                     default_template = existing_step_map.get(step_number, "")
                     default_index = template_names.index(default_template) + 1 if default_template in template_names else 0
                     step_template = st.selectbox(
@@ -3160,6 +3169,11 @@ def main() -> None:
                     )
                     if step_template != "使わない":
                         step_values.append(step_template)
+                add_step_col, step_note_col = st.columns([1.0, 2.0])
+                if add_step_col.button("ステップを追加", key=f"add_scenario_step_{selected_scenario_name}", use_container_width=True):
+                    st.session_state[step_count_key] = step_count + 1
+                    st.rerun()
+                step_note_col.caption(f"現在 {step_count}通目まで表示しています。不要なステップは「使わない」のままで大丈夫です。")
                 scenario_save_col, scenario_delete_col = st.columns(2)
                 if scenario_save_col.button("シナリオを保存", key=f"save_scenario_{selected_scenario_name}", use_container_width=True):
                     if not scenario_name_input.strip():
@@ -3170,6 +3184,7 @@ def main() -> None:
                         save_scenario(scenario_name_input, step_values)
                         st.success(f"シナリオ「{scenario_name_input}」を保存しました")
                         st.session_state["_reset_scenario_editor_keys"] = selected_scenario_name
+                        st.session_state["_force_new_scenario_editor"] = True
                         st.rerun()
                 if selected_scenario and scenario_delete_col.button("このシナリオを削除", key=f"delete_scenario_{selected_scenario['id']}", use_container_width=True):
                     delete_scenario(int(selected_scenario["id"]))
