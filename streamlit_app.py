@@ -197,7 +197,6 @@ def require_login() -> bool:
         return True
     st.title("Creator Outreach Mailer")
     st.write("このアプリを使うにはGoogleログインが必要です。")
-    st.info("Google CloudのOAuth設定には、このアプリ本体のURLをリダイレクトURLとして登録してください。例: https://creator-outreach-mailer.streamlit.app/")
     st.link_button("Googleでログイン", build_google_login_url())
     st.stop()
 
