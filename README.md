@@ -97,6 +97,8 @@ Streamlit CloudのSecretsに以下を設定します。
 [auth]
 redirect_uri = "https://your-app-name.streamlit.app/oauth2callback"
 cookie_secret = "long-random-secret"
+
+[auth.google]
 client_id = "your-google-oauth-client-id"
 client_secret = "your-google-oauth-client-secret"
 server_metadata_url = "https://accounts.google.com/.well-known/openid-configuration"

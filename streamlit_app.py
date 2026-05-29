@@ -53,12 +53,13 @@ def today_key() -> str:
 def auth_is_configured() -> bool:
     try:
         auth_config = st.secrets.get("auth", {})
+        google_config = auth_config.get("google", {})
         return bool(
             auth_config.get("redirect_uri")
             and auth_config.get("cookie_secret")
-            and auth_config.get("client_id")
-            and auth_config.get("client_secret")
-            and auth_config.get("server_metadata_url")
+            and google_config.get("client_id")
+            and google_config.get("client_secret")
+            and google_config.get("server_metadata_url")
         )
     except Exception:
         return False
@@ -69,7 +70,8 @@ def auth_config_status() -> list[str]:
     try:
         auth_config = st.secrets.get("auth", {})
         for key in ["redirect_uri", "cookie_secret", "client_id", "client_secret", "server_metadata_url"]:
-            checks.append(f"{key}: {'設定あり' if auth_config.get(key) else '未設定'}")
+            value = auth_config.get(key) if key in ["redirect_uri", "cookie_secret"] else auth_config.get("google", {}).get(key)
+            checks.append(f"{key}: {'設定あり' if value else '未設定'}")
         redirect_uri = str(auth_config.get("redirect_uri", ""))
         if redirect_uri and not redirect_uri.endswith("/oauth2callback"):
             checks.append("redirect_uri: /oauth2callback で終わっていません")
@@ -102,7 +104,7 @@ def require_login() -> bool:
     st.title("Creator Outreach Mailer")
     st.write("このアプリを使うにはGoogleログインが必要です。")
     st.info("ログインできない場合は、Streamlitのプレビューや埋め込み画面ではなく、Chrome / Edge / Safari などの通常ブラウザで開いてください。")
-    st.button("Googleでログイン", on_click=st.login)
+    st.button("Googleでログイン", on_click=lambda: st.login("google"))
     st.stop()
 
 
