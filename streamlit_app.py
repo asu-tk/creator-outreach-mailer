@@ -1339,6 +1339,21 @@ def fetch_scenario_steps(scenario_id: int) -> list[sqlite3.Row]:
     )
 
 
+def fetch_template_names_used_in_scenarios() -> set[str]:
+    return {
+        str(row["template_name"]).strip()
+        for row in rows(
+            """
+            select distinct template_name
+            from scenario_steps
+            where user_id = ? and template_name != ''
+            """,
+            (current_user_id(),),
+        )
+        if str(row["template_name"]).strip()
+    }
+
+
 def save_scenario(name: str, template_names: list[str]) -> int | None:
     clean_name = name.strip()
     clean_templates = [template.strip() for template in template_names if template.strip()]
@@ -3104,13 +3119,39 @@ def main() -> None:
 
         templates = fetch_campaign_templates()
         template_names = [template["name"] for template in templates]
-        if template_names:
-            selected_index = template_names.index(current_campaign_name) if current_campaign_name in template_names else 0
-            selected_template = st.selectbox("保存済み配信", template_names, index=selected_index)
+        scenario_template_names = fetch_template_names_used_in_scenarios()
+        saved_template_names = [name for name in template_names if name.strip() not in scenario_template_names]
+        if current_campaign_name.strip() in scenario_template_names:
+            current_campaign_name = saved_template_names[0] if saved_template_names else ""
+            save_setting("CURRENT_CAMPAIGN_NAME", current_campaign_name)
+            if current_campaign_name:
+                fallback_template = get_campaign_template(current_campaign_name)
+                if fallback_template:
+                    reset_campaign_template_session(
+                        fallback_template["name"],
+                        fallback_template["subject"],
+                        fallback_template["body"],
+                    )
+            else:
+                reset_campaign_template_session("", "", "")
+        if saved_template_names:
+            if st.session_state.get("saved_campaign_template_select") not in saved_template_names:
+                st.session_state.pop("saved_campaign_template_select", None)
+            selected_index = saved_template_names.index(current_campaign_name) if current_campaign_name in saved_template_names else 0
+            selected_template = st.selectbox(
+                "保存済み配信",
+                saved_template_names,
+                index=selected_index,
+                key="saved_campaign_template_select",
+            )
         else:
             selected_template = ""
-            st.info("保存済み配信はまだありません。新しいテンプレートを作成してください。")
-        st.caption("保存済みのテンプレートを選んで「読み込む」と、下の件名・本文に反映されます。")
+            st.session_state.pop("saved_campaign_template_select", None)
+            if template_names and scenario_template_names:
+                st.info("通常配信用の保存済み配信はありません。シナリオに含まれているテンプレートは、ここでは非表示にしています。")
+            else:
+                st.info("保存済み配信はまだありません。新しいテンプレートを作成してください。")
+        st.caption("保存済みのテンプレートを選んで「読み込む」と、下の件名・本文に反映されます。シナリオに含まれるテンプレートは通常配信側では非表示になります。")
         load_col, new_col, save_col, delete_col = st.columns(4)
         if load_col.button("読み込む", key="load_campaign_template", use_container_width=True, disabled=not selected_template):
             if load_campaign_template_into_session(selected_template):
