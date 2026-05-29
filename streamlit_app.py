@@ -1582,6 +1582,26 @@ def delete_candidate(candidate_id: int) -> None:
     execute("delete from youtube_candidates where user_id = ? and id = ?", (current_user_id(), candidate_id))
 
 
+def delete_candidate_and_block(candidate_id: int, reason: str = "YouTube候補から削除") -> None:
+    candidate = rows(
+        """
+        select email, channel_id, title
+        from youtube_candidates
+        where user_id = ? and id = ?
+        limit 1
+        """,
+        (current_user_id(), int(candidate_id)),
+    )
+    if candidate:
+        block_target(
+            str(candidate[0]["email"] or ""),
+            str(candidate[0]["channel_id"] or ""),
+            str(candidate[0]["title"] or ""),
+            reason,
+        )
+    delete_candidate(candidate_id)
+
+
 def save_candidate_from_contact(contact_id: int) -> tuple[bool, str]:
     contact = rows("select * from contacts where user_id = ? and id = ?", (current_user_id(), contact_id))
     if not contact:
@@ -4038,8 +4058,8 @@ def main() -> None:
                 else:
                     st.warning("このチャンネルはすでに宛先一覧に登録されています")
             if columns[7].button("削除", key=f"delete_candidate_{row.id}"):
-                delete_candidate(int(row.id))
-                st.success(f"{row.title} を削除しました")
+                delete_candidate_and_block(int(row.id))
+                st.success(f"{row.title} を削除し、今後自動で戻らないようにしました")
                 st.rerun()
 
         st.divider()
