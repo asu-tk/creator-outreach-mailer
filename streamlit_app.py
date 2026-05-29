@@ -1892,6 +1892,61 @@ def fetch_failed_sends(limit: int = 20) -> pd.DataFrame:
         )
 
 
+def fetch_campaign_template_stats(template_names: list[str]) -> pd.DataFrame:
+    records = []
+    for name in template_names:
+        key = campaign_key(name)
+        counts = rows(
+            """
+            select
+                sum(case when status = 'sent' then 1 else 0 end) as sent_count,
+                sum(case when status = 'failed' then 1 else 0 end) as failed_count,
+                sum(case when status = 'queued' then 1 else 0 end) as queued_count,
+                count(*) as total_count
+            from sends
+            where user_id = ? and campaign_key = ?
+            """,
+            (current_user_id(), key),
+        )[0]
+        records.append(
+            {
+                "配信テンプレート": name,
+                "送信済み": int(counts["sent_count"] or 0),
+                "送信失敗": int(counts["failed_count"] or 0),
+                "送信待ち": int(counts["queued_count"] or 0),
+                "記録合計": int(counts["total_count"] or 0),
+            }
+        )
+    return pd.DataFrame(records)
+
+
+def safety_check_messages(
+    subject_template: str,
+    body_template: str,
+    send_limit: int,
+    planned_count: int,
+    preview_available: bool,
+) -> list[str]:
+    messages = []
+    clean_subject = subject_template.strip()
+    clean_body = body_template.strip()
+    if not clean_subject:
+        messages.append("件名が空です。送信前に件名を入力してください。")
+    if len(clean_subject) > 80:
+        messages.append("件名が長めです。相手のメールアプリで途中までしか表示されない可能性があります。")
+    if len(clean_body) < 80:
+        messages.append("本文がかなり短いです。誤送信でないか確認してください。")
+    if "${unsubscribe_url}" not in body_template:
+        messages.append("本文に配信停止URLがありません。送信時に末尾へ自動追加されます。")
+    if int(send_limit) > 300:
+        messages.append("今回送信する件数が多めです。サーバー制限や迷惑メール判定に注意してください。")
+    if planned_count == 0:
+        messages.append("今回送信できる未送信の宛先がありません。配信名や送信済み状況を確認してください。")
+    if not preview_available:
+        messages.append("送信前プレビューを作れる宛先がありません。")
+    return messages
+
+
 def fetch_blocked_targets() -> pd.DataFrame:
     with sqlite3.connect(DB_PATH) as db:
         return pd.read_sql_query(
@@ -2434,6 +2489,14 @@ def main() -> None:
                             st.rerun()
                 else:
                     st.caption("ドラッグで並び替えるには、依存パッケージの反映後にアプリを再起動してください。")
+        if template_names:
+            with st.expander("配信テンプレートごとの成績"):
+                st.caption("配信名ごとの送信済み・失敗・送信待ちを確認できます。")
+                st.dataframe(
+                    fetch_campaign_template_stats(template_names),
+                    use_container_width=True,
+                    hide_index=True,
+                )
         campaign_name = st.text_input("配信名", key="campaign_name_input")
         st.caption("同じ配信名の間は、本文を少し直しても同じ配信として進捗を引き継ぎます。新しい別メールを送る時だけ配信名を変えてください。")
         subject_template = st.text_input("件名", key="subject_template_input")
@@ -2544,6 +2607,17 @@ def main() -> None:
         st.caption("同じ配信名ですでに送った宛先、または送信待ちの宛先は自動で除外します。送信対象は、未送信の宛先を優先し、その後は最終送信日時が古い順に選ばれます。")
 
         preview_contacts = fetch_next_send_contacts(current_campaign_key, 1) if campaign_name.strip() else []
+        safety_messages = safety_check_messages(
+            subject_template,
+            body_template,
+            int(send_limit),
+            int(planned_count),
+            bool(preview_contacts),
+        )
+        if safety_messages:
+            with st.expander(f"送信前安全チェック（{len(safety_messages)}件）", expanded=True):
+                for message in safety_messages:
+                    st.warning(message)
         with st.expander("送信前プレビュー", expanded=False):
             if not preview_contacts:
                 st.write("プレビューできる送信対象がありません。宛先一覧、配信名、送信済み状況を確認してください。")
@@ -2830,6 +2904,33 @@ def main() -> None:
         if contacts.empty:
             st.write("検索条件に合う宛先はありません。")
             return
+
+        with st.expander("宛先一覧の一括操作"):
+            st.caption(f"現在の検索・並び順で表示対象になっている {len(contacts)} 件にまとめて操作できます。削除系の操作は元に戻せません。")
+            bulk_action = st.selectbox(
+                "一括操作",
+                ["分類を変更", "返信ありにする", "削除して今後取り込まない"],
+                key="bulk_contacts_action",
+            )
+            bulk_status = "送信対象"
+            if bulk_action == "分類を変更":
+                bulk_status = st.selectbox("変更後の分類", CONTACT_STATUS_OPTIONS, index=CONTACT_STATUS_OPTIONS.index("送信対象"), key="bulk_contacts_status")
+            bulk_confirm = st.checkbox("この一括操作を実行することを確認しました", key="bulk_contacts_confirm")
+            if st.button("一括操作を実行", key="bulk_contacts_apply", use_container_width=True, disabled=not bulk_confirm):
+                target_ids = [int(contact_id) for contact_id in contacts["id"].tolist()]
+                if bulk_action == "分類を変更":
+                    for contact_id in target_ids:
+                        set_contact_status(contact_id, bulk_status)
+                    st.success(f"{len(target_ids)}件の分類を「{bulk_status}」に変更しました")
+                elif bulk_action == "返信ありにする":
+                    for contact_id in target_ids:
+                        mark_contact_replied(contact_id)
+                    st.success(f"{len(target_ids)}件を返信ありにしました。自動送信対象から外れます。")
+                else:
+                    for contact_id in target_ids:
+                        delete_contact(contact_id, block=True, reason="一括削除")
+                    st.success(f"{len(target_ids)}件を削除し、再取り込みしないようにしました")
+                st.rerun()
 
         export_frame = contacts_export_frame(contacts)
         export_name = datetime.now(APP_TIMEZONE).strftime("contacts_%Y%m%d_%H%M")
