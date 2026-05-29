@@ -291,6 +291,15 @@ def init_db() -> None:
                 reason text not null default '',
                 created_at text not null
             );
+
+            create table if not exists campaign_templates (
+                id integer primary key autoincrement,
+                user_id text not null default 'local-user',
+                name text not null,
+                subject text not null default '',
+                body text not null default '',
+                updated_at text not null
+            );
             """
         )
         columns = [row[1] for row in db.execute("pragma table_info(contacts)").fetchall()]
@@ -307,7 +316,7 @@ def init_db() -> None:
         for column, statement in migrations.items():
             if column not in columns:
                 db.execute(statement)
-        for table in ["sends", "settings", "youtube_candidates", "youtube_api_usage", "blocked_targets"]:
+        for table in ["sends", "settings", "youtube_candidates", "youtube_api_usage", "blocked_targets", "campaign_templates"]:
             table_columns = [row[1] for row in db.execute(f"pragma table_info({table})").fetchall()]
             if "user_id" not in table_columns:
                 db.execute(f"alter table {table} add column user_id text not null default 'local-user'")
@@ -425,6 +434,55 @@ def save_setting(key: str, value: str) -> None:
 def delete_setting(key: str) -> None:
     scoped_key = f"{current_user_id()}::{key}"
     execute("delete from settings where key = ?", (scoped_key,))
+
+
+def fetch_campaign_templates() -> list[sqlite3.Row]:
+    return rows(
+        """
+        select id, name, subject, body, updated_at
+        from campaign_templates
+        where user_id = ?
+        order by id asc
+        """,
+        (current_user_id(),),
+    )
+
+
+def get_campaign_template(name: str) -> sqlite3.Row | None:
+    matches = rows(
+        """
+        select id, name, subject, body, updated_at
+        from campaign_templates
+        where user_id = ? and name = ?
+        limit 1
+        """,
+        (current_user_id(), name.strip()),
+    )
+    return matches[0] if matches else None
+
+
+def save_campaign_template(name: str, subject: str, body: str) -> None:
+    clean_name = name.strip()
+    if not clean_name:
+        return
+    execute(
+        "delete from campaign_templates where user_id = ? and name = ?",
+        (current_user_id(), clean_name),
+    )
+    execute(
+        """
+        insert into campaign_templates(user_id, name, subject, body, updated_at)
+        values(?, ?, ?, ?, ?)
+        """,
+        (current_user_id(), clean_name, subject, body, now_iso()),
+    )
+
+
+def delete_campaign_template(name: str) -> None:
+    execute(
+        "delete from campaign_templates where user_id = ? and name = ?",
+        (current_user_id(), name.strip()),
+    )
 
 
 def block_target(email: str = "", youtube_channel_id: str = "", channel: str = "", reason: str = "") -> None:
@@ -1085,20 +1143,48 @@ def main() -> None:
 
     with right:
         st.subheader("メール作成")
-        campaign_name = st.text_input("配信名", value=get_setting("CURRENT_CAMPAIGN_NAME", "初回案内"))
-        st.caption("同じ配信名の間は、本文を少し直しても同じ配信として進捗を引き継ぎます。新しい別メールを送る時だけ配信名を変えてください。")
-        subject_template = st.text_input("件名", value="${channel}へのご連絡")
-        body_template = st.text_area(
-            "本文",
-            value="""突然のご連絡失礼いたします。
+        default_subject = "${channel}へのご連絡"
+        default_body = """突然のご連絡失礼いたします。
 
 ${channel}を拝見し、ご連絡いたしました。
 
 もしご興味がありましたら、一度お話しできれば幸いです。
 
-不要な場合は、お手数ですが「配信停止希望」とご返信ください。""",
-            height=260,
-        )
+不要な場合は、お手数ですが「配信停止希望」とご返信ください。"""
+        if "campaign_name_input" not in st.session_state:
+            st.session_state["campaign_name_input"] = get_setting("CURRENT_CAMPAIGN_NAME", "初回案内")
+        if "subject_template_input" not in st.session_state:
+            st.session_state["subject_template_input"] = default_subject
+        if "body_template_input" not in st.session_state:
+            st.session_state["body_template_input"] = default_body
+
+        templates = fetch_campaign_templates()
+        template_names = [template["name"] for template in templates]
+        selected_template = st.selectbox("保存済み配信", ["新しく作る"] + template_names)
+        load_col, save_col, delete_col = st.columns(3)
+        if load_col.button("読み込む", use_container_width=True, disabled=selected_template == "新しく作る"):
+            template = get_campaign_template(selected_template)
+            if template:
+                st.session_state["campaign_name_input"] = template["name"]
+                st.session_state["subject_template_input"] = template["subject"]
+                st.session_state["body_template_input"] = template["body"]
+                st.rerun()
+        campaign_name = st.text_input("配信名", key="campaign_name_input")
+        st.caption("同じ配信名の間は、本文を少し直しても同じ配信として進捗を引き継ぎます。新しい別メールを送る時だけ配信名を変えてください。")
+        subject_template = st.text_input("件名", key="subject_template_input")
+        body_template = st.text_area("本文", height=260, key="body_template_input")
+        if save_col.button("保存 / 更新", use_container_width=True):
+            if campaign_name.strip():
+                save_campaign_template(campaign_name, subject_template, body_template)
+                save_setting("CURRENT_CAMPAIGN_NAME", campaign_name.strip())
+                st.success(f"{campaign_name} を保存しました")
+                st.rerun()
+            else:
+                st.error("配信名を入力してください")
+        if delete_col.button("削除", use_container_width=True, disabled=selected_template == "新しく作る"):
+            delete_campaign_template(selected_template)
+            st.success(f"{selected_template} を削除しました")
+            st.rerun()
         delay = st.number_input("送信間隔（秒）", min_value=1, max_value=60, value=3)
         send_limit = st.number_input("今回送信する件数", min_value=1, max_value=500, value=50)
         confirmed = st.checkbox("送信対象が許諾済み、または法的に送信可能な宛先であることを確認しました")
