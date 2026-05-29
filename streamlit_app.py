@@ -1291,6 +1291,9 @@ def main() -> None:
             st.rerun()
         delay = st.number_input("送信間隔（秒）", min_value=1, max_value=60, value=3)
         send_limit = st.number_input("今回送信する件数", min_value=1, max_value=500, value=50)
+        st.caption("大量送信はメールサーバー側で制限される場合があります。営業メールの実運用では、まず1日50〜100件程度から始め、送信エラーや迷惑メール判定が増えないことを確認しながら、必要に応じて100〜300件程度まで増やしてください。1日500件以上を継続して送る場合は、専用のメール配信サービスの利用を推奨します。")
+        if int(send_limit) > 300:
+            st.warning("今回の送信件数が多めです。送信先の反応、迷惑メール判定、サーバー制限を確認しながら少しずつ増やしてください。")
         confirmed = st.checkbox("送信対象が許諾済み、または法的に送信可能な宛先であることを確認しました")
 
         current_campaign_key = campaign_key(campaign_name)
