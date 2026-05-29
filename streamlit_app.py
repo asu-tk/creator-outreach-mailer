@@ -191,6 +191,28 @@ def supabase_request(method: str, path: str, payload: dict | None = None, prefer
         return json.loads(body) if body else []
 
 
+def stripe_secret_key() -> str:
+    return read_secret("STRIPE_SECRET_KEY") or get_nested_secret("billing", "stripe_secret_key")
+
+
+def stripe_configured() -> bool:
+    return bool(stripe_secret_key())
+
+
+def stripe_request(path: str, params: dict[str, str] | None = None) -> dict:
+    query = urllib.parse.urlencode(params or {})
+    url = f"https://api.stripe.com/v1/{path.lstrip('/')}"
+    if query:
+        url += f"?{query}"
+    request = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {stripe_secret_key()}"},
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
 def handle_google_callback() -> None:
     code = st.query_params.get("code")
     if not code:
@@ -329,6 +351,57 @@ def subscription_active(subscription: dict) -> bool:
     return False
 
 
+def find_stripe_subscription_by_email(email: str) -> dict:
+    if not stripe_configured() or not email:
+        return {}
+    customers = stripe_request("customers/search", {"query": f"email:'{email}'", "limit": "5"})
+    for customer in customers.get("data", []):
+        customer_id = customer.get("id", "")
+        if not customer_id:
+            continue
+        subscriptions = stripe_request(
+            "subscriptions",
+            {"customer": customer_id, "status": "all", "limit": "10"},
+        )
+        for subscription in subscriptions.get("data", []):
+            status = str(subscription.get("status", "")).lower()
+            if status not in {"active", "trialing"}:
+                continue
+            period_end = subscription.get("current_period_end")
+            period_end_iso = ""
+            if period_end:
+                period_end_iso = datetime.fromtimestamp(int(period_end), timezone.utc).isoformat()
+            return {
+                "stripe_customer_id": customer_id,
+                "stripe_subscription_id": subscription.get("id", ""),
+                "plan_name": "Creator Outreach Mailer 月額プラン",
+                "status": status,
+                "current_period_end": period_end_iso,
+            }
+    return {}
+
+
+def sync_subscription_from_stripe(email: str) -> bool:
+    stripe_subscription = find_stripe_subscription_by_email(email)
+    if not stripe_subscription:
+        return False
+    supabase_request(
+        "POST",
+        "subscriptions?on_conflict=user_email",
+        {
+            "user_email": email,
+            "stripe_customer_id": stripe_subscription["stripe_customer_id"],
+            "stripe_subscription_id": stripe_subscription["stripe_subscription_id"],
+            "plan_name": stripe_subscription["plan_name"],
+            "status": stripe_subscription["status"],
+            "current_period_end": stripe_subscription["current_period_end"] or None,
+            "updated_at": now_iso(),
+        },
+        prefer="resolution=merge-duplicates",
+    )
+    return True
+
+
 def require_active_subscription() -> None:
     ensure_supabase_user()
     if not subscription_required():
@@ -341,6 +414,12 @@ def require_active_subscription() -> None:
         st.caption("管理者アカウントとして利用中です。")
         return
     subscription = get_subscription_status(email)
+    if not subscription_active(subscription) and stripe_configured():
+        try:
+            if sync_subscription_from_stripe(email):
+                subscription = get_subscription_status(email)
+        except Exception as exc:
+            st.warning(f"Stripeの課金状態確認に失敗しました: {exc}")
     if subscription_active(subscription):
         return
     st.title("Creator Outreach Mailer")
@@ -348,6 +427,16 @@ def require_active_subscription() -> None:
     checkout_url = read_secret("STRIPE_CHECKOUT_URL") or get_nested_secret("billing", "stripe_checkout_url")
     if checkout_url:
         st.link_button("有料プランに登録する", checkout_url)
+        st.caption("決済時のメールアドレスは、Googleログインと同じメールアドレスを使ってください。決済後、この画面に戻ると課金状態を自動確認します。")
+        if stripe_configured() and st.button("決済状態を確認する"):
+            try:
+                if sync_subscription_from_stripe(email):
+                    st.success("決済状態を確認しました。アプリを開き直します。")
+                    st.rerun()
+                else:
+                    st.error("このGoogleメールアドレスの有効なサブスクリプションが見つかりませんでした。")
+            except Exception as exc:
+                st.error(f"決済状態の確認に失敗しました: {exc}")
     else:
         st.info("現在、決済ページを準備中です。管理者にお問い合わせください。")
     st.stop()
