@@ -1370,7 +1370,7 @@ def settings_panel() -> None:
     selected_account_id = 0
     if selected_account != "新しく作る":
         selected_account_id = account_ids[options.index(selected_account) - 1]
-    if load_col.button("読み込む", use_container_width=True, disabled=selected_account_id == 0):
+    if load_col.button("読み込む", key="load_smtp_account", use_container_width=True, disabled=selected_account_id == 0):
         account = get_smtp_account(selected_account_id)
         if account:
             st.session_state["smtp_account_id_input"] = int(account["id"])
@@ -1400,7 +1400,7 @@ def settings_panel() -> None:
         placeholder="保存済み" if has_password else "Gmailの場合はアプリパスワード",
     )
 
-    if save_col.button("保存 / 更新", use_container_width=True):
+    if save_col.button("保存 / 更新", key="save_smtp_account", use_container_width=True):
         if not sender_email.strip():
             st.error("送信元メールアドレスを入力してください")
         else:
@@ -1419,7 +1419,7 @@ def settings_panel() -> None:
             st.success(f"保存しました。相手には {smtp_mail_from(active_smtp_account())} から届きます。")
             st.rerun()
 
-    if delete_col.button("削除", use_container_width=True, disabled=selected_account_id == 0):
+    if delete_col.button("削除", key="delete_smtp_account", use_container_width=True, disabled=selected_account_id == 0):
         delete_smtp_account(selected_account_id)
         st.success("送信元設定を削除しました")
         st.rerun()
@@ -1675,7 +1675,7 @@ def main() -> None:
         selected_index = template_options.index(current_campaign_name) if current_campaign_name in template_options else 0
         selected_template = st.selectbox("保存済み配信", template_options, index=selected_index)
         load_col, save_col, delete_col = st.columns(3)
-        if load_col.button("読み込む", use_container_width=True, disabled=selected_template == "新しく作る"):
+        if load_col.button("読み込む", key="load_campaign_template", use_container_width=True, disabled=selected_template == "新しく作る"):
             template = get_campaign_template(selected_template)
             if template:
                 st.session_state["campaign_name_input"] = template["name"]
@@ -1727,7 +1727,7 @@ def main() -> None:
         st.caption("同じ配信名の間は、本文を少し直しても同じ配信として進捗を引き継ぎます。新しい別メールを送る時だけ配信名を変えてください。")
         subject_template = st.text_input("件名", key="subject_template_input")
         body_template = st.text_area("本文", height=260, key="body_template_input")
-        if save_col.button("保存 / 更新", use_container_width=True):
+        if save_col.button("保存 / 更新", key="save_campaign_template", use_container_width=True):
             if campaign_name.strip():
                 save_campaign_template(campaign_name, subject_template, body_template)
                 save_setting("CURRENT_CAMPAIGN_NAME", campaign_name.strip())
@@ -1735,7 +1735,7 @@ def main() -> None:
                 st.rerun()
             else:
                 st.error("配信名を入力してください")
-        if delete_col.button("削除", use_container_width=True, disabled=selected_template == "新しく作る"):
+        if delete_col.button("削除", key="delete_campaign_template", use_container_width=True, disabled=selected_template == "新しく作る"):
             delete_campaign_template(selected_template)
             st.success(f"{selected_template} を削除しました")
             st.rerun()
