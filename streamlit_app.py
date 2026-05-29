@@ -2395,9 +2395,9 @@ def main() -> None:
         if st.session_state.pop("scroll_to_candidates_top", False):
             scroll_nonce = int(st.session_state.get("scroll_to_candidates_nonce", 0))
             components.html(
-                f"""
+                """
                 <script>
-                const scrollNonce = {scroll_nonce};
+                const scrollNonce = __SCROLL_NONCE__;
                 const doc = window.parent.document;
 
                 function findCandidateSearchTarget() {
@@ -2426,7 +2426,7 @@ def main() -> None:
                 setTimeout(scrollToCandidateSearch, 450);
                 setTimeout(scrollToCandidateSearch, 900);
                 </script>
-                """,
+                """.replace("__SCROLL_NONCE__", str(scroll_nonce)),
                 height=1,
             )
         if candidate_search:
