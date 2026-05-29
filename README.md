@@ -87,6 +87,31 @@ APP_BASE_URL = "http://localhost:8501"
 
 公開URLを自分だけで使いたい場合は、Streamlit Cloud側で公開範囲や共有先を絞ってください。
 
+## Googleログイン
+
+ログイン設定を入れると、未ログインではアプリを操作できません。ログイン後は、送信元メール設定、宛先一覧、YouTube候補一覧、API使用量などがログインユーザーごとに分かれます。
+
+Streamlit CloudのSecretsに以下を設定します。
+
+```toml
+[auth]
+redirect_uri = "https://your-app-name.streamlit.app/oauth2callback"
+cookie_secret = "long-random-secret"
+
+[auth.google]
+client_id = "your-google-oauth-client-id"
+client_secret = "your-google-oauth-client-secret"
+server_metadata_url = "https://accounts.google.com/.well-known/openid-configuration"
+```
+
+ローカルで試す場合の `redirect_uri` は以下です。
+
+```toml
+redirect_uri = "http://localhost:8501/oauth2callback"
+```
+
+Google Cloud Console側のOAuthクライアントにも、同じリダイレクトURLを登録してください。
+
 ## YouTube API使用量メーター
 
 YouTube候補検索では、このアプリが実行した検索から推定した使用量を日別に記録します。Google Cloud Console側の正確な残量を直接取得するものではありません。

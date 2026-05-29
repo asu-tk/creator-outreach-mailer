@@ -50,6 +50,40 @@ def today_key() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
+def auth_is_configured() -> bool:
+    try:
+        auth_config = st.secrets.get("auth", {})
+        return bool(auth_config.get("redirect_uri") and auth_config.get("cookie_secret"))
+    except Exception:
+        return False
+
+
+def current_user_id() -> str:
+    try:
+        if auth_is_configured() and st.user.is_logged_in:
+            return str(st.user.get("email") or st.user.get("sub") or "unknown-user")
+    except Exception:
+        pass
+    return "local-user"
+
+
+def require_login() -> bool:
+    if not auth_is_configured():
+        st.warning("ログイン設定が未設定です。開発モードとして local-user のデータを表示しています。")
+        return True
+    if st.user.is_logged_in:
+        col1, col2 = st.columns([3, 1])
+        col1.caption(f"ログイン中: {st.user.get('email', 'unknown')}")
+        if col2.button("ログアウト"):
+            st.logout()
+        return True
+    st.title("Creator Outreach Mailer")
+    st.write("このアプリを使うにはGoogleログインが必要です。")
+    if st.button("Googleでログイン"):
+        st.login("google")
+    return False
+
+
 def get_secret(name: str, default: str = "") -> str:
     saved = get_setting(name)
     if saved:
@@ -67,7 +101,8 @@ def init_db() -> None:
             """
             create table if not exists contacts (
                 id integer primary key autoincrement,
-                email text not null unique,
+                user_id text not null default 'local-user',
+                email text not null default '',
                 name text not null default '',
                 channel text not null default '',
                 youtube_channel_id text not null default '',
@@ -86,6 +121,7 @@ def init_db() -> None:
 
             create table if not exists sends (
                 id integer primary key autoincrement,
+                user_id text not null default 'local-user',
                 contact_id integer not null,
                 subject text not null,
                 status text not null,
@@ -95,13 +131,16 @@ def init_db() -> None:
             );
 
             create table if not exists settings (
-                key text primary key,
-                value text not null
+                user_id text not null default 'local-user',
+                key text not null,
+                value text not null,
+                primary key (user_id, key)
             );
 
             create table if not exists youtube_candidates (
                 id integer primary key autoincrement,
-                channel_id text not null unique,
+                user_id text not null default 'local-user',
+                channel_id text not null,
                 title text not null default '',
                 channel_url text not null default '',
                 subscriber_count integer not null default 0,
@@ -113,12 +152,15 @@ def init_db() -> None:
             );
 
             create table if not exists youtube_api_usage (
-                usage_date text primary key,
-                units integer not null default 0
+                user_id text not null default 'local-user',
+                usage_date text not null,
+                units integer not null default 0,
+                primary key (user_id, usage_date)
             );
 
             create table if not exists blocked_targets (
                 id integer primary key autoincrement,
+                user_id text not null default 'local-user',
                 email text not null default '',
                 youtube_channel_id text not null default '',
                 channel text not null default '',
@@ -129,6 +171,7 @@ def init_db() -> None:
         )
         columns = [row[1] for row in db.execute("pragma table_info(contacts)").fetchall()]
         migrations = {
+            "user_id": "alter table contacts add column user_id text not null default 'local-user'",
             "youtube_channel_id": "alter table contacts add column youtube_channel_id text not null default ''",
             "youtube_channel_url": "alter table contacts add column youtube_channel_url text not null default ''",
             "youtube_subscriber_count": "alter table contacts add column youtube_subscriber_count integer not null default 0",
@@ -140,6 +183,10 @@ def init_db() -> None:
         for column, statement in migrations.items():
             if column not in columns:
                 db.execute(statement)
+        for table in ["sends", "settings", "youtube_candidates", "youtube_api_usage", "blocked_targets"]:
+            table_columns = [row[1] for row in db.execute(f"pragma table_info({table})").fetchall()]
+            if "user_id" not in table_columns:
+                db.execute(f"alter table {table} add column user_id text not null default 'local-user'")
         db.commit()
 
 
@@ -158,10 +205,12 @@ def fetch_contacts() -> pd.DataFrame:
                 coalesce(max(s.sent_at), '') as last_sent
             from contacts c
             left join sends s on s.contact_id = c.id
+            where c.user_id = ?
             group by c.id
             order by c.id asc
             """,
             db,
+            params=(current_user_id(),),
         )
 
 
@@ -180,9 +229,11 @@ def fetch_candidates() -> pd.DataFrame:
                 keyword,
                 created_at
             from youtube_candidates
+            where user_id = ?
             order by id desc
             """,
             db,
+            params=(current_user_id(),),
         )
 
 
@@ -207,39 +258,46 @@ def estimate_youtube_units(max_results: int) -> int:
 
 def get_youtube_units_used(date_key: str | None = None) -> int:
     key = date_key or today_key()
-    result = rows("select units from youtube_api_usage where usage_date = ?", (key,))
+    scoped_key = f"{current_user_id()}::{key}"
+    result = rows("select units from youtube_api_usage where usage_date = ?", (scoped_key,))
     return int(result[0]["units"]) if result else 0
 
 
 def add_youtube_units(units: int, date_key: str | None = None) -> None:
     key = date_key or today_key()
+    scoped_key = f"{current_user_id()}::{key}"
+    new_total = get_youtube_units_used(key) + int(units)
+    execute("delete from youtube_api_usage where usage_date = ?", (scoped_key,))
     execute(
         """
-        insert into youtube_api_usage(usage_date, units)
-        values(?, ?)
-        on conflict(usage_date) do update set units = units + excluded.units
+        insert into youtube_api_usage(user_id, usage_date, units)
+        values(?, ?, ?)
         """,
-        (key, int(units)),
+        (current_user_id(), scoped_key, new_total),
     )
 
 
 def get_setting(key: str, default: str = "") -> str:
     if not DB_PATH.exists():
         return default
+    scoped_key = f"{current_user_id()}::{key}"
     with sqlite3.connect(DB_PATH) as db:
-        row = db.execute("select value from settings where key = ?", (key,)).fetchone()
+        row = db.execute("select value from settings where key = ?", (scoped_key,)).fetchone()
         return str(row[0]) if row else default
 
 
 def save_setting(key: str, value: str) -> None:
+    scoped_key = f"{current_user_id()}::{key}"
+    delete_setting(key)
     execute(
-        "insert into settings(key, value) values(?, ?) on conflict(key) do update set value = excluded.value",
-        (key, value),
+        "insert into settings(user_id, key, value) values(?, ?, ?)",
+        (current_user_id(), scoped_key, value),
     )
 
 
 def delete_setting(key: str) -> None:
-    execute("delete from settings where key = ?", (key,))
+    scoped_key = f"{current_user_id()}::{key}"
+    execute("delete from settings where key = ?", (scoped_key,))
 
 
 def block_target(email: str = "", youtube_channel_id: str = "", channel: str = "", reason: str = "") -> None:
@@ -250,18 +308,18 @@ def block_target(email: str = "", youtube_channel_id: str = "", channel: str = "
     duplicate = rows(
         """
         select id from blocked_targets
-        where (email != '' and email = ?) or (youtube_channel_id != '' and youtube_channel_id = ?)
+        where user_id = ? and ((email != '' and email = ?) or (youtube_channel_id != '' and youtube_channel_id = ?))
         """,
-        (normalized_email, channel_id),
+        (current_user_id(), normalized_email, channel_id),
     )
     if duplicate:
         return
     execute(
         """
-        insert into blocked_targets(email, youtube_channel_id, channel, reason, created_at)
-        values (?, ?, ?, ?, ?)
+        insert into blocked_targets(user_id, email, youtube_channel_id, channel, reason, created_at)
+        values (?, ?, ?, ?, ?, ?)
         """,
-        (normalized_email, channel_id, channel.strip(), reason, now_iso()),
+        (current_user_id(), normalized_email, channel_id, channel.strip(), reason, now_iso()),
     )
 
 
@@ -274,29 +332,29 @@ def is_blocked(email: str = "", youtube_channel_id: str = "") -> bool:
         rows(
             """
             select id from blocked_targets
-            where (email != '' and email = ?) or (youtube_channel_id != '' and youtube_channel_id = ?)
+            where user_id = ? and ((email != '' and email = ?) or (youtube_channel_id != '' and youtube_channel_id = ?))
             """,
-            (normalized_email, channel_id),
+            (current_user_id(), normalized_email, channel_id),
         )
     )
 
 
 def delete_contact(contact_id: int, block: bool = False, reason: str = "") -> None:
     if block:
-        contact = rows("select * from contacts where id = ?", (contact_id,))
+        contact = rows("select * from contacts where user_id = ? and id = ?", (current_user_id(), contact_id))
         if contact:
             item = contact[0]
             block_target(item["email"], item["youtube_channel_id"], item["channel"], reason)
-    execute("delete from sends where contact_id = ?", (contact_id,))
-    execute("delete from contacts where id = ?", (contact_id,))
+    execute("delete from sends where user_id = ? and contact_id = ?", (current_user_id(), contact_id))
+    execute("delete from contacts where user_id = ? and id = ?", (current_user_id(), contact_id))
 
 
 def delete_candidate(candidate_id: int) -> None:
-    execute("delete from youtube_candidates where id = ?", (candidate_id,))
+    execute("delete from youtube_candidates where user_id = ? and id = ?", (current_user_id(), candidate_id))
 
 
 def save_candidate_from_contact(contact_id: int) -> tuple[bool, str]:
-    contact = rows("select * from contacts where id = ?", (contact_id,))
+    contact = rows("select * from contacts where user_id = ? and id = ?", (current_user_id(), contact_id))
     if not contact:
         return False, "宛先が見つかりません"
     item = contact[0]
@@ -310,10 +368,11 @@ def save_candidate_from_contact(contact_id: int) -> tuple[bool, str]:
     execute(
         """
         insert into youtube_candidates
-        (channel_id, title, channel_url, subscriber_count, video_count, view_count, description, keyword, created_at)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (user_id, channel_id, title, channel_url, subscriber_count, video_count, view_count, description, keyword, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
+            current_user_id(),
             channel_id,
             item["channel"],
             item["youtube_channel_url"] or f"https://www.youtube.com/channel/{channel_id}",
@@ -333,33 +392,33 @@ def contact_exists(email: str) -> bool:
     normalized_email = email.strip().lower()
     if not normalized_email:
         return False
-    return bool(rows("select id from contacts where email = ?", (normalized_email,)))
+    return bool(rows("select id from contacts where user_id = ? and email = ?", (current_user_id(), normalized_email)))
 
 
 def candidate_contact_exists(channel: str) -> bool:
     normalized_channel = channel.strip()
     if not normalized_channel:
         return False
-    return bool(rows("select id from contacts where email = '' and channel = ?", (normalized_channel,)))
+    return bool(rows("select id from contacts where user_id = ? and email = '' and channel = ?", (current_user_id(), normalized_channel)))
 
 
 def youtube_channel_in_contacts(channel_id: str) -> bool:
     if not channel_id:
         return False
-    return bool(rows("select id from contacts where youtube_channel_id = ?", (channel_id,)))
+    return bool(rows("select id from contacts where user_id = ? and youtube_channel_id = ?", (current_user_id(), channel_id)))
 
 
 def youtube_channel_in_candidates(channel_id: str) -> bool:
     if not channel_id:
         return False
-    return bool(rows("select id from youtube_candidates where channel_id = ?", (channel_id,)))
+    return bool(rows("select id from youtube_candidates where user_id = ? and channel_id = ?", (current_user_id(), channel_id)))
 
 
 def update_contact(contact_id: int, email: str, name: str, channel: str, consent: bool) -> tuple[bool, str]:
     normalized_email = email.strip().lower()
     duplicate = rows(
-        "select id from contacts where email = ? and id != ?",
-        (normalized_email, contact_id),
+        "select id from contacts where user_id = ? and email = ? and id != ?",
+        (current_user_id(), normalized_email, contact_id),
     ) if normalized_email else []
     if duplicate:
         return False, "このメールアドレスはすでに登録されています"
@@ -367,9 +426,9 @@ def update_contact(contact_id: int, email: str, name: str, channel: str, consent
         """
         update contacts
         set email = ?, name = ?, channel = ?, consent = ?
-        where id = ?
+        where user_id = ? and id = ?
         """,
-        (normalized_email, name.strip(), channel.strip(), 1 if consent else 0, contact_id),
+        (normalized_email, name.strip(), channel.strip(), 1 if consent else 0, current_user_id(), contact_id),
     )
     return True, "宛先を更新しました"
 
@@ -399,10 +458,11 @@ def save_candidate(candidate: dict, keyword: str) -> bool:
     execute(
         """
         insert or ignore into youtube_candidates
-        (channel_id, title, channel_url, subscriber_count, video_count, view_count, description, keyword, created_at)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (user_id, channel_id, title, channel_url, subscriber_count, video_count, view_count, description, keyword, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
+            current_user_id(),
             channel_id,
             candidate["title"],
             candidate["channel_url"],
@@ -601,13 +661,14 @@ def add_contact(
         """
         insert into contacts
         (
-            email, name, channel, youtube_channel_id, youtube_channel_url,
+            user_id, email, name, channel, youtube_channel_id, youtube_channel_url,
             youtube_subscriber_count, youtube_video_count, youtube_view_count,
             youtube_keyword, youtube_description, source, consent, unsubscribed, token, created_at
         )
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, 0, ?, ?)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, 0, ?, ?)
         """,
         (
+            current_user_id(),
             normalized_email,
             name.strip(),
             channel.strip(),
@@ -789,6 +850,9 @@ def main() -> None:
     st.set_page_config(page_title="Creator Outreach Mailer", layout="wide")
     init_db()
 
+    if not require_login():
+        return
+
     st.title("Creator Outreach Mailer")
     st.caption("許諾済みの宛先だけに、1件ずつ送信する個人用Webアプリ")
 
@@ -942,7 +1006,7 @@ https://universeapp.jp/
         send_limit = st.number_input("今回送信する件数", min_value=1, max_value=500, value=50)
         confirmed = st.checkbox("送信対象が許諾済み、または法的に送信可能な宛先であることを確認しました")
 
-        target_count = rows("select count(*) as count from contacts where consent = 1 and unsubscribed = 0 and email != ''")[0]["count"]
+        target_count = rows("select count(*) as count from contacts where user_id = ? and consent = 1 and unsubscribed = 0 and email != ''", (current_user_id(),))[0]["count"]
         st.metric("送信対象", f"{target_count}件")
         st.caption("送信対象は、未送信の宛先を優先し、その後は最終送信日時が古い順に選ばれます。")
 
@@ -963,13 +1027,15 @@ https://universeapp.jp/
                         max(s.sent_at) as last_sent
                     from contacts c
                     left join sends s on s.contact_id = c.id and s.status = 'sent'
-                    where c.consent = 1 and c.unsubscribed = 0 and c.email != ''
+                    where c.user_id = ? and c.consent = 1 and c.unsubscribed = 0 and c.email != ''
                     group by c.id
                     order by
                         case when max(s.sent_at) is null then 0 else 1 end,
                         max(s.sent_at) asc,
                         c.id asc
                     """
+                    ,
+                    (current_user_id(),),
                 )
                 if run_test:
                     contacts = contacts[:1]
@@ -986,8 +1052,8 @@ https://universeapp.jp/
                     body = render_template(body_template, contact, unsubscribe_url)
                     ok, result = send_email(contact["email"], subject, body)
                     execute(
-                        "insert into sends(contact_id, subject, status, error, sent_at) values (?, ?, ?, ?, ?)",
-                        (contact["id"], subject, "sent" if ok else "failed", "" if ok else result, now_iso()),
+                        "insert into sends(user_id, contact_id, subject, status, error, sent_at) values (?, ?, ?, ?, ?, ?)",
+                        (current_user_id(), contact["id"], subject, "sent" if ok else "failed", "" if ok else result, now_iso()),
                     )
                     sent += 1 if ok else 0
                     failed += 0 if ok else 1
@@ -1151,7 +1217,7 @@ https://universeapp.jp/
             columns[4].write(row.keyword or "-")
             columns[5].markdown(f"[YouTubeで開く]({row.channel_url})")
             if columns[6].button("宛先に登録", key=f"candidate_to_contact_{row.id}"):
-                candidate_detail = rows("select * from youtube_candidates where id = ?", (int(row.id),))
+                candidate_detail = rows("select * from youtube_candidates where user_id = ? and id = ?", (current_user_id(), int(row.id)))
                 candidate = candidate_detail[0] if candidate_detail else None
                 added = add_contact(
                     "",
