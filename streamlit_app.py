@@ -8,11 +8,12 @@ import sqlite3
 import time
 import json
 import hashlib
+import math
 from io import BytesIO
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, time as datetime_time, timedelta, timezone
+from datetime import date, datetime, time as datetime_time, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from string import Template
@@ -2099,6 +2100,46 @@ def build_send_schedule(
     return scheduled_times
 
 
+def send_window_seconds(window_start: datetime_time, window_end: datetime_time) -> int:
+    if window_end <= window_start:
+        return 0
+    start_dt = datetime.combine(date.today(), window_start)
+    end_dt = datetime.combine(date.today(), window_end)
+    return max(0, int((end_dt - start_dt).total_seconds()))
+
+
+def daily_send_capacity(window_start: datetime_time, window_end: datetime_time, delay_seconds: int) -> int:
+    seconds = send_window_seconds(window_start, window_end)
+    delay = max(1, int(delay_seconds))
+    if seconds <= 0:
+        return 0
+    return ((seconds - 1) // delay) + 1
+
+
+def delay_for_daily_target(window_start: datetime_time, window_end: datetime_time, daily_target: int) -> int:
+    seconds = send_window_seconds(window_start, window_end)
+    target = max(1, int(daily_target))
+    if seconds <= 0:
+        return 60
+    return max(30, min(3600, math.ceil(seconds / target)))
+
+
+def format_delay_seconds(delay_seconds: int) -> str:
+    delay = max(1, int(delay_seconds))
+    minutes, seconds = divmod(delay, 60)
+    if minutes and seconds:
+        return f"{minutes}分{seconds}秒"
+    if minutes:
+        return f"{minutes}分"
+    return f"{seconds}秒"
+
+
+def estimate_send_days(send_count: int, daily_capacity: int) -> int:
+    if int(send_count) <= 0 or int(daily_capacity) <= 0:
+        return 0
+    return math.ceil(int(send_count) / int(daily_capacity))
+
+
 def format_local_datetime(value: datetime) -> str:
     return value.astimezone(APP_TIMEZONE).strftime("%Y-%m-%d %H:%M")
 
@@ -2799,6 +2840,7 @@ def safety_check_messages(
     send_limit: int,
     planned_count: int,
     preview_available: bool,
+    daily_capacity: int = 0,
 ) -> list[str]:
     messages = []
     clean_subject = subject_template.strip()
@@ -2811,8 +2853,10 @@ def safety_check_messages(
         messages.append("本文がかなり短いです。誤送信でないか確認してください。")
     if "${unsubscribe_url}" not in body_template:
         messages.append("本文に配信停止URLがありません。送信時に末尾へ自動追加されます。")
-    if int(send_limit) > 300:
-        messages.append("今回送信する件数が多めです。サーバー制限や迷惑メール判定に注意してください。")
+    if int(daily_capacity or 0) > 800:
+        messages.append("1日の送信予定件数が多めです。送信エラーや迷惑メール判定が増えないか確認してください。")
+    elif int(send_limit) > 1000:
+        messages.append("予約総数が多めです。数日に分けて送信されます。途中で止めたい時は「最近の送信予約」から取り消せます。")
     if planned_count == 0:
         messages.append("今回送信できる未送信の宛先がありません。配信名や送信済み状況を確認してください。")
     if not preview_available:
@@ -3813,29 +3857,88 @@ def main() -> None:
                     st.success(f"{campaign_name} を保存しました")
                 else:
                     st.error("配信名を入力してください")
-        delay = st.number_input("送信間隔（秒）", min_value=30, max_value=300, value=90, step=10)
-        st.caption("送信間隔は90秒を初期値にしています。短すぎる間隔は迷惑メール判定やサーバー制限の原因になるため、実運用では60〜120秒以上を目安にしてください。")
-        send_limit = st.number_input("今回送信する件数", min_value=1, max_value=500, value=50)
-        st.caption("大量送信はメールサーバー側で制限される場合があります。営業メールの実運用では、まず1日50〜100件程度から始め、送信エラーや迷惑メール判定が増えないことを確認しながら、必要に応じて100〜300件程度まで増やしてください。1日500件以上を継続して送る場合は、専用のメール配信サービスの利用を推奨します。")
+        current_campaign_key = effective_campaign_key
+        estimated_remaining_count = count_next_send_contacts(
+            current_campaign_key,
+            prerequisite_campaign_keys,
+            later_step_campaign_keys,
+        )
         window_col_start, window_col_end = st.columns(2)
         send_window_start = window_col_start.time_input(
             "メールを送ってよい時間（この時間から）",
-            value=datetime_time(8, 0),
+            value=datetime_time(10, 0),
             step=1800,
         )
         send_window_end = window_col_end.time_input(
             "メールを送ってよい時間（この時間まで）",
-            value=datetime_time(20, 0),
+            value=datetime_time(18, 0),
             step=1800,
         )
         if send_window_end <= send_window_start:
             st.warning("メールを送ってよい時間は、「この時間まで」を「この時間から」より後にしてください。")
         st.caption("この時間帯の外では送信しません。時間を超えた分は、翌日の「この時間から」に自動で持ち越します。")
-        if int(send_limit) > 300:
-            st.warning("今回の送信件数が多めです。送信先の反応、迷惑メール判定、サーバー制限を確認しながら少しずつ増やしてください。")
+
+        send_pace_mode = st.radio(
+            "送信ペース",
+            ["1日の目標件数で決める", "送信間隔を直接指定"],
+            horizontal=True,
+            key="send_pace_mode",
+        )
+        if send_pace_mode == "1日の目標件数で決める":
+            daily_target = st.number_input(
+                "1日の目標送信数",
+                min_value=50,
+                max_value=1500,
+                value=500,
+                step=50,
+                key="daily_send_target",
+            )
+            delay = delay_for_daily_target(send_window_start, send_window_end, int(daily_target))
+            daily_capacity = daily_send_capacity(send_window_start, send_window_end, int(delay))
+            st.info(
+                f"この時間帯で1日約{daily_capacity:,}件にするため、"
+                f"送信間隔は自動で「{format_delay_seconds(int(delay))}に1通」にします。"
+            )
+        else:
+            delay = st.number_input("送信間隔（秒）", min_value=30, max_value=3600, value=90, step=10)
+            daily_capacity = daily_send_capacity(send_window_start, send_window_end, int(delay))
+            st.info(
+                f"この設定だと、1日最大で約{daily_capacity:,}件送れます。"
+                f"送信間隔は「{format_delay_seconds(int(delay))}に1通」です。"
+            )
+
+        if int(daily_capacity) > 800:
+            st.warning("1日の送信数が多めです。最初は500〜600件くらいから始め、失敗や迷惑メール判定が増えないか確認するのがおすすめです。")
+
+        reserve_all_remaining = st.checkbox(
+            "この配信の未送信をすべて予約する",
+            value=False,
+            disabled=int(estimated_remaining_count) <= 0,
+            key="reserve_all_remaining_contacts",
+        )
+        if reserve_all_remaining:
+            send_limit = max(1, int(estimated_remaining_count))
+            st.caption(f"今回予約する総件数: {send_limit:,}件")
+        else:
+            default_send_limit = max(1, min(int(estimated_remaining_count) if int(estimated_remaining_count) > 0 else 500, 500))
+            send_limit = st.number_input(
+                "今回予約する総件数",
+                min_value=1,
+                max_value=10000,
+                value=default_send_limit,
+                step=50,
+                key="send_limit_input",
+            )
+
+        estimated_planned_count = min(int(send_limit), int(estimated_remaining_count))
+        estimated_days = estimate_send_days(estimated_planned_count, int(daily_capacity))
+        if estimated_planned_count > 0 and estimated_days > 0:
+            st.caption(
+                f"この予約は、約{estimated_days}日で送信完了する見込みです"
+                f"（予約 {estimated_planned_count:,}件 / 1日 約{int(daily_capacity):,}件）。"
+            )
         confirmed = st.checkbox("送信対象が許諾済み、または法的に送信可能な宛先であることを確認しました")
 
-        current_campaign_key = effective_campaign_key
         target_count = rows(
             """
             select count(*) as count
@@ -3895,9 +3998,11 @@ def main() -> None:
             first_time = format_local_datetime(preview_schedule[0])
             last_time = format_local_datetime(preview_schedule[-1])
             total_minutes = max(1, int((preview_schedule[-1] - preview_schedule[0]).total_seconds() // 60) + 1)
+            plan_days = estimate_send_days(int(planned_count), int(daily_capacity))
+            day_label = f" / 約{plan_days}日分" if plan_days else ""
             st.info(
                 f"送信予定: {planned_count}件 / 開始予定 {first_time} / 完了予定 {last_time} / "
-                f"所要目安 約{total_minutes:,}分"
+                f"所要目安 約{total_minutes:,}分{day_label}"
             )
         elif planned_count > 0:
             st.warning("送信可能時間帯の設定を確認してください。終了時刻は開始時刻より後にしてください。")
@@ -3938,6 +4043,7 @@ def main() -> None:
             int(send_limit),
             int(planned_count),
             bool(preview_contacts),
+            int(daily_capacity),
         )
         if safety_messages:
             with st.expander(f"送信前安全チェック（{len(safety_messages)}件）", expanded=True):
@@ -3972,11 +4078,14 @@ def main() -> None:
                 start_label = format_local_datetime(preview_schedule[0])
                 finish_label = format_local_datetime(preview_schedule[-1])
                 duration_minutes = max(1, int((preview_schedule[-1] - preview_schedule[0]).total_seconds() // 60) + 1)
+                duration_days = estimate_send_days(int(planned_count), int(daily_capacity))
                 duration_label = f"約{duration_minutes:,}分"
+                if duration_days:
+                    duration_label += f" / 約{duration_days}日"
 
             confirm_cols = st.columns(3)
             confirm_cols[0].metric("今回送信予約する件数", f"{planned_count}件")
-            confirm_cols[1].metric("送信間隔", f"{int(delay)}秒に1通")
+            confirm_cols[1].metric("送信間隔", f"{format_delay_seconds(int(delay))}に1通")
             confirm_cols[2].metric("完了予定", finish_label)
 
             detail_frame = pd.DataFrame(
@@ -3985,6 +4094,7 @@ def main() -> None:
                     {"確認項目": "送信元", "内容": sender_label},
                     {"確認項目": "件名", "内容": effective_subject_template.strip() or "-"},
                     {"確認項目": "送信してよい時間", "内容": f"{send_window_start:%H:%M} から {send_window_end:%H:%M} まで"},
+                    {"確認項目": "1日の送信目安", "内容": f"約{int(daily_capacity):,}件"},
                     {"確認項目": "開始予定", "内容": start_label},
                     {"確認項目": "所要時間の目安", "内容": duration_label},
                     {"確認項目": "この配信の送信済み", "内容": f"{already_sent_count}件"},
