@@ -19,6 +19,7 @@ from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 try:
     from streamlit_sortables import sort_items
@@ -1010,6 +1011,7 @@ def save_campaign_template_order(names: list[str]) -> None:
 def change_candidate_page(delta: int, total_pages: int) -> None:
     current_page = int(st.session_state.get("candidates_page", 1))
     st.session_state["candidates_page"] = max(1, min(int(total_pages), current_page + int(delta)))
+    st.session_state["scroll_to_candidates_top"] = True
 
 
 def ensure_default_campaign_template() -> None:
@@ -2379,7 +2381,20 @@ def main() -> None:
                 st.rerun()
 
     st.divider()
+    st.markdown("<div id='youtube-candidates-top'></div>", unsafe_allow_html=True)
     st.subheader("YouTube候補一覧")
+    if st.session_state.pop("scroll_to_candidates_top", False):
+        components.html(
+            """
+            <script>
+            const target = window.parent.document.getElementById("youtube-candidates-top");
+            if (target) {
+                target.scrollIntoView({ behavior: "smooth", block: "start" });
+            }
+            </script>
+            """,
+            height=0,
+        )
     candidates = fetch_candidates()
     if candidates.empty:
         st.write("まだ候補チャンネルがありません。")
