@@ -1422,6 +1422,12 @@ def render_template(text: str, contact: sqlite3.Row, unsubscribe_url: str) -> st
     return Template(text).safe_substitute(values)
 
 
+def ensure_unsubscribe_link_template(body_template: str) -> str:
+    if "${unsubscribe_url}" in body_template:
+        return body_template
+    return body_template.rstrip() + "\n\n不要な場合はこちらから配信停止できます。\n${unsubscribe_url}"
+
+
 def build_unsubscribe_mailto(contact: sqlite3.Row) -> str:
     account = active_smtp_account()
     reply_to = get_secret("UNSUBSCRIBE_EMAIL", "") or str(account.get("sender_email") or "")
@@ -1432,6 +1438,33 @@ def build_unsubscribe_mailto(contact: sqlite3.Row) -> str:
         f"チャンネル名: {contact['channel'] or '-'}\n"
     )
     return f"mailto:{reply_to}?subject={quote(subject)}&body={quote(body)}"
+
+
+def build_unsubscribe_url(contact: sqlite3.Row) -> str:
+    if supabase_configured():
+        base_url = supabase_config()["url"].rstrip("/")
+        return f"{base_url}/functions/v1/unsubscribe?token={quote(str(contact['token']))}"
+    return build_unsubscribe_mailto(contact)
+
+
+def register_unsubscribe_token(contact: sqlite3.Row, user_email: str) -> None:
+    if not supabase_configured():
+        return
+    payload = {
+        "user_email": user_email,
+        "token": str(contact["token"]),
+        "contact_local_id": int(contact["id"]),
+        "contact_email": str(contact["email"] or "").strip().lower(),
+        "youtube_channel_id": str(contact["youtube_channel_id"] or ""),
+        "channel": str(contact["channel"] or ""),
+        "updated_at": now_iso(),
+    }
+    supabase_request(
+        "POST",
+        "unsubscribe_tokens?on_conflict=token",
+        payload,
+        prefer="resolution=merge-duplicates,return=minimal",
+    )
 
 
 def send_email(to_email: str, subject: str, body: str) -> tuple[bool, str]:
@@ -1490,7 +1523,7 @@ def create_send_job(
         "campaign_key": campaign_key_value,
         "campaign_name": campaign_name.strip(),
         "subject_template": subject_template,
-        "body_template": body_template,
+        "body_template": ensure_unsubscribe_link_template(body_template),
         "sender_label": str(account.get("label") or ""),
         "sender_name": str(account.get("sender_name") or ""),
         "sender_email": str(account.get("sender_email") or ""),
@@ -1510,9 +1543,10 @@ def create_send_job(
     start_time = datetime.now(timezone.utc)
     queue_rows = []
     for index, contact in enumerate(contacts):
-        unsubscribe_url = build_unsubscribe_mailto(contact)
+        register_unsubscribe_token(contact, user_email)
+        unsubscribe_url = build_unsubscribe_url(contact)
         subject = render_template(subject_template, contact, unsubscribe_url)
-        body = render_template(body_template, contact, unsubscribe_url)
+        body = render_template(ensure_unsubscribe_link_template(body_template), contact, unsubscribe_url)
         scheduled_at = (start_time.timestamp() + (index * int(delay_seconds)))
         queue_rows.append(
             {
@@ -1572,6 +1606,40 @@ def sync_send_queue_results() -> None:
                 """,
                 (status, error, sent_at, current_user_id(), int(contact_id), campaign_key_value),
             )
+    except Exception:
+        return
+
+
+def sync_unsubscribes_from_supabase() -> None:
+    if not supabase_configured():
+        return
+    user_email = current_user_profile()["email"].strip().lower()
+    if not user_email:
+        return
+    try:
+        query_email = urllib.parse.quote(user_email, safe="")
+        results = supabase_request(
+            "GET",
+            f"unsubscribe_tokens?user_email=eq.{query_email}&unsubscribed_at=not.is.null&select=contact_local_id,contact_email,youtube_channel_id,channel",
+        )
+        if not isinstance(results, list):
+            return
+        for item in results:
+            contact_id = int(item.get("contact_local_id") or 0)
+            contact_email = str(item.get("contact_email") or "").strip().lower()
+            youtube_channel_id = str(item.get("youtube_channel_id") or "").strip()
+            channel = str(item.get("channel") or "").strip()
+            block_target(contact_email, youtube_channel_id, channel, "配信停止URL")
+            if contact_id:
+                delete_contact(contact_id)
+            elif contact_email:
+                matched = rows("select id from contacts where user_id = ? and email = ?", (current_user_id(), contact_email))
+                for row in matched:
+                    delete_contact(int(row["id"]))
+            elif youtube_channel_id:
+                matched = rows("select id from contacts where user_id = ? and youtube_channel_id = ?", (current_user_id(), youtube_channel_id))
+                for row in matched:
+                    delete_contact(int(row["id"]))
     except Exception:
         return
 
@@ -1873,6 +1941,7 @@ def main() -> None:
     require_active_subscription()
     ensure_default_campaign_template()
     sync_send_queue_results()
+    sync_unsubscribes_from_supabase()
 
     st.title("Creator Outreach Mailer")
     st.caption("許諾済みの宛先だけに、1件ずつ送信する個人用Webアプリ")
@@ -2247,10 +2316,12 @@ def main() -> None:
                     log = st.empty()
                     sent = failed = 0
                     failed_contacts = []
+                    user_email = current_user_profile()["email"].strip().lower() or current_user_id()
                     for index, contact in enumerate(contacts):
-                        unsubscribe_url = build_unsubscribe_mailto(contact)
+                        register_unsubscribe_token(contact, user_email)
+                        unsubscribe_url = build_unsubscribe_url(contact)
                         subject = render_template(subject_template, contact, unsubscribe_url)
-                        body = render_template(body_template, contact, unsubscribe_url)
+                        body = render_template(ensure_unsubscribe_link_template(body_template), contact, unsubscribe_url)
                         ok, result = send_email(contact["email"], subject, body)
                         execute(
                             "insert into sends(user_id, contact_id, campaign_key, subject, status, error, sent_at) values (?, ?, ?, ?, ?, ?, ?)",
