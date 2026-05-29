@@ -1388,6 +1388,39 @@ def unblock_target_by_id(blocked_id: int) -> None:
     execute("delete from blocked_targets where user_id = ? and id = ?", (current_user_id(), int(blocked_id)))
 
 
+def restore_blocked_target_by_id(blocked_id: int) -> tuple[bool, str]:
+    blocked = rows(
+        "select email, youtube_channel_id, channel from blocked_targets where user_id = ? and id = ?",
+        (current_user_id(), int(blocked_id)),
+    )
+    if not blocked:
+        return False, "除外データが見つかりませんでした。"
+
+    item = blocked[0]
+    email = str(item["email"] or "").strip().lower()
+    youtube_channel_id = str(item["youtube_channel_id"] or "").strip()
+    channel = str(item["channel"] or "").strip()
+
+    already_registered = (email and contact_exists(email)) or (
+        youtube_channel_id and youtube_channel_in_contacts(youtube_channel_id)
+    )
+    unblock_target(email, youtube_channel_id)
+
+    if already_registered:
+        return True, "すでに宛先一覧にあるため、除外だけ解除しました。"
+
+    restored = add_contact(
+        email=email,
+        name="",
+        channel=channel or "名称未設定",
+        consent=True,
+        youtube_channel_id=youtube_channel_id,
+    )
+    if restored:
+        return True, "除外を解除し、宛先一覧に戻しました。"
+    return False, "除外は解除しましたが、宛先一覧への復元はできませんでした。メールアドレスやチャンネルの重複を確認してください。"
+
+
 def cleanup_blocked_targets_for_existing_contacts() -> None:
     execute(
         """
@@ -3052,7 +3085,7 @@ def main() -> None:
     blocked_targets = fetch_blocked_targets()
     if not blocked_targets.empty:
         with st.expander(f"配信停止済み・削除済みリスト（{len(blocked_targets)}件）"):
-            st.caption("ここにあるメールアドレスやYouTubeチャンネルは、CSV取り込みや候補検索から自動で戻らないようにしています。必要な場合だけ除外を解除してください。")
+            st.caption("ここにあるメールアドレスやYouTubeチャンネルは、CSV取り込みや候補検索から自動で戻らないようにしています。必要な場合だけ宛先一覧へ戻してください。")
             blocked_search = st.text_input(
                 "除外リストを検索",
                 placeholder="メールアドレス、チャンネル名、理由で検索",
@@ -3077,9 +3110,12 @@ def main() -> None:
                     columns[1].write(row.channel or row.youtube_channel_id or "-")
                     columns[2].write(row.reason or "-")
                     columns[3].write(row.created_at or "-")
-                    if columns[4].button("除外を解除", key=f"unblock_target_{row.id}"):
-                        unblock_target_by_id(int(row.id))
-                        st.success("除外を解除しました。必要であれば宛先を再登録してください。")
+                    if columns[4].button("宛先へ戻す", key=f"unblock_target_{row.id}"):
+                        ok, message = restore_blocked_target_by_id(int(row.id))
+                        if ok:
+                            st.success(message)
+                        else:
+                            st.error(message)
                         st.rerun()
 
     if contacts.empty:
