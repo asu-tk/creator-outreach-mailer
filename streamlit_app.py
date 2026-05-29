@@ -2389,17 +2389,40 @@ def main() -> None:
             ).any(axis=1)
             candidates = candidates[mask]
 
-        st.caption(f"{len(candidates)}件表示中")
         if candidates.empty:
             st.write("検索条件に合う候補はありません。")
             return
+
+        total_candidates = len(candidates)
+        candidate_page_col, candidate_size_col, candidate_info_col = st.columns([1.0, 1.0, 2.0])
+        candidate_page_size = candidate_size_col.selectbox(
+            "表示件数",
+            [20, 30, 50, 100],
+            index=0,
+            key="candidates_page_size",
+        )
+        candidate_total_pages = max(1, (total_candidates + candidate_page_size - 1) // candidate_page_size)
+        candidate_current_page = candidate_page_col.number_input(
+            "ページ",
+            min_value=1,
+            max_value=candidate_total_pages,
+            value=min(st.session_state.get("candidates_page", 1), candidate_total_pages),
+            step=1,
+            key="candidates_page",
+        )
+        candidate_start_index = (int(candidate_current_page) - 1) * candidate_page_size
+        candidate_end_index = min(candidate_start_index + candidate_page_size, total_candidates)
+        visible_candidates = candidates.iloc[candidate_start_index:candidate_end_index]
+        candidate_info_col.caption(
+            f"{total_candidates}件中 {candidate_start_index + 1}〜{candidate_end_index}件を表示 / {candidate_total_pages}ページ"
+        )
 
         header = st.columns([2.2, 1.0, 1.0, 1.0, 1.2, 1.0, 0.9, 0.7])
         headers = ["チャンネル", "登録者数", "動画数", "総再生数", "検索キーワード", "開く", "宛先", "削除"]
         for column, label in zip(header, headers):
             column.markdown(f"**{label}**")
 
-        for row in candidates.itertuples():
+        for row in visible_candidates.itertuples():
             columns = st.columns([2.2, 1.0, 1.0, 1.0, 1.2, 1.0, 0.9, 0.7])
             columns[0].write(row.title or "-")
             columns[1].write(f"{int(row.subscriber_count):,}")
