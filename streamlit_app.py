@@ -64,6 +64,22 @@ def auth_is_configured() -> bool:
         return False
 
 
+def auth_config_status() -> list[str]:
+    checks = []
+    try:
+        auth_config = st.secrets.get("auth", {})
+        for key in ["redirect_uri", "cookie_secret", "client_id", "client_secret", "server_metadata_url"]:
+            checks.append(f"{key}: {'設定あり' if auth_config.get(key) else '未設定'}")
+        redirect_uri = str(auth_config.get("redirect_uri", ""))
+        if redirect_uri and not redirect_uri.endswith("/oauth2callback"):
+            checks.append("redirect_uri: /oauth2callback で終わっていません")
+        if redirect_uri and redirect_uri.endswith("/"):
+            checks.append("redirect_uri: 末尾の / が余分かもしれません")
+    except Exception as exc:
+        checks.append(f"Secrets読取エラー: {exc}")
+    return checks
+
+
 def current_user_id() -> str:
     try:
         if auth_is_configured() and st.user.is_logged_in:
@@ -85,8 +101,11 @@ def require_login() -> bool:
         return True
     st.title("Creator Outreach Mailer")
     st.write("このアプリを使うにはGoogleログインが必要です。")
+    with st.expander("ログイン設定チェック"):
+        for line in auth_config_status():
+            st.write(line)
     st.button("Googleでログイン", on_click=st.login)
-    return False
+    st.stop()
 
 
 def get_secret(name: str, default: str = "") -> str:
