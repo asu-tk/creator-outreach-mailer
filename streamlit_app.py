@@ -2940,34 +2940,128 @@ def fetch_public_google_url(url: str) -> bytes:
         return response.read()
 
 
+def describe_google_download_error(exc: Exception) -> str:
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"HTTP {exc.code}"
+    if isinstance(exc, urllib.error.URLError):
+        return str(exc.reason)
+    message = str(exc).strip()
+    return message or exc.__class__.__name__
+
+
+def google_public_file_error(kind: str, details: list[str] | None = None) -> str:
+    detail_text = ""
+    if details:
+        detail_text = f"（詳細: {' / '.join(details[:3])}）"
+    return (
+        f"{kind}を読み込めませんでした。Google側の共有設定を"
+        "「リンクを知っている全員が閲覧可」にしてから、"
+        f"ブラウザのアドレスバーのURLを貼り直してください。{detail_text}"
+    )
+
+
+def extract_google_url_value(url: str, key: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    for part in [parsed.query, parsed.fragment]:
+        values = urllib.parse.parse_qs(part).get(key)
+        if values and values[0].strip():
+            return values[0].strip()
+    match = re.search(rf"(?:^|[&#?]){re.escape(key)}=([^&#]+)", parsed.fragment)
+    if match:
+        return urllib.parse.unquote(match.group(1)).strip()
+    return ""
+
+
 def extract_google_file_id(url: str, expected_kind: str) -> str:
-    pattern = rf"docs\.google\.com/{expected_kind}/d/([^/?#]+)"
+    pattern = rf"docs\.google\.com/{expected_kind}(?:/u/\d+)?/d/(?!e/)([^/?#]+)"
     match = re.search(pattern, url)
     if not match:
         raise ValueError("GoogleファイルのURLを読み取れませんでした。ブラウザのアドレスバーからURLをコピーしてください。")
     return match.group(1)
 
 
-def read_google_sheet_url(url: str) -> pd.DataFrame:
-    sheet_id = extract_google_file_id(url, "spreadsheets")
-    parsed = urllib.parse.urlparse(url)
-    query = urllib.parse.parse_qs(parsed.query)
-    fragment_query = urllib.parse.parse_qs(parsed.fragment)
-    gid = (query.get("gid") or fragment_query.get("gid") or ["0"])[0]
-    export_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={urllib.parse.quote(gid)}"
-    data = fetch_public_google_url(export_url)
+def extract_google_published_file_id(url: str, expected_kind: str) -> str:
+    pattern = rf"docs\.google\.com/{expected_kind}(?:/u/\d+)?/d/e/([^/?#]+)"
+    match = re.search(pattern, url)
+    return match.group(1) if match else ""
+
+
+def extract_google_sheet_gid(url: str) -> str:
+    return extract_google_url_value(url, "gid") or "0"
+
+
+def build_google_sheet_csv_urls(sheet_id: str, gid: str, resource_key: str = "") -> list[str]:
+    candidate_gids = [gid]
+    if gid != "0":
+        candidate_gids.append("0")
+
+    urls: list[str] = []
+    for candidate_gid in candidate_gids:
+        quoted_gid = urllib.parse.quote(candidate_gid, safe="")
+        resource_suffix = f"&resourcekey={urllib.parse.quote(resource_key, safe='')}" if resource_key else ""
+        urls.extend(
+            [
+                f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={quoted_gid}{resource_suffix}",
+                f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:csv&gid={quoted_gid}{resource_suffix}",
+            ]
+        )
+    return list(dict.fromkeys(urls))
+
+
+def build_google_published_sheet_csv_urls(published_id: str, gid: str) -> list[str]:
+    candidate_gids = [gid]
+    if gid != "0":
+        candidate_gids.append("0")
+
+    urls: list[str] = []
+    for candidate_gid in candidate_gids:
+        query = urllib.parse.urlencode({"gid": candidate_gid, "single": "true", "output": "csv"})
+        urls.append(f"https://docs.google.com/spreadsheets/d/e/{published_id}/pub?{query}")
+    urls.append(f"https://docs.google.com/spreadsheets/d/e/{published_id}/pub?output=csv")
+    return list(dict.fromkeys(urls))
+
+
+def read_google_csv_bytes(data: bytes) -> pd.DataFrame:
     text = decode_downloaded_bytes(data)
     if "<html" in text[:300].lower():
-        raise ValueError("スプレッドシートを読み込めませんでした。共有設定を「リンクを知っている全員が閲覧可」にしてから再度お試しください。")
+        raise ValueError("Googleの権限画面が返されました")
+    if not text.strip():
+        raise ValueError("CSVが空でした")
     return pd.read_csv(BytesIO(text.encode("utf-8"))).fillna("")
+
+
+def read_google_sheet_url(url: str) -> pd.DataFrame:
+    gid = extract_google_sheet_gid(url)
+    published_id = extract_google_published_file_id(url, "spreadsheets")
+    if published_id:
+        export_urls = build_google_published_sheet_csv_urls(published_id, gid)
+    else:
+        sheet_id = extract_google_file_id(url, "spreadsheets")
+        resource_key = extract_google_url_value(url, "resourcekey")
+        export_urls = build_google_sheet_csv_urls(sheet_id, gid, resource_key)
+
+    errors: list[str] = []
+    for export_url in export_urls:
+        try:
+            return read_google_csv_bytes(fetch_public_google_url(export_url))
+        except Exception as exc:
+            error_detail = describe_google_download_error(exc)
+            if error_detail not in errors:
+                errors.append(error_detail)
+    raise ValueError(google_public_file_error("Googleスプレッドシート", errors))
 
 
 def read_google_doc_url(url: str) -> str:
     document_id = extract_google_file_id(url, "document")
-    export_url = f"https://docs.google.com/document/d/{document_id}/export?format=txt"
-    text = decode_downloaded_bytes(fetch_public_google_url(export_url))
+    resource_key = extract_google_url_value(url, "resourcekey")
+    resource_suffix = f"&resourcekey={urllib.parse.quote(resource_key, safe='')}" if resource_key else ""
+    export_url = f"https://docs.google.com/document/d/{document_id}/export?format=txt{resource_suffix}"
+    try:
+        text = decode_downloaded_bytes(fetch_public_google_url(export_url))
+    except Exception as exc:
+        raise ValueError(google_public_file_error("Googleドキュメント", [describe_google_download_error(exc)])) from exc
     if "<html" in text[:300].lower():
-        raise ValueError("Googleドキュメントを読み込めませんでした。共有設定を「リンクを知っている全員が閲覧可」にしてから再度お試しください。")
+        raise ValueError(google_public_file_error("Googleドキュメント", ["Googleの権限画面が返されました"]))
     return text
 
 
