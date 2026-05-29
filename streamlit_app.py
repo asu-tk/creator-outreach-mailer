@@ -2457,6 +2457,31 @@ def main() -> None:
                 st.success(f"{row.title} を削除しました")
                 st.rerun()
 
+        st.divider()
+        prev_col, page_status_col, next_col = st.columns([1.0, 2.0, 1.0])
+        if prev_col.button(
+            "前のページ",
+            key="candidates_prev_page_bottom",
+            use_container_width=True,
+            disabled=int(candidate_current_page) <= 1,
+        ):
+            st.session_state["candidates_page"] = int(candidate_current_page) - 1
+            st.rerun()
+        page_status_col.markdown(
+            f"<div style='text-align:center; padding-top:0.45rem;'>"
+            f"{candidate_current_page} / {candidate_total_pages}ページ"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        if next_col.button(
+            "次のページ",
+            key="candidates_next_page_bottom",
+            use_container_width=True,
+            disabled=int(candidate_current_page) >= candidate_total_pages,
+        ):
+            st.session_state["candidates_page"] = int(candidate_current_page) + 1
+            st.rerun()
+
 
 if __name__ == "__main__":
     main()
