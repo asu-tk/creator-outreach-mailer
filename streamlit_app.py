@@ -2549,7 +2549,7 @@ def main() -> None:
         st.divider()
 
         st.subheader("宛先を追加")
-        with st.form("add_contact"):
+        with st.form("add_contact", clear_on_submit=True):
             email = st.text_input("メールアドレス")
             name = st.text_input("名前", placeholder="例: 山田さん")
             channel = st.text_input("チャンネル名", placeholder="例: Sample Channel")
