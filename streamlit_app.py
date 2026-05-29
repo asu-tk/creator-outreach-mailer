@@ -1802,6 +1802,34 @@ def fetch_recent_send_jobs() -> list[dict]:
         return []
 
 
+def fetch_next_send_contacts(campaign_key_value: str, limit: int) -> list[sqlite3.Row]:
+    return rows(
+        """
+        select
+            c.*,
+            max(s.sent_at) as last_sent
+        from contacts c
+        left join sends s on s.contact_id = c.id and s.status = 'sent'
+        where c.user_id = ? and c.consent = 1 and c.unsubscribed = 0 and c.email != ''
+          and not exists (
+              select 1
+              from sends sent_campaign
+              where sent_campaign.user_id = c.user_id
+                and sent_campaign.contact_id = c.id
+                and sent_campaign.campaign_key = ?
+                and sent_campaign.status in ('sent', 'queued')
+          )
+        group by c.id
+        order by
+            case when max(s.sent_at) is null then 0 else 1 end,
+            max(s.sent_at) asc,
+            c.id asc
+        limit ?
+        """,
+        (current_user_id(), campaign_key_value, int(limit)),
+    )
+
+
 def add_contact(
     email: str,
     name: str,
@@ -2423,6 +2451,27 @@ def main() -> None:
         if remaining_count == 0 and target_count > 0:
             st.success("この配信名では、現在の送信対象すべてが送信済み、または送信待ちです。")
         st.caption("同じ配信名ですでに送った宛先、または送信待ちの宛先は自動で除外します。送信対象は、未送信の宛先を優先し、その後は最終送信日時が古い順に選ばれます。")
+
+        preview_contacts = fetch_next_send_contacts(current_campaign_key, 1) if campaign_name.strip() else []
+        with st.expander("送信前プレビュー", expanded=False):
+            if not preview_contacts:
+                st.write("プレビューできる送信対象がありません。宛先一覧、配信名、送信済み状況を確認してください。")
+            else:
+                preview_contact = preview_contacts[0]
+                preview_unsubscribe_url = build_unsubscribe_url(preview_contact)
+                preview_subject = render_template(subject_template, preview_contact, preview_unsubscribe_url)
+                preview_body = render_template(
+                    ensure_unsubscribe_link_template(body_template),
+                    preview_contact,
+                    preview_unsubscribe_url,
+                )
+                st.caption(
+                    f"送信対象の先頭1件で確認しています: "
+                    f"{preview_contact['channel'] or '-'} / {preview_contact['email']}"
+                )
+                st.text_input("プレビュー件名", value=preview_subject, disabled=True)
+                st.text_area("プレビュー本文", value=preview_body, height=260, disabled=True)
+
         recent_jobs = fetch_recent_send_jobs()
         if recent_jobs:
             with st.expander("最近の送信予約"):
@@ -2504,35 +2553,9 @@ def main() -> None:
                 st.error("送信前に直す項目があります。\n\n" + "\n".join(f"- {error}" for error in preflight_errors))
             else:
                 save_setting("CURRENT_CAMPAIGN_NAME", campaign_name.strip())
-                contacts = rows(
-                    """
-                    select
-                        c.*,
-                        max(s.sent_at) as last_sent
-                    from contacts c
-                    left join sends s on s.contact_id = c.id and s.status = 'sent'
-                    where c.user_id = ? and c.consent = 1 and c.unsubscribed = 0 and c.email != ''
-                      and not exists (
-                          select 1
-                          from sends sent_campaign
-                          where sent_campaign.user_id = c.user_id
-                            and sent_campaign.contact_id = c.id
-                            and sent_campaign.campaign_key = ?
-                            and sent_campaign.status in ('sent', 'queued')
-                      )
-                    group by c.id
-                    order by
-                        case when max(s.sent_at) is null then 0 else 1 end,
-                        max(s.sent_at) asc,
-                        c.id asc
-                    """
-                    ,
-                    (current_user_id(), current_campaign_key),
-                )
+                contacts = fetch_next_send_contacts(current_campaign_key, int(send_limit))
                 if run_test:
                     contacts = contacts[:1]
-                else:
-                    contacts = contacts[: int(send_limit)]
 
                 if not contacts:
                     st.error("送信できる宛先がありません。宛先一覧、送信済み状況、配信名を確認してください。")
