@@ -8,6 +8,7 @@ import sqlite3
 import time
 import json
 import hashlib
+from io import BytesIO
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -734,6 +735,31 @@ def fetch_candidates() -> pd.DataFrame:
             db,
             params=(current_user_id(),),
         )
+
+
+def contacts_export_frame(contacts: pd.DataFrame) -> pd.DataFrame:
+    export_columns = {
+        "channel": "チャンネル",
+        "email": "メールアドレス",
+        "name": "名前",
+        "状態": "状態",
+        "last_sent": "最終送信",
+        "youtube_channel_url": "YouTube URL",
+        "youtube_subscriber_count": "登録者数",
+        "youtube_video_count": "動画数",
+        "youtube_view_count": "総再生数",
+        "youtube_keyword": "検索キーワード",
+        "created_at": "登録日時",
+    }
+    available_columns = [column for column in export_columns if column in contacts.columns]
+    return contacts[available_columns].rename(columns=export_columns)
+
+
+def dataframe_to_xlsx(frame: pd.DataFrame) -> bytes:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        frame.to_excel(writer, index=False, sheet_name="宛先一覧")
+    return output.getvalue()
 
 
 def execute(query: str, params: tuple = ()) -> None:
@@ -2562,6 +2588,24 @@ def main() -> None:
         if contacts.empty:
             st.write("検索条件に合う宛先はありません。")
             return
+
+        export_frame = contacts_export_frame(contacts)
+        export_name = datetime.now(APP_TIMEZONE).strftime("contacts_%Y%m%d_%H%M")
+        download_csv_col, download_xlsx_col = st.columns(2)
+        download_csv_col.download_button(
+            "CSVでダウンロード",
+            data=export_frame.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"{export_name}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+        download_xlsx_col.download_button(
+            "Excelでダウンロード",
+            data=dataframe_to_xlsx(export_frame),
+            file_name=f"{export_name}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
 
         total_contacts = len(contacts)
         page_col, size_col, info_col = st.columns([1.0, 1.0, 2.0])
