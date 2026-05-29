@@ -6,6 +6,7 @@ import secrets
 import smtplib
 import sqlite3
 import time
+import json
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -55,14 +56,95 @@ def auth_is_configured() -> bool:
         auth_config = st.secrets.get("auth", {})
         google_config = auth_config.get("google", {})
         return bool(
-            auth_config.get("redirect_uri")
+            get_google_redirect_uri()
             and auth_config.get("cookie_secret")
             and google_config.get("client_id")
             and google_config.get("client_secret")
-            and google_config.get("server_metadata_url")
         )
     except Exception:
         return False
+
+
+def get_google_config() -> dict:
+    try:
+        auth_config = st.secrets.get("auth", {})
+        google_config = auth_config.get("google", {})
+        return {
+            "client_id": google_config.get("client_id") or auth_config.get("client_id", ""),
+            "client_secret": google_config.get("client_secret") or auth_config.get("client_secret", ""),
+            "redirect_uri": get_google_redirect_uri(),
+        }
+    except Exception:
+        return {"client_id": "", "client_secret": "", "redirect_uri": ""}
+
+
+def get_google_redirect_uri() -> str:
+    try:
+        redirect_uri = str(st.secrets.get("auth", {}).get("redirect_uri", ""))
+    except Exception:
+        redirect_uri = ""
+    if redirect_uri.endswith("/oauth2callback"):
+        return redirect_uri.removesuffix("oauth2callback")
+    return redirect_uri
+
+
+def build_google_login_url() -> str:
+    config = get_google_config()
+    params = {
+        "client_id": config["client_id"],
+        "redirect_uri": config["redirect_uri"],
+        "response_type": "code",
+        "scope": "openid email profile",
+        "prompt": "select_account",
+        "access_type": "online",
+    }
+    return "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
+
+
+def post_form(url: str, payload: dict[str, str]) -> dict:
+    data = urllib.parse.urlencode(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def get_json(url: str) -> dict:
+    with urllib.request.urlopen(url, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def handle_google_callback() -> None:
+    code = st.query_params.get("code")
+    if not code:
+        return
+    config = get_google_config()
+    try:
+        token_data = post_form(
+            "https://oauth2.googleapis.com/token",
+            {
+                "code": code,
+                "client_id": config["client_id"],
+                "client_secret": config["client_secret"],
+                "redirect_uri": config["redirect_uri"],
+                "grant_type": "authorization_code",
+            },
+        )
+        id_token = token_data.get("id_token", "")
+        user_info = get_json("https://oauth2.googleapis.com/tokeninfo?id_token=" + urllib.parse.quote(id_token))
+        st.session_state["google_user"] = {
+            "email": user_info.get("email", ""),
+            "sub": user_info.get("sub", ""),
+            "name": user_info.get("name", ""),
+        }
+        st.query_params.clear()
+        st.rerun()
+    except Exception as exc:
+        st.error(f"Googleログインの処理に失敗しました: {exc}")
 
 
 def auth_config_status() -> list[str]:
@@ -73,16 +155,19 @@ def auth_config_status() -> list[str]:
             value = auth_config.get(key) if key in ["redirect_uri", "cookie_secret"] else auth_config.get("google", {}).get(key)
             checks.append(f"{key}: {'設定あり' if value else '未設定'}")
         redirect_uri = str(auth_config.get("redirect_uri", ""))
-        if redirect_uri and not redirect_uri.endswith("/oauth2callback"):
-            checks.append("redirect_uri: /oauth2callback で終わっていません")
-        if redirect_uri and redirect_uri.endswith("/"):
-            checks.append("redirect_uri: 末尾の / が余分かもしれません")
+        active_redirect_uri = get_google_redirect_uri()
+        if redirect_uri.endswith("/oauth2callback"):
+            checks.append("redirect_uri: 古い形式ですが、アプリ側では末尾を外して使います")
+        checks.append(f"Google Cloudに登録するリダイレクトURL: {active_redirect_uri or '未設定'}")
     except Exception as exc:
         checks.append(f"Secrets読取エラー: {exc}")
     return checks
 
 
 def current_user_id() -> str:
+    manual_user = st.session_state.get("google_user")
+    if manual_user:
+        return str(manual_user.get("email") or manual_user.get("sub") or "unknown-user")
     try:
         if auth_is_configured() and st.user.is_logged_in:
             return str(st.user.get("email") or st.user.get("sub") or "unknown-user")
@@ -92,8 +177,17 @@ def current_user_id() -> str:
 
 
 def require_login() -> bool:
+    handle_google_callback()
     if not auth_is_configured():
         st.warning("ログイン設定が未設定です。開発モードとして local-user のデータを表示しています。")
+        return True
+    manual_user = st.session_state.get("google_user")
+    if manual_user:
+        col1, col2 = st.columns([3, 1])
+        col1.caption(f"ログイン中: {manual_user.get('email', 'unknown')}")
+        if col2.button("ログアウト"):
+            st.session_state.pop("google_user", None)
+            st.rerun()
         return True
     if st.user.is_logged_in:
         col1, col2 = st.columns([3, 1])
@@ -103,9 +197,8 @@ def require_login() -> bool:
         return True
     st.title("Creator Outreach Mailer")
     st.write("このアプリを使うにはGoogleログインが必要です。")
-    st.info("ログインできない場合は、Streamlitのプレビューや埋め込み画面ではなく、Chrome / Edge / Safari などの通常ブラウザで開いてください。")
-    if st.button("Googleでログイン"):
-        st.login("google")
+    st.info("Google CloudのOAuth設定には、このアプリ本体のURLをリダイレクトURLとして登録してください。例: https://creator-outreach-mailer.streamlit.app/")
+    st.link_button("Googleでログイン", build_google_login_url())
     st.stop()
 
 
