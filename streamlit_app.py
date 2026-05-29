@@ -1041,6 +1041,11 @@ def save_campaign_template_order(names: list[str]) -> None:
         )
 
 
+def campaign_template_list_key(names: list[str]) -> str:
+    digest = hashlib.sha1("|".join(names).encode("utf-8")).hexdigest()[:10]
+    return f"campaign_template_sort_{digest}"
+
+
 def change_candidate_page(delta: int, total_pages: int) -> None:
     current_page = int(st.session_state.get("candidates_page", 1))
     st.session_state["candidates_page"] = max(1, min(int(total_pages), current_page + int(delta)))
@@ -2284,7 +2289,7 @@ def main() -> None:
                     """
                     sorted_template_names = sort_items(
                         template_names,
-                        key="campaign_template_sort",
+                        key=campaign_template_list_key(template_names),
                         custom_style=vertical_sort_style,
                     )
                     if sorted_template_names != template_names:
