@@ -2621,7 +2621,7 @@ def fetch_campaign_template_stats(template_names: list[str]) -> pd.DataFrame:
                 "送信待ち": int(counts["queued_count"] or 0),
                 "配信停止": int(unsubscribe_count or 0),
                 "配信停止率": f"{unsubscribe_rate:.1f}%",
-                "記録合計": int(counts["total_count"] or 0),
+                "送信記録合計": int(counts["total_count"] or 0),
             }
         )
     return pd.DataFrame(records)
@@ -2664,7 +2664,7 @@ def fetch_scenario_step_stats(scenario_id: int) -> pd.DataFrame:
                 "送信待ち": int(counts["queued_count"] or 0),
                 "配信停止": int(unsubscribe_count or 0),
                 "配信停止率": f"{unsubscribe_rate:.1f}%",
-                "記録合計": int(counts["total_count"] or 0),
+                "送信記録合計": int(counts["total_count"] or 0),
             }
         )
     return pd.DataFrame(records)
