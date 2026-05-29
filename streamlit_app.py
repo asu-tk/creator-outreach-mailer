@@ -605,6 +605,7 @@ def init_db() -> None:
                 user_id text not null default 'local-user',
                 contact_id integer not null,
                 campaign_key text not null default '',
+                send_job_id text not null default '',
                 subject text not null,
                 status text not null,
                 error text not null default '',
@@ -735,6 +736,8 @@ def init_db() -> None:
         sends_columns = [row[1] for row in db.execute("pragma table_info(sends)").fetchall()]
         if "campaign_key" not in sends_columns:
             db.execute("alter table sends add column campaign_key text not null default ''")
+        if "send_job_id" not in sends_columns:
+            db.execute("alter table sends add column send_job_id text not null default ''")
         campaign_columns = [row[1] for row in db.execute("pragma table_info(campaign_templates)").fetchall()]
         if "sort_order" not in campaign_columns:
             db.execute("alter table campaign_templates add column sort_order integer not null default 0")
@@ -2203,8 +2206,8 @@ def create_send_job(
         supabase_request("POST", "send_queue", queue_rows, prefer="return=representation")
     for row in queue_rows:
         execute(
-            "insert into sends(user_id, contact_id, campaign_key, subject, status, error, sent_at) values (?, ?, ?, ?, ?, ?, ?)",
-            (current_user_id(), row["contact_local_id"], campaign_key_value, row["subject"], "queued", "", now_iso()),
+            "insert into sends(user_id, contact_id, campaign_key, send_job_id, subject, status, error, sent_at) values (?, ?, ?, ?, ?, ?, ?, ?)",
+            (current_user_id(), row["contact_local_id"], campaign_key_value, str(job_id), row["subject"], "queued", "", now_iso()),
         )
     return True, f"{len(queue_rows)}件の送信予約を作成しました"
 
@@ -2219,7 +2222,7 @@ def sync_send_queue_results() -> None:
         query_email = urllib.parse.quote(user_email, safe="")
         results = supabase_request(
             "GET",
-            f"send_queue?user_email=eq.{query_email}&status=in.(sent,failed)&select=contact_local_id,campaign_key,status,error,sent_at,subject",
+            f"send_queue?user_email=eq.{query_email}&status=in.(sent,failed)&select=job_id,contact_local_id,campaign_key,status,error,sent_at,subject",
         )
         if not isinstance(results, list):
             return
@@ -2231,6 +2234,20 @@ def sync_send_queue_results() -> None:
             sent_at = item.get("sent_at") or now_iso()
             status = item.get("status", "")
             error = item.get("error", "")
+            send_job_id = str(item.get("job_id") or "")
+            if send_job_id:
+                execute(
+                    """
+                    update sends
+                    set status = ?, error = ?, sent_at = ?
+                    where user_id = ?
+                      and send_job_id = ?
+                      and contact_id = ?
+                      and campaign_key = ?
+                      and status = 'queued'
+                    """,
+                    (status, error, sent_at, current_user_id(), send_job_id, int(contact_id), campaign_key_value),
+                )
             execute(
                 """
                 update sends
@@ -2238,12 +2255,109 @@ def sync_send_queue_results() -> None:
                 where user_id = ?
                   and contact_id = ?
                   and campaign_key = ?
+                  and subject = ?
                   and status = 'queued'
                 """,
-                (status, error, sent_at, current_user_id(), int(contact_id), campaign_key_value),
+                (status, error, sent_at, current_user_id(), int(contact_id), campaign_key_value, str(item.get("subject") or "")),
             )
     except Exception:
         return
+
+
+def send_job_status_label(status: str) -> str:
+    return {
+        "queued": "送信待ち",
+        "pending": "送信待ち",
+        "running": "送信中",
+        "processing": "送信中",
+        "completed": "完了",
+        "done": "完了",
+        "failed": "失敗",
+        "canceled": "取消済み",
+        "cancelled": "取消済み",
+    }.get(str(status or "").lower(), str(status or "不明"))
+
+
+def is_cancelable_send_job(job: dict) -> bool:
+    status = str(job.get("status") or "").lower()
+    if status in {"canceled", "cancelled", "completed", "done", "failed"}:
+        return False
+    total_count = int(job.get("total_count") or 0)
+    sent_count = int(job.get("sent_count") or 0)
+    failed_count = int(job.get("failed_count") or 0)
+    return total_count <= 0 or sent_count + failed_count < total_count
+
+
+def delete_local_queued_sends_for_job(send_job_id: str, queue_rows: list[dict]) -> int:
+    deleted_count = 0
+    with sqlite3.connect(DB_PATH) as db:
+        for item in queue_rows:
+            contact_id = int(item.get("contact_local_id") or 0)
+            campaign_key_value = str(item.get("campaign_key") or "")
+            subject = str(item.get("subject") or "")
+            if not contact_id or not campaign_key_value:
+                continue
+            cursor = db.execute(
+                """
+                delete from sends
+                where user_id = ?
+                  and contact_id = ?
+                  and campaign_key = ?
+                  and subject = ?
+                  and (send_job_id = ? or send_job_id = '')
+                  and status = 'queued'
+                """,
+                (current_user_id(), contact_id, campaign_key_value, subject, send_job_id),
+            )
+            deleted_count += max(cursor.rowcount, 0)
+        db.commit()
+    if deleted_count:
+        mark_app_state_dirty()
+    return deleted_count
+
+
+def cancel_send_job(job: dict) -> tuple[bool, str]:
+    if not supabase_configured():
+        return False, "送信予約の取消にはSupabase設定が必要です。"
+    user_email = current_user_profile()["email"].strip().lower()
+    if not user_email:
+        return False, "Googleログインのメールアドレスを確認できませんでした。"
+    job_id = str(job.get("id") or "").strip()
+    if not job_id:
+        return False, "送信予約IDを確認できませんでした。"
+    if not is_cancelable_send_job(job):
+        return False, "この送信予約はすでに完了しているため、取り消せません。"
+
+    query_email = urllib.parse.quote(user_email, safe="")
+    query_job_id = urllib.parse.quote(job_id, safe="")
+    try:
+        canceled_rows = supabase_request(
+            "DELETE",
+            (
+                "send_queue"
+                f"?user_email=eq.{query_email}"
+                f"&job_id=eq.{query_job_id}"
+                "&status=eq.pending"
+                "&select=contact_local_id,campaign_key,subject"
+            ),
+            prefer="return=representation",
+        )
+        if not isinstance(canceled_rows, list):
+            canceled_rows = []
+        local_deleted = delete_local_queued_sends_for_job(job_id, canceled_rows)
+        supabase_request(
+            "PATCH",
+            f"send_jobs?user_email=eq.{query_email}&id=eq.{query_job_id}",
+            {"status": "canceled", "updated_at": now_iso()},
+            prefer="return=minimal",
+        )
+    except Exception as exc:
+        return False, f"送信予約を取り消せませんでした: {exc}"
+
+    restored_count = max(len(canceled_rows), local_deleted)
+    if restored_count:
+        return True, f"送信予約を取り消しました。送信待ちだった{restored_count}件を未送信の状態に戻しました。"
+    return True, "送信予約を取り消しました。送信待ちの宛先はすでに処理済み、または見つかりませんでした。"
 
 
 def record_unsubscribe_event(
@@ -2370,7 +2484,7 @@ def fetch_recent_send_jobs() -> list[dict]:
         query_email = urllib.parse.quote(user_email, safe="")
         result = supabase_request(
             "GET",
-            f"send_jobs?user_email=eq.{query_email}&select=campaign_name,total_count,sent_count,failed_count,status,created_at&order=created_at.desc&limit=5",
+            f"send_jobs?user_email=eq.{query_email}&select=id,campaign_key,campaign_name,total_count,sent_count,failed_count,status,created_at&order=created_at.desc&limit=5",
         )
         return result if isinstance(result, list) else []
     except Exception:
@@ -3910,6 +4024,12 @@ def main() -> None:
                     sync_send_queue_results()
                     st.rerun()
                 note_col.caption("送信予約の進捗は30秒ごとに自動更新されます。")
+                cancel_notice = st.session_state.pop("send_job_cancel_notice", "")
+                cancel_error = st.session_state.pop("send_job_cancel_error", "")
+                if cancel_notice:
+                    st.success(cancel_notice)
+                if cancel_error:
+                    st.error(cancel_error)
                 st.markdown(
                     """
                     <style>
@@ -3947,20 +4067,67 @@ def main() -> None:
                     st_autorefresh(interval=30_000, key="send_jobs_autorefresh")
                 else:
                     st.caption("自動更新部品の反映後は、30秒ごとに進捗が更新されます。")
-                st.dataframe(
-                    pd.DataFrame(recent_jobs).rename(
-                        columns={
-                            "campaign_name": "配信名",
-                            "total_count": "予約数",
-                            "sent_count": "送信済み",
-                            "failed_count": "失敗",
-                            "status": "状態",
-                            "created_at": "作成日時",
-                        }
-                    ),
-                    use_container_width=True,
-                    hide_index=True,
-                )
+                jobs_frame = pd.DataFrame(recent_jobs)
+                if not jobs_frame.empty:
+                    jobs_display = jobs_frame.copy()
+                    jobs_display["status"] = jobs_display["status"].apply(send_job_status_label)
+                    st.dataframe(
+                        jobs_display[
+                            ["campaign_name", "total_count", "sent_count", "failed_count", "status", "created_at"]
+                        ].rename(
+                            columns={
+                                "campaign_name": "配信名",
+                                "total_count": "予約数",
+                                "sent_count": "送信済み",
+                                "failed_count": "失敗",
+                                "status": "状態",
+                                "created_at": "作成日時",
+                            }
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                cancelable_jobs = [job for job in recent_jobs if is_cancelable_send_job(job)]
+                if cancelable_jobs:
+                    st.caption("送信待ちの予約は取り消せます。取消した宛先は、未送信の状態に戻ります。すでに送信済みの宛先は戻せません。")
+                    pending_cancel_job_id = str(st.session_state.get("confirm_cancel_send_job_id", ""))
+                    header = st.columns([2.0, 1.0, 1.0, 1.0, 1.1])
+                    for column, label in zip(header, ["配信名", "予約数", "送信済み", "状態", "操作"]):
+                        column.markdown(f"**{label}**")
+                    for job in cancelable_jobs:
+                        job_id = str(job.get("id") or "")
+                        columns = st.columns([2.0, 1.0, 1.0, 1.0, 1.1])
+                        columns[0].write(job.get("campaign_name") or "-")
+                        columns[1].write(f"{int(job.get('total_count') or 0)}件")
+                        columns[2].write(f"{int(job.get('sent_count') or 0)}件")
+                        columns[3].write(send_job_status_label(str(job.get("status") or "")))
+                        if columns[4].button("予約を取消", key=f"request_cancel_send_job_{job_id}", use_container_width=True):
+                            st.session_state["confirm_cancel_send_job_id"] = job_id
+                            st.rerun()
+
+                    if pending_cancel_job_id:
+                        pending_job = next(
+                            (job for job in cancelable_jobs if str(job.get("id") or "") == pending_cancel_job_id),
+                            None,
+                        )
+                        if pending_job:
+                            st.warning(
+                                f"送信予約「{pending_job.get('campaign_name') or '-'}」を取り消しますか？"
+                                "送信待ちの宛先は未送信の状態に戻ります。"
+                            )
+                            yes_col, no_col = st.columns(2)
+                            if yes_col.button("はい、取り消す", key=f"confirm_cancel_send_job_yes_{pending_cancel_job_id}", use_container_width=True):
+                                ok, message = cancel_send_job(pending_job)
+                                st.session_state["confirm_cancel_send_job_id"] = ""
+                                if ok:
+                                    st.session_state["send_job_cancel_notice"] = message
+                                else:
+                                    st.session_state["send_job_cancel_error"] = message
+                                st.rerun()
+                            if no_col.button("いいえ、取り消さない", key=f"confirm_cancel_send_job_no_{pending_cancel_job_id}", use_container_width=True):
+                                st.session_state["confirm_cancel_send_job_id"] = ""
+                                st.rerun()
 
         failed_sends = fetch_failed_sends()
         if not failed_sends.empty:
