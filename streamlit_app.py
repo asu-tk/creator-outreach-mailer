@@ -2422,9 +2422,7 @@ def main() -> None:
                     target.scrollIntoView({ behavior: "smooth", block: "start" });
                 }
 
-                setTimeout(scrollToCandidateSearch, 100);
-                setTimeout(scrollToCandidateSearch, 450);
-                setTimeout(scrollToCandidateSearch, 900);
+                setTimeout(scrollToCandidateSearch, 250);
                 </script>
                 """.replace("__SCROLL_NONCE__", str(scroll_nonce)),
                 height=1,
