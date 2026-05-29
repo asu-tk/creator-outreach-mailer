@@ -890,16 +890,18 @@ def save_app_state_to_supabase() -> None:
     if not app_state_can_sync() or st.session_state.get("_restoring_app_state"):
         return
     try:
+        saved_at = now_iso()
         supabase_request(
             "POST",
             "app_state?on_conflict=user_email",
             {
                 "user_email": app_state_user_email(),
                 "state": export_local_app_state(),
-                "updated_at": now_iso(),
+                "updated_at": saved_at,
             },
             prefer="resolution=merge-duplicates,return=minimal",
         )
+        st.session_state["_last_app_state_saved_at"] = saved_at
         st.session_state.pop("_last_app_state_save_error", None)
     except Exception as exc:
         st.session_state["_last_app_state_save_error"] = str(exc)
@@ -916,10 +918,12 @@ def load_app_state_from_supabase() -> None:
         query_email = urllib.parse.quote(email, safe="")
         result = supabase_request(
             "GET",
-            f"app_state?user_email=eq.{query_email}&select=state&limit=1",
+            f"app_state?user_email=eq.{query_email}&select=state,updated_at&limit=1",
         )
         if isinstance(result, list) and result:
             restore_local_app_state(result[0].get("state", {}))
+            if result[0].get("updated_at"):
+                st.session_state["_last_app_state_saved_at"] = str(result[0].get("updated_at"))
         else:
             save_app_state_to_supabase()
         st.session_state[loaded_key] = True
@@ -940,6 +944,38 @@ def flush_app_state_if_dirty() -> None:
     save_app_state_to_supabase()
     if "_last_app_state_save_error" not in st.session_state:
         st.session_state["_app_state_dirty"] = False
+
+
+def render_app_state_sync_panel() -> None:
+    with st.container():
+        st.markdown("#### データ保存")
+        if not supabase_configured():
+            st.warning("Supabase未設定のため、データ保存はこのアプリ内だけで行われています。")
+            return
+        if not app_state_user_email():
+            st.warning("Googleログインのメールアドレスを確認できないため、Supabase保存を実行できません。")
+            return
+
+        status_col, button_col = st.columns([2.2, 1.0])
+        last_saved = st.session_state.get("_last_app_state_saved_at", "")
+        if last_saved:
+            status_col.caption(f"最終保存: {last_saved}")
+        else:
+            status_col.caption("まだこの画面では保存確認ができていません。")
+
+        if button_col.button("現在のデータを保存", key="manual_save_app_state", use_container_width=True):
+            save_app_state_to_supabase()
+            if "_last_app_state_save_error" in st.session_state:
+                st.error("Supabaseへの保存に失敗しました。設定や通信状態を確認してください。")
+                st.caption(st.session_state["_last_app_state_save_error"])
+            else:
+                st.session_state["_app_state_dirty"] = False
+                st.success("現在のデータをSupabaseに保存しました。")
+
+        if st.session_state.get("_app_state_dirty"):
+            st.info("未保存の変更があります。しばらくすると自動保存されますが、心配な場合は「現在のデータを保存」を押してください。")
+        elif last_saved:
+            st.success("データ保存は有効です。")
 
 
 def get_youtube_daily_limit() -> int:
@@ -2416,6 +2452,7 @@ def main() -> None:
 
     st.title("Creator Outreach Mailer")
     st.caption("許諾済みの宛先だけに、1件ずつ送信する個人用Webアプリ")
+    render_app_state_sync_panel()
 
     if smtp_configured():
         st.success("SMTP設定あり: 実送信できます")
