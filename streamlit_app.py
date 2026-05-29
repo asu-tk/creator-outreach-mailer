@@ -141,8 +141,21 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def format_jst_datetime(value: str) -> str:
+    if not value:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        jst_time = parsed.astimezone(APP_TIMEZONE)
+        return jst_time.strftime("%Y年%m月%d日 %H:%M:%S（日本時間）")
+    except ValueError:
+        return value
+
+
 def today_key() -> str:
-    return datetime.now().strftime("%Y-%m-%d")
+    return datetime.now(APP_TIMEZONE).strftime("%Y-%m-%d")
 
 
 def campaign_key(campaign_name: str) -> str:
@@ -959,7 +972,7 @@ def render_app_state_sync_panel() -> None:
         status_col, button_col = st.columns([2.2, 1.0])
         last_saved = st.session_state.get("_last_app_state_saved_at", "")
         if last_saved:
-            status_col.caption(f"最終保存: {last_saved}")
+            status_col.caption(f"最終保存: {format_jst_datetime(str(last_saved))}")
         else:
             status_col.caption("まだこの画面では保存確認ができていません。")
 
