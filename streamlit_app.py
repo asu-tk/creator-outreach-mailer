@@ -1739,7 +1739,8 @@ def main() -> None:
             delete_campaign_template(selected_template)
             st.success(f"{selected_template} を削除しました")
             st.rerun()
-        delay = st.number_input("送信間隔（秒）", min_value=1, max_value=60, value=3)
+        delay = st.number_input("送信間隔（秒）", min_value=30, max_value=300, value=90, step=10)
+        st.caption("送信間隔は90秒を初期値にしています。短すぎる間隔は迷惑メール判定やサーバー制限の原因になるため、実運用では60〜120秒以上を目安にしてください。")
         send_limit = st.number_input("今回送信する件数", min_value=1, max_value=500, value=50)
         st.caption("大量送信はメールサーバー側で制限される場合があります。営業メールの実運用では、まず1日50〜100件程度から始め、送信エラーや迷惑メール判定が増えないことを確認しながら、必要に応じて100〜300件程度まで増やしてください。1日500件以上を継続して送る場合は、専用のメール配信サービスの利用を推奨します。")
         if int(send_limit) > 300:
