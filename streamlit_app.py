@@ -294,11 +294,16 @@ def ensure_supabase_user() -> None:
 
 def admin_emails() -> set[str]:
     raw = read_secret("ADMIN_EMAILS")
+    if not raw:
+        raw = get_nested_secret("billing", "admin_emails") or get_nested_secret("supabase", "ADMIN_EMAILS")
     return {email.strip().lower() for email in raw.split(",") if email.strip()}
 
 
 def subscription_required() -> bool:
-    return parse_bool(read_secret("SUBSCRIPTION_REQUIRED", "false"))
+    raw = read_secret("SUBSCRIPTION_REQUIRED")
+    if not raw:
+        raw = get_nested_secret("billing", "subscription_required") or get_nested_secret("supabase", "SUBSCRIPTION_REQUIRED")
+    return parse_bool(raw, False)
 
 
 def get_subscription_status(email: str) -> dict:
@@ -340,7 +345,7 @@ def require_active_subscription() -> None:
         return
     st.title("Creator Outreach Mailer")
     st.warning("このアプリを使うには有料プランへの登録が必要です。")
-    checkout_url = read_secret("STRIPE_CHECKOUT_URL")
+    checkout_url = read_secret("STRIPE_CHECKOUT_URL") or get_nested_secret("billing", "stripe_checkout_url")
     if checkout_url:
         st.link_button("有料プランに登録する", checkout_url)
     else:
