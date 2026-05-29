@@ -2244,16 +2244,24 @@ def main() -> None:
 
         templates = fetch_campaign_templates()
         template_names = [template["name"] for template in templates]
-        template_options = ["新しく作る"] + template_names
-        selected_index = template_options.index(current_campaign_name) if current_campaign_name in template_options else 0
-        selected_template = st.selectbox("保存済み配信", template_options, index=selected_index)
-        st.caption("テンプレートを選んで「読み込む」と、下の件名・本文に反映されます。新しく作る場合は配信名を変えて保存してください。")
-        load_col, save_col, delete_col = st.columns(3)
-        if load_col.button("読み込む", key="load_campaign_template", use_container_width=True, disabled=selected_template == "新しく作る"):
+        if template_names:
+            selected_index = template_names.index(current_campaign_name) if current_campaign_name in template_names else 0
+            selected_template = st.selectbox("保存済み配信", template_names, index=selected_index)
+        else:
+            selected_template = ""
+            st.info("保存済み配信はまだありません。新しいテンプレートを作成してください。")
+        st.caption("保存済みのテンプレートを選んで「読み込む」と、下の件名・本文に反映されます。")
+        load_col, new_col, save_col, delete_col = st.columns(4)
+        if load_col.button("読み込む", key="load_campaign_template", use_container_width=True, disabled=not selected_template):
             if load_campaign_template_into_session(selected_template):
                 save_setting("CURRENT_CAMPAIGN_NAME", selected_template)
                 st.success(f"{selected_template} を読み込みました")
-        if delete_col.button("このテンプレートを削除", key="delete_campaign_template", use_container_width=True, disabled=selected_template == "新しく作る"):
+        if new_col.button("新しいテンプレートを作る", key="new_campaign_template", use_container_width=True):
+            reset_campaign_template_session("", "", "")
+            save_setting("CURRENT_CAMPAIGN_NAME", "")
+            st.session_state["confirm_delete_campaign_template"] = ""
+            st.success("新しいテンプレートを作成できます。配信名、件名、本文を入力して保存してください。")
+        if delete_col.button("このテンプレートを削除", key="delete_campaign_template", use_container_width=True, disabled=not selected_template):
             st.session_state["confirm_delete_campaign_template"] = selected_template
         pending_delete_template = st.session_state.get("confirm_delete_campaign_template", "")
         if pending_delete_template:
