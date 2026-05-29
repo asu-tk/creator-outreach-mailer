@@ -20,6 +20,11 @@ from urllib.parse import quote
 import pandas as pd
 import streamlit as st
 
+try:
+    from streamlit_sortables import sort_items
+except Exception:
+    sort_items = None
+
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
@@ -528,6 +533,14 @@ def move_campaign_template(name: str, direction: int) -> None:
         "update campaign_templates set sort_order = ? where user_id = ? and id = ?",
         (int(current["sort_order"]), current_user_id(), int(other["id"])),
     )
+
+
+def save_campaign_template_order(names: list[str]) -> None:
+    for index, name in enumerate(names):
+        execute(
+            "update campaign_templates set sort_order = ? where user_id = ? and name = ?",
+            ((index + 1) * 10, current_user_id(), name),
+        )
 
 
 def ensure_default_campaign_template() -> None:
@@ -1211,7 +1224,7 @@ def main() -> None:
         template_options = ["新しく作る"] + template_names
         selected_index = template_options.index(current_campaign_name) if current_campaign_name in template_options else 0
         selected_template = st.selectbox("保存済み配信", template_options, index=selected_index)
-        load_col, save_col, delete_col, up_col, down_col = st.columns(5)
+        load_col, save_col, delete_col = st.columns(3)
         if load_col.button("読み込む", use_container_width=True, disabled=selected_template == "新しく作る"):
             template = get_campaign_template(selected_template)
             if template:
@@ -1219,15 +1232,17 @@ def main() -> None:
                 st.session_state["subject_template_input"] = template["subject"]
                 st.session_state["body_template_input"] = template["body"]
                 st.rerun()
-        selected_template_index = template_names.index(selected_template) if selected_template in template_names else -1
-        if up_col.button("上へ", use_container_width=True, disabled=selected_template_index <= 0):
-            move_campaign_template(selected_template, -1)
-            save_setting("CURRENT_CAMPAIGN_NAME", selected_template)
-            st.rerun()
-        if down_col.button("下へ", use_container_width=True, disabled=selected_template_index < 0 or selected_template_index >= len(template_names) - 1):
-            move_campaign_template(selected_template, 1)
-            save_setting("CURRENT_CAMPAIGN_NAME", selected_template)
-            st.rerun()
+        if len(template_names) > 1:
+            with st.expander("配信テンプレートの並び替え"):
+                if sort_items:
+                    sorted_template_names = sort_items(template_names, key="campaign_template_sort")
+                    if sorted_template_names != template_names:
+                        if st.button("この順番で保存", use_container_width=True):
+                            save_campaign_template_order(sorted_template_names)
+                            st.success("並び順を保存しました")
+                            st.rerun()
+                else:
+                    st.caption("ドラッグで並び替えるには、依存パッケージの反映後にアプリを再起動してください。")
         campaign_name = st.text_input("配信名", key="campaign_name_input")
         st.caption("同じ配信名の間は、本文を少し直しても同じ配信として進捗を引き継ぎます。新しい別メールを送る時だけ配信名を変えてください。")
         subject_template = st.text_input("件名", key="subject_template_input")
