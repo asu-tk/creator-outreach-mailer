@@ -819,7 +819,7 @@ def settings_panel() -> None:
     has_password = bool(get_setting("SMTP_PASS"))
 
     with st.form("mail_settings"):
-        sender_name = st.text_input("送信者表示名", value=get_setting("SENDER_NAME", "UniVerse"))
+        sender_name = st.text_input("送信者表示名", value=get_setting("SENDER_NAME", ""))
         sender_email = st.text_input("送信元メールアドレス", value=current_user)
         smtp_host = st.text_input("SMTPサーバー", value=current_host)
         smtp_port = st.text_input("SMTPポート", value=current_port)
@@ -1076,49 +1076,17 @@ def main() -> None:
 
     with right:
         st.subheader("メール作成")
-        subject_template = st.text_input("件名", value="御社YouTubeチャンネルの海外視聴者向け翻訳について")
+        subject_template = st.text_input("件名", value="${channel}へのご連絡")
         body_template = st.text_area(
             "本文",
             value="""突然のご連絡失礼いたします。
-YouTube多言語化アプリ「UniVerse」開発元チームの綾瀬と申します。
 
-貴社様のYouTube動画を拝見させて頂きました。
+${channel}を拝見し、ご連絡いたしました。
 
-動画の雰囲気や企画がとても魅力的で「海外視聴者にも届く可能性があるチャンネル」だと感じ、ご連絡させて頂きました。
-
-
-YouTubeアルゴリズムでは
-・タイトル
-・説明文
-・字幕
-
-を多言語化することで、海外からの再生やおすすめ表示が伸びる傾向があります。
-
-
-ただ実際は
-・翻訳作業に時間がかかる
-・複数言語対応が難しい
-・各言語ごとの登録が面倒
-
-などの理由から、海外対応を継続できないor全くやらないというチャンネル運営者様も少なくありません。
-
-
-UniVerseではYouTubeのタイトル・説明文を主要28言語へ自動翻訳し、海外視聴者向けのローカライズ作業を大幅に効率化できます。
-
-これまで何時間もかかっていた作業を、数分レベルまで短縮できるのが特徴です。
-
-
-「海外の視聴者にも動画を届けたい」
-そう考えている方には、非常に相性の良いアプリとなっております。
-
-もしご興味がありましたら、ぜひ一度ご覧ください。
-
-
-YouTubeサブスク型翻訳アプリ｜UniVerse
-https://universeapp.jp/
+もしご興味がありましたら、一度お話しできれば幸いです。
 
 不要な場合は、お手数ですが「配信停止希望」とご返信ください。""",
-            height=560,
+            height=260,
         )
         delay = st.number_input("送信間隔（秒）", min_value=1, max_value=60, value=3)
         send_limit = st.number_input("今回送信する件数", min_value=1, max_value=500, value=50)
