@@ -778,10 +778,10 @@ def contacts_export_frame(contacts: pd.DataFrame) -> pd.DataFrame:
     return contacts[available_columns].rename(columns=export_columns)
 
 
-def dataframe_to_xlsx(frame: pd.DataFrame) -> bytes:
+def dataframe_to_xlsx(frame: pd.DataFrame, sheet_name: str = "宛先一覧") -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        frame.to_excel(writer, index=False, sheet_name="宛先一覧")
+        frame.to_excel(writer, index=False, sheet_name=sheet_name)
     return output.getvalue()
 
 
@@ -2169,6 +2169,58 @@ def fetch_failed_sends(limit: int = 20) -> pd.DataFrame:
         )
 
 
+def send_status_label(status: str) -> str:
+    return {
+        "sent": "送信済み",
+        "queued": "送信待ち",
+        "failed": "失敗",
+    }.get(str(status or ""), str(status or "不明"))
+
+
+def fetch_send_history(limit: int = 500) -> pd.DataFrame:
+    with sqlite3.connect(DB_PATH) as db:
+        return pd.read_sql_query(
+            """
+            select
+                s.id as send_id,
+                s.sent_at,
+                s.status,
+                s.campaign_key,
+                c.channel,
+                c.email,
+                c.name,
+                s.subject,
+                s.error
+            from sends s
+            left join contacts c on c.id = s.contact_id and c.user_id = s.user_id
+            where s.user_id = ?
+            order by s.sent_at desc, s.id desc
+            limit ?
+            """,
+            db,
+            params=(current_user_id(), int(limit)),
+        )
+
+
+def prepare_send_history_display(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    template_name_by_key = {
+        campaign_key(template["name"]): template["name"]
+        for template in fetch_campaign_templates()
+    }
+    display = frame.copy().fillna("")
+    display["日時"] = display["sent_at"].apply(format_jst_datetime)
+    display["状態"] = display["status"].apply(send_status_label)
+    display["配信名"] = display["campaign_key"].map(template_name_by_key).fillna("削除済み/不明の配信")
+    display["チャンネル"] = display["channel"].replace("", "-")
+    display["メールアドレス"] = display["email"].replace("", "-")
+    display["名前"] = display["name"].replace("", "-")
+    display["件名"] = display["subject"].replace("", "-")
+    display["失敗理由"] = display["error"].replace("", "-")
+    return display[["日時", "状態", "配信名", "チャンネル", "メールアドレス", "名前", "件名", "失敗理由"]]
+
+
 def fetch_campaign_template_stats(template_names: list[str]) -> pd.DataFrame:
     records = []
     for name in template_names:
@@ -3054,6 +3106,65 @@ def main() -> None:
                         delete_contact(int(row.contact_id), block=True, reason="送信失敗")
                         st.success(f"{row.email} を削除し、再取り込みしないようにしました")
                         st.rerun()
+
+        send_history = fetch_send_history()
+        with st.expander(f"送信ログ履歴（最新{len(send_history)}件）", expanded=False):
+            if send_history.empty:
+                st.write("まだ送信ログがありません。")
+            else:
+                history_metrics = st.columns(4)
+                history_metrics[0].metric("送信済み", f"{int((send_history['status'] == 'sent').sum())}件")
+                history_metrics[1].metric("送信待ち", f"{int((send_history['status'] == 'queued').sum())}件")
+                history_metrics[2].metric("失敗", f"{int((send_history['status'] == 'failed').sum())}件")
+                history_metrics[3].metric("合計", f"{len(send_history)}件")
+
+                history_display = prepare_send_history_display(send_history)
+                filter_cols = st.columns([1.5, 1.0, 1.0])
+                history_keyword = filter_cols[0].text_input(
+                    "送信ログを検索",
+                    placeholder="メールアドレス、チャンネル名、配信名、件名で検索",
+                    key="send_history_search",
+                )
+                history_status = filter_cols[1].selectbox(
+                    "状態",
+                    ["すべて", "送信済み", "送信待ち", "失敗"],
+                    key="send_history_status_filter",
+                )
+                history_limit = filter_cols[2].selectbox(
+                    "表示件数",
+                    [20, 50, 100, 200, 500],
+                    index=1,
+                    key="send_history_limit",
+                )
+
+                filtered_history = history_display.copy()
+                if history_status != "すべて":
+                    filtered_history = filtered_history[filtered_history["状態"] == history_status]
+                if history_keyword.strip():
+                    keyword = history_keyword.strip().lower()
+                    search_text = filtered_history.astype(str).agg(" ".join, axis=1).str.lower()
+                    filtered_history = filtered_history[search_text.str.contains(re.escape(keyword), na=False)]
+
+                st.caption(f"{len(filtered_history)}件を表示しています。日時は日本時間です。")
+                visible_history = filtered_history.head(int(history_limit))
+                st.dataframe(visible_history, use_container_width=True, hide_index=True)
+
+                export_name = datetime.now(APP_TIMEZONE).strftime("send_history_%Y%m%d_%H%M")
+                log_csv_col, log_xlsx_col = st.columns(2)
+                log_csv_col.download_button(
+                    "送信ログをCSVでダウンロード",
+                    data=filtered_history.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"{export_name}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+                log_xlsx_col.download_button(
+                    "送信ログをExcelでダウンロード",
+                    data=dataframe_to_xlsx(filtered_history, sheet_name="送信ログ"),
+                    file_name=f"{export_name}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
 
         test_button, send_button = st.columns(2)
         with test_button:
