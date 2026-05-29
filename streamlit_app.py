@@ -1802,6 +1802,32 @@ def friendly_smtp_error(raw_error: str) -> str:
     return f"SMTP送信に失敗しました。\n\n考えられる原因と直し方:\n{bullet_list}\n\n実際のエラー:\n`{message}`"
 
 
+def classify_send_failure(raw_error: str) -> tuple[str, str]:
+    message = str(raw_error or "").strip()
+    lower = message.lower()
+    if not message:
+        return "不明", "送信ログに詳しいエラーが残っていません。送信元設定と宛先を確認してください。"
+    if "535" in lower or "authentication failed" in lower or "authentication unsuccessful" in lower:
+        return "SMTP認証エラー", "送信元メールアドレス、SMTPパスワード、アプリパスワードを確認してください。"
+    if "getaddrinfo" in lower or "name or service not known" in lower or "nodename" in lower:
+        return "SMTPサーバー名エラー", "SMTPサーバー名が正しいか確認してください。Xserverなら sv数字.xserver.jp の形式です。"
+    if "timed out" in lower or "connection refused" in lower or "network is unreachable" in lower:
+        return "接続エラー", "SMTPサーバー、ポート番号、SSL設定の組み合わせを確認してください。"
+    if "wrong version number" in lower or "unknown protocol" in lower or ("ssl" in lower and "wrong" in lower):
+        return "SSL/ポート設定エラー", "587ならSSL OFF、465ならSSL ONにしてください。"
+    if "starttls" in lower:
+        return "STARTTLSエラー", "587でSSL OFF、または465でSSL ONを試してください。"
+    if "sender address rejected" in lower or "relay access denied" in lower or "553" in lower:
+        return "送信元アドレス不一致", "送信元メールアドレスとSMTPアカウントが同じメールか確認してください。"
+    if "recipient address rejected" in lower or "user unknown" in lower or "mailbox unavailable" in lower or "550" in lower:
+        return "宛先メールアドレス不正", "宛先が存在しない、または受信拒否の可能性があります。削除または確認してください。"
+    if "quota" in lower or "rate limit" in lower or "too many" in lower or "daily" in lower or "421" in lower or "450" in lower or "451" in lower or "452" in lower:
+        return "送信制限の可能性", "短時間に送りすぎた可能性があります。件数を減らすか、送信間隔を長くしてください。"
+    if "spam" in lower or "blocked" in lower or "blacklist" in lower or "policy" in lower or "554" in lower:
+        return "迷惑メール判定/ポリシー拒否", "本文、URL、送信頻度、送信元ドメインの信頼性を見直してください。"
+    return "その他の送信エラー", "詳細エラーを確認し、SMTP設定・宛先・送信頻度を順番に確認してください。"
+
+
 def check_smtp_login() -> tuple[bool, str]:
     if not smtp_configured():
         return False, "送信元メール設定が未完了です。SMTPサーバー、ポート、送信元メールアドレス、SMTPパスワードを入力してください。"
@@ -2217,8 +2243,12 @@ def prepare_send_history_display(frame: pd.DataFrame) -> pd.DataFrame:
     display["メールアドレス"] = display["email"].replace("", "-")
     display["名前"] = display["name"].replace("", "-")
     display["件名"] = display["subject"].replace("", "-")
+    failure_info = display["error"].apply(classify_send_failure)
+    display["原因分類"] = failure_info.apply(lambda item: item[0])
+    display["対応の目安"] = failure_info.apply(lambda item: item[1])
     display["失敗理由"] = display["error"].replace("", "-")
-    return display[["日時", "状態", "配信名", "チャンネル", "メールアドレス", "名前", "件名", "失敗理由"]]
+    display.loc[display["状態"] != "失敗", ["原因分類", "対応の目安", "失敗理由"]] = "-"
+    return display[["日時", "状態", "原因分類", "配信名", "チャンネル", "メールアドレス", "名前", "件名", "対応の目安", "失敗理由"]]
 
 
 def fetch_campaign_template_stats(template_names: list[str]) -> pd.DataFrame:
@@ -3091,18 +3121,28 @@ def main() -> None:
         if not failed_sends.empty:
             with st.expander(f"送信失敗理由の一覧（直近{len(failed_sends)}件）"):
                 st.caption("送信できなかった宛先だけを表示します。不要な宛先は削除して、今後取り込まないようにできます。")
-                header = st.columns([1.5, 2.0, 2.1, 3.0, 1.3, 1.3])
-                headers = ["チャンネル", "メールアドレス", "件名", "失敗理由", "日時", "操作"]
+                failed_summary = failed_sends.copy()
+                failed_summary[["原因分類", "対応の目安"]] = failed_summary["error"].apply(
+                    lambda error: pd.Series(classify_send_failure(error))
+                )
+                cause_counts = failed_summary["原因分類"].value_counts().reset_index()
+                cause_counts.columns = ["原因分類", "件数"]
+                st.dataframe(cause_counts, use_container_width=True, hide_index=True)
+
+                header = st.columns([1.3, 1.8, 1.8, 1.8, 2.6, 1.2, 1.2])
+                headers = ["チャンネル", "メールアドレス", "件名", "原因分類", "対応の目安", "日時", "操作"]
                 for column, label in zip(header, headers):
                     column.markdown(f"**{label}**")
                 for row in failed_sends.itertuples():
-                    columns = st.columns([1.5, 2.0, 2.1, 3.0, 1.3, 1.3])
+                    cause_label, action_hint = classify_send_failure(row.error)
+                    columns = st.columns([1.3, 1.8, 1.8, 1.8, 2.6, 1.2, 1.2])
                     columns[0].write(row.channel or "-")
                     columns[1].write(row.email or "-")
                     columns[2].write(row.subject or "-")
-                    columns[3].write(row.error or "-")
-                    columns[4].write(row.sent_at or "-")
-                    if row.contact_id and columns[5].button("削除して除外", key=f"delete_failed_send_{row.send_id}"):
+                    columns[3].write(cause_label)
+                    columns[4].write(action_hint)
+                    columns[5].write(format_jst_datetime(row.sent_at) if row.sent_at else "-")
+                    if row.contact_id and columns[6].button("削除して除外", key=f"delete_failed_send_{row.send_id}"):
                         delete_contact(int(row.contact_id), block=True, reason="送信失敗")
                         st.success(f"{row.email} を削除し、再取り込みしないようにしました")
                         st.rerun()
