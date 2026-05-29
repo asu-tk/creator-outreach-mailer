@@ -38,6 +38,8 @@ ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 DB_PATH = DATA_DIR / "mailer.sqlite3"
 APP_TIMEZONE = ZoneInfo("Asia/Tokyo")
+CONTACT_STATUS_OPTIONS = ["未確認", "メール確認済み", "送信対象", "返信あり", "見込みあり", "除外"]
+SENDABLE_CONTACT_STATUSES = {"未確認", "メール確認済み", "送信対象"}
 
 YOUTUBE_VIDEO_CATEGORIES = {
     "エンターテイメント": "24",
@@ -578,6 +580,8 @@ def init_db() -> None:
                 source text not null default '',
                 consent integer not null default 0,
                 unsubscribed integer not null default 0,
+                contact_status text not null default '送信対象',
+                replied_at text not null default '',
                 token text not null unique,
                 created_at text not null
             );
@@ -668,6 +672,8 @@ def init_db() -> None:
             "youtube_view_count": "alter table contacts add column youtube_view_count integer not null default 0",
             "youtube_keyword": "alter table contacts add column youtube_keyword text not null default ''",
             "youtube_description": "alter table contacts add column youtube_description text not null default ''",
+            "contact_status": "alter table contacts add column contact_status text not null default '送信対象'",
+            "replied_at": "alter table contacts add column replied_at text not null default ''",
         }
         for column, statement in migrations.items():
             if column not in columns:
@@ -700,6 +706,8 @@ def fetch_contacts() -> pd.DataFrame:
                 c.channel,
                 c.consent,
                 c.unsubscribed,
+                c.contact_status,
+                c.replied_at,
                 c.created_at,
                 coalesce(max(s.sent_at), '') as last_sent
             from contacts c
@@ -743,6 +751,8 @@ def contacts_export_frame(contacts: pd.DataFrame) -> pd.DataFrame:
         "email": "メールアドレス",
         "name": "名前",
         "状態": "状態",
+        "contact_status": "分類",
+        "replied_at": "返信日時",
         "last_sent": "最終送信",
         "youtube_channel_url": "YouTube URL",
         "youtube_subscriber_count": "登録者数",
@@ -1254,8 +1264,9 @@ def youtube_channel_in_candidates(channel_id: str) -> bool:
     return bool(rows("select id from youtube_candidates where user_id = ? and channel_id = ?", (current_user_id(), channel_id)))
 
 
-def update_contact(contact_id: int, email: str, name: str, channel: str, consent: bool) -> tuple[bool, str]:
+def update_contact(contact_id: int, email: str, name: str, channel: str, consent: bool, contact_status: str) -> tuple[bool, str]:
     normalized_email = email.strip().lower()
+    clean_status = contact_status if contact_status in CONTACT_STATUS_OPTIONS else "送信対象"
     duplicate = rows(
         "select id from contacts where user_id = ? and email = ? and id != ?",
         (current_user_id(), normalized_email, contact_id),
@@ -1265,12 +1276,35 @@ def update_contact(contact_id: int, email: str, name: str, channel: str, consent
     execute(
         """
         update contacts
-        set email = ?, name = ?, channel = ?, consent = ?
+        set email = ?, name = ?, channel = ?, consent = ?, contact_status = ?
         where user_id = ? and id = ?
         """,
-        (normalized_email, name.strip(), channel.strip(), 1 if consent else 0, current_user_id(), contact_id),
+        (normalized_email, name.strip(), channel.strip(), 1 if consent else 0, clean_status, current_user_id(), contact_id),
     )
     return True, "宛先を更新しました"
+
+
+def mark_contact_replied(contact_id: int) -> None:
+    execute(
+        """
+        update contacts
+        set contact_status = '返信あり', replied_at = ?
+        where user_id = ? and id = ?
+        """,
+        (now_iso(), current_user_id(), int(contact_id)),
+    )
+
+
+def set_contact_status(contact_id: int, contact_status: str) -> None:
+    clean_status = contact_status if contact_status in CONTACT_STATUS_OPTIONS else "送信対象"
+    execute(
+        """
+        update contacts
+        set contact_status = ?
+        where user_id = ? and id = ?
+        """,
+        (clean_status, current_user_id(), int(contact_id)),
+    )
 
 
 def youtube_api_get(path: str, params: dict[str, str | int]) -> dict:
@@ -1815,6 +1849,7 @@ def fetch_next_send_contacts(campaign_key_value: str, limit: int) -> list[sqlite
         from contacts c
         left join sends s on s.contact_id = c.id and s.status = 'sent'
         where c.user_id = ? and c.consent = 1 and c.unsubscribed = 0 and c.email != ''
+          and coalesce(c.contact_status, '送信対象') in ('未確認', 'メール確認済み', '送信対象')
           and not exists (
               select 1
               from sends sent_campaign
@@ -2435,7 +2470,15 @@ def main() -> None:
 
         current_campaign_key = campaign_key(campaign_name)
         target_count = rows(
-            "select count(*) as count from contacts where user_id = ? and consent = 1 and unsubscribed = 0 and email != ''",
+            """
+            select count(*) as count
+            from contacts
+            where user_id = ?
+              and consent = 1
+              and unsubscribed = 0
+              and email != ''
+              and coalesce(contact_status, '送信対象') in ('未確認', 'メール確認済み', '送信対象')
+            """,
             (current_user_id(),),
         )[0]["count"]
         already_sent_count = rows(
@@ -2462,6 +2505,7 @@ def main() -> None:
               and c.consent = 1
               and c.unsubscribed = 0
               and c.email != ''
+              and coalesce(c.contact_status, '送信対象') in ('未確認', 'メール確認済み', '送信対象')
               and not exists (
                   select 1
                   from sends s
@@ -2732,6 +2776,25 @@ def main() -> None:
     if contacts.empty:
         st.write("まだ宛先がありません。")
     else:
+        replied_contacts = contacts[contacts["contact_status"].fillna("") == "返信あり"]
+        if not replied_contacts.empty:
+            with st.expander(f"返信あり管理（{len(replied_contacts)}件）"):
+                st.caption("返信があった宛先です。返信ありの宛先は自動送信対象から外れます。")
+                header = st.columns([2.0, 2.0, 1.4, 1.4, 1.0])
+                headers = ["チャンネル", "メールアドレス", "名前", "返信日時", "操作"]
+                for column, label in zip(header, headers):
+                    column.markdown(f"**{label}**")
+                for row in replied_contacts.itertuples():
+                    columns = st.columns([2.0, 2.0, 1.4, 1.4, 1.0])
+                    columns[0].write(row.channel or "-")
+                    columns[1].write(row.email or "-")
+                    columns[2].write(row.name or "-")
+                    columns[3].write(row.replied_at or "-")
+                    if columns[4].button("送信対象に戻す", key=f"restore_sendable_status_{row.id}"):
+                        set_contact_status(int(row.id), "送信対象")
+                        st.success(f"{row.email} を送信対象に戻しました")
+                        st.rerun()
+
         search_col, sort_col, direction_col = st.columns([2.4, 1.2, 1.0])
         search_text = search_col.text_input(
             "宛先一覧を検索",
@@ -2751,7 +2814,7 @@ def main() -> None:
         )
 
         if search_text:
-            search_columns = ["email", "name", "channel"]
+            search_columns = ["email", "name", "channel", "contact_status"]
             mask = contacts[search_columns].fillna("").astype(str).apply(
                 lambda column: column.str.lower().str.contains(search_text, regex=False)
             ).any(axis=1)
@@ -2803,33 +2866,44 @@ def main() -> None:
         visible_contacts = contacts.iloc[start_index:end_index]
         info_col.caption(f"{total_contacts}件中 {start_index + 1}〜{end_index}件を表示 / {total_pages}ページ")
 
-        header = st.columns([2.0, 2.4, 1.4, 0.9, 1.5, 0.9, 0.7, 0.7])
-        headers = ["チャンネル", "email", "name", "状態", "last_sent", "候補へ戻す", "保存", "削除"]
+        header = st.columns([1.7, 2.1, 1.2, 1.2, 1.2, 0.9, 0.8, 0.7, 0.7])
+        headers = ["チャンネル", "email", "name", "分類", "last_sent", "返信あり", "候補へ戻す", "保存", "削除"]
         for column, label in zip(header, headers):
             column.markdown(f"**{label}**")
 
         for row in visible_contacts.itertuples():
-            columns = st.columns([2.0, 2.4, 1.4, 0.9, 1.5, 0.9, 0.7, 0.7])
+            columns = st.columns([1.7, 2.1, 1.2, 1.2, 1.2, 0.9, 0.8, 0.7, 0.7])
             edited_channel = columns[0].text_input("channel", value=row.channel or "", key=f"contact_channel_{row.id}", label_visibility="collapsed")
             edited_email = columns[1].text_input("email", value=row.email or "", key=f"contact_email_{row.id}", label_visibility="collapsed")
             edited_name = columns[2].text_input("name", value=row.name or "", key=f"contact_name_{row.id}", label_visibility="collapsed")
-            columns[3].write(row.状態)
+            current_status = row.contact_status if row.contact_status in CONTACT_STATUS_OPTIONS else "送信対象"
+            edited_status = columns[3].selectbox(
+                "分類",
+                CONTACT_STATUS_OPTIONS,
+                index=CONTACT_STATUS_OPTIONS.index(current_status),
+                key=f"contact_status_{row.id}",
+                label_visibility="collapsed",
+            )
             columns[4].write(row.last_sent or "-")
-            if columns[5].button("戻す", key=f"restore_candidate_{row.id}"):
+            if columns[5].button("返信あり", key=f"mark_replied_{row.id}", disabled=current_status == "返信あり"):
+                mark_contact_replied(int(row.id))
+                st.success(f"{row.email} を返信ありにしました。今後の自動送信対象から外れます。")
+                st.rerun()
+            if columns[6].button("戻す", key=f"restore_candidate_{row.id}"):
                 ok, message = save_candidate_from_contact(int(row.id))
                 if ok:
                     st.success(message)
                     st.rerun()
                 else:
                     st.warning(message)
-            if columns[6].button("保存", key=f"save_contact_{row.id}"):
-                ok, message = update_contact(int(row.id), edited_email, edited_name, edited_channel, True)
+            if columns[7].button("保存", key=f"save_contact_{row.id}"):
+                ok, message = update_contact(int(row.id), edited_email, edited_name, edited_channel, True, edited_status)
                 if ok:
                     st.success(message)
                     st.rerun()
                 else:
                     st.error(message)
-            if columns[7].button("削除", key=f"delete_contact_{row.id}"):
+            if columns[8].button("削除", key=f"delete_contact_{row.id}"):
                 delete_contact(int(row.id), block=True, reason="手動削除")
                 st.success(f"{row.email} を削除しました")
                 st.rerun()
