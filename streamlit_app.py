@@ -1596,7 +1596,14 @@ def settings_panel() -> None:
     sender_email = st.text_input("送信元メールアドレス", key="smtp_sender_email_input")
     smtp_host = st.text_input("SMTPサーバー", key="smtp_host_input")
     smtp_port = st.text_input("SMTPポート", key="smtp_port_input")
-    smtp_ssl = st.checkbox("SSL接続を使う", key="smtp_ssl_input")
+    smtp_ssl = st.checkbox("SSL接続を使う（465の場合だけON。587の場合はOFF）", key="smtp_ssl_input")
+    port_text = str(smtp_port).strip()
+    if port_text == "587" and smtp_ssl:
+        st.warning("587を使う場合は、SSL接続をOFFにしてください。587はSTARTTLSで送信します。")
+    elif port_text == "465" and not smtp_ssl:
+        st.warning("465を使う場合は、SSL接続をONにしてください。465はSSL/TLSで送信します。")
+    else:
+        st.caption("Xserverの目安: 587ならSSL OFF、465ならSSL ONです。")
     editing_account_id = int(st.session_state.get("smtp_account_id_input") or 0)
     if selected_account == "新しく作る":
         editing_account_id = 0
