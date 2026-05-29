@@ -419,7 +419,8 @@ def require_active_subscription() -> None:
             if sync_subscription_from_stripe(email):
                 subscription = get_subscription_status(email)
         except Exception as exc:
-            st.warning(f"Stripeの課金状態確認に失敗しました: {exc}")
+            if email in admin_emails():
+                st.warning(f"Stripeの課金状態確認に失敗しました: {exc}")
     if subscription_active(subscription):
         return
     st.title("Creator Outreach Mailer")
@@ -434,9 +435,12 @@ def require_active_subscription() -> None:
                     st.success("決済状態を確認しました。アプリを開き直します。")
                     st.rerun()
                 else:
-                    st.error("このGoogleメールアドレスの有効なサブスクリプションが見つかりませんでした。")
+                    st.info("まだ有料プランの登録を確認できませんでした。決済が完了している場合は、少し時間を置いてからもう一度お試しください。")
             except Exception as exc:
-                st.error(f"決済状態の確認に失敗しました: {exc}")
+                if email in admin_emails():
+                    st.error(f"決済状態の確認に失敗しました: {exc}")
+                else:
+                    st.info("現在、決済状態を確認できませんでした。少し時間を置いてからもう一度お試しください。")
     else:
         st.info("現在、決済ページを準備中です。管理者にお問い合わせください。")
     st.stop()
@@ -521,6 +525,20 @@ def init_db() -> None:
                 primary key (user_id, key)
             );
 
+            create table if not exists smtp_accounts (
+                id integer primary key autoincrement,
+                user_id text not null default 'local-user',
+                label text not null default '',
+                sender_name text not null default '',
+                sender_email text not null default '',
+                smtp_host text not null default '',
+                smtp_port text not null default '587',
+                smtp_ssl integer not null default 0,
+                smtp_pass text not null default '',
+                created_at text not null,
+                updated_at text not null
+            );
+
             create table if not exists youtube_candidates (
                 id integer primary key autoincrement,
                 user_id text not null default 'local-user',
@@ -577,7 +595,7 @@ def init_db() -> None:
         for column, statement in migrations.items():
             if column not in columns:
                 db.execute(statement)
-        for table in ["sends", "settings", "youtube_candidates", "youtube_api_usage", "blocked_targets", "campaign_templates"]:
+        for table in ["sends", "settings", "youtube_candidates", "youtube_api_usage", "blocked_targets", "campaign_templates", "smtp_accounts"]:
             table_columns = [row[1] for row in db.execute(f"pragma table_info({table})").fetchall()]
             if "user_id" not in table_columns:
                 db.execute(f"alter table {table} add column user_id text not null default 'local-user'")
@@ -699,6 +717,133 @@ def save_setting(key: str, value: str) -> None:
 def delete_setting(key: str) -> None:
     scoped_key = f"{current_user_id()}::{key}"
     execute("delete from settings where key = ?", (scoped_key,))
+
+
+def fetch_smtp_accounts() -> list[sqlite3.Row]:
+    return rows(
+        """
+        select id, label, sender_name, sender_email, smtp_host, smtp_port, smtp_ssl, smtp_pass
+        from smtp_accounts
+        where user_id = ?
+        order by id asc
+        """,
+        (current_user_id(),),
+    )
+
+
+def get_smtp_account(account_id: int) -> sqlite3.Row | None:
+    matches = rows(
+        """
+        select id, label, sender_name, sender_email, smtp_host, smtp_port, smtp_ssl, smtp_pass
+        from smtp_accounts
+        where user_id = ? and id = ?
+        limit 1
+        """,
+        (current_user_id(), int(account_id)),
+    )
+    return matches[0] if matches else None
+
+
+def save_smtp_account(
+    account_id: int | None,
+    label: str,
+    sender_name: str,
+    sender_email: str,
+    smtp_host: str,
+    smtp_port: str,
+    smtp_ssl: bool,
+    smtp_pass: str,
+) -> int:
+    clean_label = label.strip() or sender_email.strip()
+    existing_pass = ""
+    if account_id:
+        existing = get_smtp_account(account_id)
+        existing_pass = existing["smtp_pass"] if existing else ""
+    password_to_save = smtp_pass or existing_pass
+    if account_id and get_smtp_account(account_id):
+        execute(
+            """
+            update smtp_accounts
+            set label = ?, sender_name = ?, sender_email = ?, smtp_host = ?, smtp_port = ?,
+                smtp_ssl = ?, smtp_pass = ?, updated_at = ?
+            where user_id = ? and id = ?
+            """,
+            (
+                clean_label,
+                sender_name.strip(),
+                sender_email.strip(),
+                smtp_host.strip(),
+                smtp_port.strip(),
+                1 if smtp_ssl else 0,
+                password_to_save,
+                now_iso(),
+                current_user_id(),
+                int(account_id),
+            ),
+        )
+        return int(account_id)
+    execute(
+        """
+        insert into smtp_accounts
+        (user_id, label, sender_name, sender_email, smtp_host, smtp_port, smtp_ssl, smtp_pass, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            current_user_id(),
+            clean_label,
+            sender_name.strip(),
+            sender_email.strip(),
+            smtp_host.strip(),
+            smtp_port.strip(),
+            1 if smtp_ssl else 0,
+            password_to_save,
+            now_iso(),
+            now_iso(),
+        ),
+    )
+    account = rows(
+        "select id from smtp_accounts where user_id = ? order by id desc limit 1",
+        (current_user_id(),),
+    )[0]
+    return int(account["id"])
+
+
+def delete_smtp_account(account_id: int) -> None:
+    execute("delete from smtp_accounts where user_id = ? and id = ?", (current_user_id(), int(account_id)))
+    if get_setting("ACTIVE_SMTP_ACCOUNT_ID") == str(account_id):
+        delete_setting("ACTIVE_SMTP_ACCOUNT_ID")
+
+
+def active_smtp_account() -> dict[str, str | int]:
+    accounts = fetch_smtp_accounts()
+    active_id = get_setting("ACTIVE_SMTP_ACCOUNT_ID")
+    if active_id:
+        try:
+            selected = get_smtp_account(int(active_id))
+            if selected:
+                return dict(selected)
+        except ValueError:
+            pass
+    if accounts:
+        return dict(accounts[0])
+    sender_name = get_setting("SENDER_NAME", "")
+    sender_email = get_setting("SMTP_USER", "")
+    return {
+        "id": 0,
+        "label": sender_email or "送信元設定",
+        "sender_name": sender_name,
+        "sender_email": sender_email,
+        "smtp_host": get_setting("SMTP_HOST", "smtp.gmail.com"),
+        "smtp_port": get_setting("SMTP_PORT", "587"),
+        "smtp_ssl": 1 if get_setting("SMTP_SSL", "false").lower() in {"1", "true", "yes"} else 0,
+        "smtp_pass": get_setting("SMTP_PASS", ""),
+    }
+
+
+def smtp_mail_from(account: dict[str, str | int]) -> str:
+    sender_name = str(account.get("sender_name") or "").strip()
+    sender_email = str(account.get("sender_email") or "").strip()
+    return f"{sender_name} <{sender_email}>" if sender_name else sender_email
 
 
 def fetch_campaign_templates() -> list[sqlite3.Row]:
@@ -1076,8 +1221,11 @@ def rows(query: str, params: tuple = ()) -> list[sqlite3.Row]:
 
 
 def smtp_configured() -> bool:
-    required = ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "MAIL_FROM"]
-    return all(get_secret(key) for key in required)
+    account = active_smtp_account()
+    return all(
+        str(account.get(key) or "").strip()
+        for key in ["smtp_host", "smtp_port", "sender_email", "smtp_pass"]
+    )
 
 
 def render_template(text: str, contact: sqlite3.Row, unsubscribe_url: str) -> str:
@@ -1091,7 +1239,8 @@ def render_template(text: str, contact: sqlite3.Row, unsubscribe_url: str) -> st
 
 
 def build_unsubscribe_mailto(contact: sqlite3.Row) -> str:
-    reply_to = get_secret("UNSUBSCRIBE_EMAIL", "") or get_secret("SMTP_USER", "")
+    account = active_smtp_account()
+    reply_to = get_secret("UNSUBSCRIBE_EMAIL", "") or str(account.get("sender_email") or "")
     subject = "配信停止希望"
     body = (
         "配信停止を希望します。\n\n"
@@ -1105,25 +1254,28 @@ def send_email(to_email: str, subject: str, body: str) -> tuple[bool, str]:
     if not smtp_configured():
         return True, "DRY_RUN: SMTP設定がないため実送信はしていません"
 
+    account = active_smtp_account()
     message = EmailMessage()
-    message["From"] = get_secret("MAIL_FROM")
+    message["From"] = smtp_mail_from(account)
     message["To"] = to_email
     message["Subject"] = subject
     message.set_content(body)
 
-    host = get_secret("SMTP_HOST")
-    port = int(get_secret("SMTP_PORT", "587"))
-    use_ssl = get_secret("SMTP_SSL").lower() in {"1", "true", "yes"}
+    host = str(account.get("smtp_host") or "")
+    port = int(str(account.get("smtp_port") or "587"))
+    use_ssl = int(account.get("smtp_ssl") or 0) == 1
+    sender_email = str(account.get("sender_email") or "")
+    smtp_pass = str(account.get("smtp_pass") or "")
 
     try:
         if use_ssl:
             with smtplib.SMTP_SSL(host, port, timeout=30) as smtp:
-                smtp.login(get_secret("SMTP_USER"), get_secret("SMTP_PASS"))
+                smtp.login(sender_email, smtp_pass)
                 smtp.send_message(message)
         else:
             with smtplib.SMTP(host, port, timeout=30) as smtp:
                 smtp.starttls()
-                smtp.login(get_secret("SMTP_USER"), get_secret("SMTP_PASS"))
+                smtp.login(sender_email, smtp_pass)
                 smtp.send_message(message)
         return True, "送信しました"
     except Exception as exc:
@@ -1184,68 +1336,120 @@ def add_contact(
 
 def settings_panel() -> None:
     st.subheader("送信元メール設定")
-    st.caption("ここで登録したメールアカウントから送信されます。相手には「送信者表示名 <送信元メールアドレス>」の形で見えます。")
+    st.caption("複数の送信元メールを登録し、送信時に使うアカウントを選べます。相手には「送信者表示名 <送信元メールアドレス>」の形で見えます。")
 
-    current_from = get_setting("MAIL_FROM")
-    current_user = get_setting("SMTP_USER")
-    current_host = get_setting("SMTP_HOST", "smtp.gmail.com")
-    current_port = get_setting("SMTP_PORT", "587")
-    current_ssl = get_setting("SMTP_SSL", "false").lower() in {"1", "true", "yes"}
+    accounts = fetch_smtp_accounts()
+    account_labels = [f"{account['label']} / {account['sender_email']}" for account in accounts]
+    account_ids = [int(account["id"]) for account in accounts]
+    active_account = active_smtp_account()
+    active_account_id = int(active_account.get("id") or 0)
     current_youtube_api_key = get_setting("YOUTUBE_API_KEY")
     current_youtube_daily_limit = get_youtube_daily_limit()
-    has_password = bool(get_setting("SMTP_PASS"))
 
-    with st.form("mail_settings"):
-        sender_name = st.text_input("送信者表示名", value=get_setting("SENDER_NAME", ""))
-        sender_email = st.text_input("送信元メールアドレス", value=current_user)
-        smtp_host = st.text_input("SMTPサーバー", value=current_host)
-        smtp_port = st.text_input("SMTPポート", value=current_port)
-        smtp_ssl = st.checkbox("SSL接続を使う", value=current_ssl)
-        smtp_pass = st.text_input(
-            "SMTPパスワード / アプリパスワード",
-            type="password",
-            placeholder="保存済み" if has_password else "Gmailの場合はアプリパスワード",
-        )
-        youtube_api_key = st.text_input(
-            "YouTube APIキー",
-            type="password",
-            placeholder="保存済み" if current_youtube_api_key else "Google Cloud ConsoleのAPIキー",
-        )
-        youtube_daily_limit = st.number_input(
-            "YouTube API 1日上限 units",
-            min_value=1,
-            value=current_youtube_daily_limit,
-            step=100,
-        )
-        submitted = st.form_submit_button("送信元設定を保存")
+    if "smtp_account_id_input" not in st.session_state:
+        st.session_state["smtp_account_id_input"] = active_account_id
+    if "smtp_label_input" not in st.session_state:
+        st.session_state["smtp_label_input"] = str(active_account.get("label") or "")
+    if "smtp_sender_name_input" not in st.session_state:
+        st.session_state["smtp_sender_name_input"] = str(active_account.get("sender_name") or "")
+    if "smtp_sender_email_input" not in st.session_state:
+        st.session_state["smtp_sender_email_input"] = str(active_account.get("sender_email") or "")
+    if "smtp_host_input" not in st.session_state:
+        st.session_state["smtp_host_input"] = str(active_account.get("smtp_host") or "smtp.gmail.com")
+    if "smtp_port_input" not in st.session_state:
+        st.session_state["smtp_port_input"] = str(active_account.get("smtp_port") or "587")
+    if "smtp_ssl_input" not in st.session_state:
+        st.session_state["smtp_ssl_input"] = int(active_account.get("smtp_ssl") or 0) == 1
 
-    if submitted:
-        mail_from = f"{sender_name.strip()} <{sender_email.strip()}>" if sender_name.strip() else sender_email.strip()
-        save_setting("SENDER_NAME", sender_name.strip())
-        save_setting("SMTP_HOST", smtp_host.strip())
-        save_setting("SMTP_PORT", smtp_port.strip())
-        save_setting("SMTP_USER", sender_email.strip())
-        save_setting("MAIL_FROM", mail_from)
-        save_setting("SMTP_SSL", "true" if smtp_ssl else "false")
-        if smtp_pass:
-            save_setting("SMTP_PASS", smtp_pass)
+    options = ["新しく作る"] + account_labels
+    selected_index = 0
+    if active_account_id in account_ids:
+        selected_index = account_ids.index(active_account_id) + 1
+    selected_account = st.selectbox("保存済み送信元", options, index=selected_index)
+    load_col, save_col, delete_col = st.columns(3)
+    selected_account_id = 0
+    if selected_account != "新しく作る":
+        selected_account_id = account_ids[options.index(selected_account) - 1]
+    if load_col.button("読み込む", use_container_width=True, disabled=selected_account_id == 0):
+        account = get_smtp_account(selected_account_id)
+        if account:
+            st.session_state["smtp_account_id_input"] = int(account["id"])
+            st.session_state["smtp_label_input"] = account["label"]
+            st.session_state["smtp_sender_name_input"] = account["sender_name"]
+            st.session_state["smtp_sender_email_input"] = account["sender_email"]
+            st.session_state["smtp_host_input"] = account["smtp_host"]
+            st.session_state["smtp_port_input"] = account["smtp_port"]
+            st.session_state["smtp_ssl_input"] = int(account["smtp_ssl"]) == 1
+            save_setting("ACTIVE_SMTP_ACCOUNT_ID", str(account["id"]))
+            st.rerun()
+
+    account_label = st.text_input("設定名", key="smtp_label_input", placeholder="例: UniVerse公式")
+    sender_name = st.text_input("送信者表示名", key="smtp_sender_name_input")
+    sender_email = st.text_input("送信元メールアドレス", key="smtp_sender_email_input")
+    smtp_host = st.text_input("SMTPサーバー", key="smtp_host_input")
+    smtp_port = st.text_input("SMTPポート", key="smtp_port_input")
+    smtp_ssl = st.checkbox("SSL接続を使う", key="smtp_ssl_input")
+    editing_account_id = int(st.session_state.get("smtp_account_id_input") or 0)
+    if selected_account == "新しく作る":
+        editing_account_id = 0
+    editing_account = get_smtp_account(editing_account_id) if editing_account_id else None
+    has_password = bool(editing_account["smtp_pass"]) if editing_account else False
+    smtp_pass = st.text_input(
+        "SMTPパスワード / アプリパスワード",
+        type="password",
+        placeholder="保存済み" if has_password else "Gmailの場合はアプリパスワード",
+    )
+
+    if save_col.button("保存 / 更新", use_container_width=True):
+        if not sender_email.strip():
+            st.error("送信元メールアドレスを入力してください")
+        else:
+            account_id = save_smtp_account(
+                editing_account_id or None,
+                account_label,
+                sender_name,
+                sender_email,
+                smtp_host,
+                smtp_port,
+                smtp_ssl,
+                smtp_pass,
+            )
+            save_setting("ACTIVE_SMTP_ACCOUNT_ID", str(account_id))
+            st.session_state["smtp_account_id_input"] = account_id
+            st.success(f"保存しました。相手には {smtp_mail_from(active_smtp_account())} から届きます。")
+            st.rerun()
+
+    if delete_col.button("削除", use_container_width=True, disabled=selected_account_id == 0):
+        delete_smtp_account(selected_account_id)
+        st.success("送信元設定を削除しました")
+        st.rerun()
+
+    display_account = active_smtp_account()
+    if display_account.get("sender_email"):
+        st.write(f"現在の送信元: `{smtp_mail_from(display_account)}`")
+    if has_password:
+        st.caption("パスワードは保存済みです。変更したい時だけ新しいパスワードを入力してください。")
+
+    st.divider()
+    st.caption("YouTube API設定")
+    youtube_api_key = st.text_input(
+        "YouTube APIキー",
+        type="password",
+        placeholder="保存済み" if current_youtube_api_key else "Google Cloud ConsoleのAPIキー",
+    )
+    youtube_daily_limit = st.number_input(
+        "YouTube API 1日上限 units",
+        min_value=1,
+        value=current_youtube_daily_limit,
+        step=100,
+    )
+    if st.button("YouTube API設定を保存"):
         if youtube_api_key:
             save_setting("YOUTUBE_API_KEY", youtube_api_key.strip())
         save_setting("YOUTUBE_DAILY_LIMIT", str(int(youtube_daily_limit)))
-        st.success(f"保存しました。相手には {mail_from} から届きます。")
-
-    if current_from:
-        st.write(f"現在の表示: `{current_from}`")
-    if has_password:
-        st.caption("パスワードは保存済みです。変更したい時だけ新しいパスワードを入力してください。")
+        st.success("YouTube API設定を保存しました")
     if current_youtube_api_key:
         st.caption("YouTube APIキーは保存済みです。変更したい時だけ新しいキーを入力してください。")
-
-    if st.button("送信元設定を削除"):
-        for key in ["SENDER_NAME", "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "MAIL_FROM", "SMTP_SSL", "APP_BASE_URL", "UNSUBSCRIBE_EMAIL", "YOUTUBE_API_KEY"]:
-            delete_setting(key)
-        st.success("送信元設定を削除しました")
-        st.rerun()
 
 
 def normalize_column_name(value: object) -> str:
