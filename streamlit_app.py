@@ -3269,13 +3269,17 @@ def main() -> None:
                 else:
                     st.caption("ドラッグで並び替えるには、依存パッケージの反映後にアプリを再起動してください。")
         if template_names:
+            normal_template_names = [name for name in template_names if name.strip() not in scenario_template_names]
             with st.expander("配信テンプレートごとの成績"):
-                st.caption("配信名ごとの送信済み・失敗・送信待ち・配信停止を確認できます。配信停止は、その宛先へ最後に送った配信テンプレートに紐づけて記録します。")
-                st.dataframe(
-                    fetch_campaign_template_stats(template_names),
-                    use_container_width=True,
-                    hide_index=True,
-                )
+                st.caption("通常配信用テンプレートの送信済み・失敗・送信待ち・配信停止を確認できます。シナリオに含まれるテンプレートは、下の「シナリオごとの成績」で確認できます。")
+                if normal_template_names:
+                    st.dataframe(
+                        fetch_campaign_template_stats(normal_template_names),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                else:
+                    st.write("通常配信用のテンプレートはありません。シナリオに含まれるテンプレートは「シナリオごとの成績」で確認してください。")
         if template_names:
             scenarios = fetch_scenarios()
             with st.expander("シナリオ設定"):
