@@ -250,8 +250,63 @@ def google_access_token() -> str:
     return ""
 
 
+def google_service_account_info() -> dict:
+    info: dict = {}
+    try:
+        section = st.secrets.get("google_service_account", {})
+        if section:
+            info = dict(section)
+    except Exception:
+        info = {}
+    if not info:
+        raw_json = ""
+        try:
+            raw_json = str(st.secrets.get("GOOGLE_SERVICE_ACCOUNT_JSON", ""))
+        except Exception:
+            raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+        if raw_json.strip():
+            try:
+                info = json.loads(raw_json)
+            except json.JSONDecodeError:
+                info = {}
+    private_key = str(info.get("private_key") or "")
+    if "\\n" in private_key:
+        info["private_key"] = private_key.replace("\\n", "\n")
+    return info
+
+
+def google_service_account_email() -> str:
+    return str(google_service_account_info().get("client_email") or "")
+
+
+def google_service_account_configured() -> bool:
+    info = google_service_account_info()
+    return bool(info.get("client_email") and info.get("private_key") and info.get("token_uri"))
+
+
+def google_service_account_token(scopes: list[str]) -> str:
+    info = google_service_account_info()
+    if not google_service_account_configured():
+        raise ValueError("Googleシートへ書き込むには、Streamlit Secretsにgoogle_service_accountを設定してください。")
+    try:
+        from google.oauth2 import service_account
+        from google.auth.transport.requests import Request
+    except Exception as exc:
+        raise ValueError("Googleシート連携に必要なgoogle-authがインストールされていません。") from exc
+    credentials = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+    credentials.refresh(Request())
+    return str(credentials.token or "")
+
+
 def google_sheet_write_ready() -> tuple[bool, str]:
-    return False, GOOGLE_SHEET_WRITE_DISABLED_MESSAGE
+    if not google_service_account_configured():
+        return False, "Googleシートへ自動反映するには、サービスアカウント設定が必要です。"
+    try:
+        from google.oauth2 import service_account  # noqa: F401
+        from google.auth.transport.requests import Request  # noqa: F401
+    except Exception:
+        return False, "Googleシート連携に必要なgoogle-authがインストールされていません。"
+    return True, ""
 
 
 def google_api_request(method: str, url: str, token: str, payload: dict | None = None) -> dict:
@@ -936,9 +991,17 @@ def create_outsource_spreadsheet(token: str) -> tuple[str, str]:
 def get_or_create_outsource_spreadsheet(token: str) -> tuple[str, str]:
     spreadsheet_id = get_setting("OUTSOURCE_SPREADSHEET_ID").strip()
     spreadsheet_url = get_setting("OUTSOURCE_SPREADSHEET_URL").strip()
+    if spreadsheet_url:
+        try:
+            extracted_id = extract_google_file_id(spreadsheet_url, "spreadsheets")
+            if extracted_id and extracted_id != spreadsheet_id:
+                spreadsheet_id = extracted_id
+                save_setting("OUTSOURCE_SPREADSHEET_ID", spreadsheet_id)
+        except Exception:
+            pass
     if spreadsheet_id and spreadsheet_url:
         return spreadsheet_id, spreadsheet_url
-    return create_outsource_spreadsheet(token)
+    raise ValueError("先に空のGoogleスプレッドシートを作り、そのURLを登録してください。")
 
 
 def get_outsource_sheet_id(token: str, spreadsheet_id: str) -> int:
@@ -965,15 +1028,76 @@ def get_outsource_sheet_id(token: str, spreadsheet_id: str) -> int:
     )
 
 
+def google_sheet_range(sheet_name: str, cell_range: str = "A:Z") -> str:
+    escaped_name = sheet_name.replace("'", "''")
+    return f"'{escaped_name}'!{cell_range}"
+
+
+def google_values_to_frame(values: list[list]) -> pd.DataFrame:
+    if not values:
+        return pd.DataFrame()
+    header = [str(value).strip() for value in values[0]]
+    if not any(header):
+        return pd.DataFrame()
+    width = len(header)
+    rows = []
+    for row in values[1:]:
+        normalized = [str(value) for value in row[:width]]
+        if len(normalized) < width:
+            normalized.extend([""] * (width - len(normalized)))
+        rows.append(normalized)
+    return pd.DataFrame(rows, columns=header).fillna("")
+
+
+def read_google_sheet_url_with_service_account(url: str) -> pd.DataFrame:
+    token = google_service_account_token(["https://www.googleapis.com/auth/spreadsheets.readonly"])
+    spreadsheet_id = extract_google_file_id(url, "spreadsheets")
+    target_gid = extract_google_sheet_gid(url)
+    metadata = google_api_request(
+        "GET",
+        f"https://sheets.googleapis.com/v4/spreadsheets/{urllib.parse.quote(spreadsheet_id, safe='')}",
+        token,
+    )
+    sheets = metadata.get("sheets", [])
+    target_title = ""
+    for sheet in sheets:
+        properties = sheet.get("properties", {})
+        if properties.get("title") == OUTSOURCE_SHEET_NAME:
+            target_title = str(properties.get("title") or "")
+            break
+    if not target_title:
+        for sheet in sheets:
+            properties = sheet.get("properties", {})
+            if str(properties.get("sheetId") or "") == str(target_gid):
+                target_title = str(properties.get("title") or "")
+                break
+    if not target_title and sheets:
+        target_title = str(sheets[0].get("properties", {}).get("title") or "")
+    if not target_title:
+        raise ValueError("Googleシート内のタブを読み取れませんでした。")
+    range_name = urllib.parse.quote(google_sheet_range(target_title), safe="")
+    result = google_api_request(
+        "GET",
+        f"https://sheets.googleapis.com/v4/spreadsheets/{urllib.parse.quote(spreadsheet_id, safe='')}/values/{range_name}",
+        token,
+    )
+    return google_values_to_frame(result.get("values", []))
+
+
 def update_outsource_spreadsheet(candidates: pd.DataFrame, share_with_link: bool = False) -> tuple[str, int]:
     ready, message = google_sheet_write_ready()
     if not ready:
         raise ValueError(message)
-    token = google_access_token()
+    token = google_service_account_token(
+        [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive.file",
+        ]
+    )
     spreadsheet_id, spreadsheet_url = get_or_create_outsource_spreadsheet(token)
     sheet_id = get_outsource_sheet_id(token, spreadsheet_id)
     encoded_id = urllib.parse.quote(spreadsheet_id, safe="")
-    encoded_range = urllib.parse.quote(f"{OUTSOURCE_SHEET_NAME}!A:Z", safe="")
+    encoded_range = urllib.parse.quote(google_sheet_range(OUTSOURCE_SHEET_NAME), safe="")
     google_api_request(
         "POST",
         f"https://sheets.googleapis.com/v4/spreadsheets/{encoded_id}/values/{encoded_range}:clear",
@@ -981,7 +1105,7 @@ def update_outsource_spreadsheet(candidates: pd.DataFrame, share_with_link: bool
         {},
     )
     values = outsource_sheet_values(candidates)
-    update_range = urllib.parse.quote(f"{OUTSOURCE_SHEET_NAME}!A1", safe="")
+    update_range = urllib.parse.quote(google_sheet_range(OUTSOURCE_SHEET_NAME, "A1"), safe="")
     google_api_request(
         "PUT",
         f"https://sheets.googleapis.com/v4/spreadsheets/{encoded_id}/values/{update_range}?valueInputOption=RAW",
@@ -3622,6 +3746,12 @@ def read_google_csv_bytes(data: bytes) -> pd.DataFrame:
 
 
 def read_google_sheet_url(url: str) -> pd.DataFrame:
+    service_account_error = ""
+    if google_service_account_configured():
+        try:
+            return read_google_sheet_url_with_service_account(url)
+        except Exception as exc:
+            service_account_error = describe_google_download_error(exc)
     gid = extract_google_sheet_gid(url)
     published_id = extract_google_published_file_id(url, "spreadsheets")
     if published_id:
@@ -3632,6 +3762,8 @@ def read_google_sheet_url(url: str) -> pd.DataFrame:
         export_urls = build_google_sheet_csv_urls(sheet_id, gid, resource_key)
 
     errors: list[str] = []
+    if service_account_error:
+        errors.append(service_account_error)
     for export_url in export_urls:
         try:
             return read_google_csv_bytes(fetch_public_google_url(export_url))
@@ -5187,6 +5319,12 @@ def main() -> None:
             placeholder="https://docs.google.com/spreadsheets/d/...",
             key="registered_outsource_sheet_url",
         )
+        ready_for_sheet, sheet_ready_message = google_sheet_write_ready()
+        service_account_email = google_service_account_email()
+        if service_account_email:
+            st.caption(f"このGoogleシートを {service_account_email} に編集者として共有すると、アプリが候補一覧を書き込めます。")
+        elif not ready_for_sheet:
+            st.info("空のGoogleシートへ自動で候補を書き込むには、アプリ用のサービスアカウント設定が必要です。設定が済むまではURLからの読み込みだけ使えます。")
         save_url_col, open_url_col = st.columns(2)
         if save_url_col.button("このURLを保存", key="save_outsource_sheet_url", use_container_width=True):
             cleaned_outsource_url = registered_outsource_url.strip()
@@ -5194,9 +5332,17 @@ def main() -> None:
             st.session_state["last_outsource_sheet_url"] = cleaned_outsource_url
             if cleaned_outsource_url:
                 st.success("外注用GoogleシートURLを保存しました。")
+                if ready_for_sheet and not candidates.empty:
+                    try:
+                        spreadsheet_url, exported_count = update_outsource_spreadsheet(candidates, False)
+                        st.success(f"候補{exported_count}件をGoogleシートへ反映しました。")
+                        st.session_state["last_outsource_sheet_url"] = spreadsheet_url
+                    except Exception as exc:
+                        st.warning(f"URLは保存しましたが、シートへの反映はできませんでした: {exc}")
+                elif not ready_for_sheet:
+                    st.caption(sheet_ready_message)
             else:
                 st.success("外注用GoogleシートURLを空にしました。")
-            st.rerun()
 
         active_outsource_url = str(
             st.session_state.get("last_outsource_sheet_url") or registered_outsource_url.strip() or stored_outsource_url
@@ -5205,7 +5351,16 @@ def main() -> None:
             open_url_col.link_button("登録したGoogleシートを開く", active_outsource_url, use_container_width=True)
         else:
             open_url_col.button("登録したGoogleシートを開く", key="open_empty_outsource_sheet_url", use_container_width=True, disabled=True)
-        st.caption("列名は「チャンネル名」「YouTube URL」「メールアドレス」「メモ」があれば取り込めます。外注さんにはメールアドレス欄を入力してもらってください。")
+        sync_disabled = not (active_outsource_url.startswith("http") and ready_for_sheet and not candidates.empty)
+        if st.button("候補一覧を登録済みシートへ反映", key="sync_outsource_sheet", use_container_width=True, disabled=sync_disabled):
+            save_setting("OUTSOURCE_SPREADSHEET_URL", active_outsource_url)
+            try:
+                spreadsheet_url, exported_count = update_outsource_spreadsheet(candidates, False)
+                st.session_state["last_outsource_sheet_url"] = spreadsheet_url
+                st.success(f"候補{exported_count}件をGoogleシートへ反映しました。外注さんにはメールアドレス欄だけ入力してもらってください。")
+            except Exception as exc:
+                st.error(str(exc))
+        st.caption("列名はアプリが用意します。外注さんにはメールアドレス欄と必要ならメモだけ入力してもらってください。")
 
         with st.expander("CSV / Excelで作る場合の予備ダウンロード"):
             outsource_frame = candidates_outsource_frame(candidates)
