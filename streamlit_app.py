@@ -85,8 +85,7 @@ def require_login() -> bool:
         return True
     st.title("Creator Outreach Mailer")
     st.write("このアプリを使うにはGoogleログインが必要です。")
-    if st.button("Googleでログイン"):
-        st.login()
+    st.button("Googleでログイン", on_click=st.login)
     return False
 
 
