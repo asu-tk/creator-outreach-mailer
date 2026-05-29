@@ -2616,7 +2616,7 @@ def fetch_campaign_template_stats(template_names: list[str]) -> pd.DataFrame:
         records.append(
             {
                 "配信テンプレート": name,
-                "送信済み": sent_count,
+                "送信成功": sent_count,
                 "送信失敗": int(counts["failed_count"] or 0),
                 "送信待ち": int(counts["queued_count"] or 0),
                 "配信停止": int(unsubscribe_count or 0),
@@ -2659,7 +2659,7 @@ def fetch_scenario_step_stats(scenario_id: int) -> pd.DataFrame:
             {
                 "ステップ": f"{step_number}通目",
                 "配信テンプレート": step["template_name"],
-                "送信済み": sent_count,
+                "送信成功": sent_count,
                 "送信失敗": int(counts["failed_count"] or 0),
                 "送信待ち": int(counts["queued_count"] or 0),
                 "配信停止": int(unsubscribe_count or 0),
@@ -3271,7 +3271,7 @@ def main() -> None:
         if template_names:
             normal_template_names = [name for name in template_names if name.strip() not in scenario_template_names]
             with st.expander("配信テンプレートごとの成績"):
-                st.caption("通常配信用テンプレートの送信済み・失敗・送信待ち・配信停止を確認できます。シナリオに含まれるテンプレートは、下の「シナリオごとの成績」で確認できます。")
+                st.caption("通常配信用テンプレートの送信成功・失敗・送信待ち・配信停止を確認できます。シナリオに含まれるテンプレートは、下の「シナリオごとの成績」で確認できます。")
                 if normal_template_names:
                     st.dataframe(
                         fetch_campaign_template_stats(normal_template_names),
@@ -3351,7 +3351,7 @@ def main() -> None:
                     st.rerun()
             if scenarios:
                 with st.expander("シナリオごとの成績"):
-                    st.caption("シナリオを選ぶと、その中に入っている各テンプレートの送信済み・失敗・送信待ち・配信停止を確認できます。")
+                    st.caption("シナリオを選ぶと、その中に入っている各テンプレートの送信成功・失敗・送信待ち・配信停止を確認できます。")
                     scenario_stat_labels = [scenario["name"] for scenario in scenarios]
                     selected_stat_scenario_name = st.selectbox(
                         "成績を見るシナリオ",
