@@ -582,6 +582,7 @@ def init_db() -> None:
                 user_id text not null default 'local-user',
                 email text not null default '',
                 name text not null default '',
+                memo text not null default '',
                 channel text not null default '',
                 youtube_channel_id text not null default '',
                 youtube_channel_url text not null default '',
@@ -712,12 +713,18 @@ def init_db() -> None:
             "youtube_view_count": "alter table contacts add column youtube_view_count integer not null default 0",
             "youtube_keyword": "alter table contacts add column youtube_keyword text not null default ''",
             "youtube_description": "alter table contacts add column youtube_description text not null default ''",
+            "memo": "alter table contacts add column memo text not null default ''",
             "contact_status": "alter table contacts add column contact_status text not null default '送信対象'",
             "replied_at": "alter table contacts add column replied_at text not null default ''",
         }
+        added_memo_column = False
         for column, statement in migrations.items():
             if column not in columns:
                 db.execute(statement)
+                if column == "memo":
+                    added_memo_column = True
+        if added_memo_column:
+            db.execute("update contacts set memo = name where memo = '' and name != ''")
         for table in ["sends", "settings", "youtube_candidates", "youtube_api_usage", "blocked_targets", "campaign_templates", "smtp_accounts", "unsubscribe_events", "scenarios", "scenario_steps"]:
             table_columns = [row[1] for row in db.execute(f"pragma table_info({table})").fetchall()]
             if "user_id" not in table_columns:
@@ -743,6 +750,7 @@ def fetch_contacts() -> pd.DataFrame:
                 c.id,
                 c.email,
                 c.name,
+                c.memo,
                 c.channel,
                 c.consent,
                 c.unsubscribed,
@@ -787,9 +795,9 @@ def fetch_candidates() -> pd.DataFrame:
 
 def contacts_export_frame(contacts: pd.DataFrame) -> pd.DataFrame:
     export_columns = {
-        "channel": "チャンネル",
-        "email": "メールアドレス",
-        "name": "名前",
+        "channel": "チャンネル名",
+        "email": "Eメール",
+        "memo": "メモ",
         "状態": "状態",
         "contact_status": "分類",
         "replied_at": "返信日時",
@@ -1550,7 +1558,7 @@ def restore_blocked_target_by_id(blocked_id: int) -> tuple[bool, str]:
 
     restored = add_contact(
         email=email,
-        name="",
+        memo="",
         channel=channel or "名称未設定",
         consent=True,
         youtube_channel_id=youtube_channel_id,
@@ -1687,7 +1695,7 @@ def youtube_channel_in_candidates(channel_id: str) -> bool:
     return bool(rows("select id from youtube_candidates where user_id = ? and channel_id = ?", (current_user_id(), channel_id)))
 
 
-def update_contact(contact_id: int, email: str, name: str, channel: str, consent: bool, contact_status: str) -> tuple[bool, str]:
+def update_contact(contact_id: int, email: str, memo: str, channel: str, consent: bool, contact_status: str) -> tuple[bool, str]:
     normalized_email = email.strip().lower()
     clean_status = contact_status if contact_status in CONTACT_STATUS_OPTIONS else "送信対象"
     duplicate = rows(
@@ -1699,10 +1707,10 @@ def update_contact(contact_id: int, email: str, name: str, channel: str, consent
     execute(
         """
         update contacts
-        set email = ?, name = ?, channel = ?, consent = ?, contact_status = ?
+        set email = ?, memo = ?, channel = ?, consent = ?, contact_status = ?
         where user_id = ? and id = ?
         """,
-        (normalized_email, name.strip(), channel.strip(), 1 if consent else 0, clean_status, current_user_id(), contact_id),
+        (normalized_email, memo.strip(), channel.strip(), 1 if consent else 0, clean_status, current_user_id(), contact_id),
     )
     return True, "宛先を更新しました"
 
@@ -2551,6 +2559,7 @@ def fetch_send_history(limit: int = 500) -> pd.DataFrame:
                 c.channel,
                 c.email,
                 c.name,
+                c.memo,
                 s.subject,
                 s.error
             from sends s
@@ -2577,14 +2586,14 @@ def prepare_send_history_display(frame: pd.DataFrame) -> pd.DataFrame:
     display["配信名"] = display["campaign_key"].map(template_name_by_key).fillna("削除済み/不明の配信")
     display["チャンネル"] = display["channel"].replace("", "-")
     display["メールアドレス"] = display["email"].replace("", "-")
-    display["名前"] = display["name"].replace("", "-")
+    display["メモ"] = display["memo"].replace("", "-")
     display["件名"] = display["subject"].replace("", "-")
     failure_info = display["error"].apply(classify_send_failure)
     display["原因分類"] = failure_info.apply(lambda item: item[0])
     display["対応の目安"] = failure_info.apply(lambda item: item[1])
     display["失敗理由"] = display["error"].replace("", "-")
     display.loc[display["状態"] != "失敗", ["原因分類", "対応の目安", "失敗理由"]] = "-"
-    return display[["日時", "状態", "原因分類", "配信名", "チャンネル", "メールアドレス", "名前", "件名", "対応の目安", "失敗理由"]]
+    return display[["日時", "状態", "原因分類", "配信名", "チャンネル", "メールアドレス", "メモ", "件名", "対応の目安", "失敗理由"]]
 
 
 def fetch_campaign_template_stats(template_names: list[str]) -> pd.DataFrame:
@@ -2719,7 +2728,7 @@ def fetch_blocked_targets() -> pd.DataFrame:
 
 def add_contact(
     email: str,
-    name: str,
+    memo: str,
     channel: str,
     consent: bool,
     youtube_channel_id: str = "",
@@ -2743,16 +2752,16 @@ def add_contact(
         """
         insert into contacts
         (
-            user_id, email, name, channel, youtube_channel_id, youtube_channel_url,
+            user_id, email, name, memo, channel, youtube_channel_id, youtube_channel_url,
             youtube_subscriber_count, youtube_video_count, youtube_view_count,
             youtube_keyword, youtube_description, source, consent, unsubscribed, token, created_at
         )
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, 0, ?, ?)
+        values (?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, 0, ?, ?)
         """,
         (
             current_user_id(),
             normalized_email,
-            name.strip(),
+            memo.strip(),
             channel.strip(),
             youtube_channel_id.strip(),
             youtube_channel_url.strip(),
@@ -3090,7 +3099,23 @@ def import_contacts_frame(frame: pd.DataFrame) -> tuple[int, int, dict[str, str 
             "emailaddress",
         },
     ) or guess_email_column(frame)
-    name_column = find_column(frame, {"name", "名前", "担当者", "担当者名", "contact", "contactname"})
+    memo_column = find_column(
+        frame,
+        {
+            "memo",
+            "note",
+            "notes",
+            "メモ",
+            "備考",
+            "コメント",
+            "名前",
+            "name",
+            "担当者",
+            "担当者名",
+            "contact",
+            "contactname",
+        },
+    )
     channel_column = find_column(
         frame,
         {
@@ -3120,7 +3145,7 @@ def import_contacts_frame(frame: pd.DataFrame) -> tuple[int, int, dict[str, str 
         seen_in_file.add(email)
         was_added = add_contact(
             email=email,
-            name=str(row.get(name_column, "")) if name_column else "",
+            memo=str(row.get(memo_column, "")) if memo_column else "",
             channel=str(row.get(channel_column, "")) if channel_column else "",
             consent=True,
         )
@@ -3128,7 +3153,7 @@ def import_contacts_frame(frame: pd.DataFrame) -> tuple[int, int, dict[str, str 
             added += 1
         else:
             skipped += 1
-    return added, skipped, {"email": email_column, "name": name_column, "channel": channel_column}
+    return added, skipped, {"email": email_column, "memo": memo_column, "channel": channel_column}
 
 
 def import_contacts_file(uploaded_file) -> tuple[int, int, dict[str, str | None]]:
@@ -3159,7 +3184,7 @@ def import_contacts_text(text: str) -> tuple[int, int, dict[str, str | None]]:
                 skipped += 1
     if not seen:
         raise ValueError("Googleドキュメント内にメールアドレスを見つけられませんでした。")
-    return added, skipped, {"email": "本文から抽出", "name": None, "channel": "メール行から推定"}
+    return added, skipped, {"email": "本文から抽出", "memo": None, "channel": "メール行から推定"}
 
 
 def import_contacts_google_url(url: str) -> tuple[int, int, dict[str, str | None], str]:
@@ -3210,8 +3235,8 @@ def main() -> None:
         st.subheader("宛先を追加")
         with st.form("add_contact", clear_on_submit=True):
             email = st.text_input("メールアドレス")
-            name = st.text_input("名前", placeholder="例: 山田さん")
             channel = st.text_input("チャンネル名", placeholder="例: Sample Channel")
+            memo = st.text_input("メモ", placeholder="例: 返信早め / 案件候補 / 要確認")
             consent = st.checkbox("営業メール送信の許諾がある")
             submitted = st.form_submit_button("追加")
         if submitted:
@@ -3220,15 +3245,15 @@ def main() -> None:
                 blocked_reason = blocked_target_reason(normalized_email)
                 if "restore_blocked_email" not in st.session_state:
                     st.session_state["restore_blocked_email"] = ""
-                    st.session_state["restore_blocked_name"] = ""
+                    st.session_state["restore_blocked_memo"] = ""
                     st.session_state["restore_blocked_channel"] = ""
                     st.session_state["restore_blocked_consent"] = False
-                was_added = add_contact(email, name, channel, consent)
+                was_added = add_contact(email, memo, channel, consent)
                 if was_added:
                     st.success("宛先を追加しました")
                 elif blocked_reason:
                     st.session_state["restore_blocked_email"] = normalized_email
-                    st.session_state["restore_blocked_name"] = name
+                    st.session_state["restore_blocked_memo"] = memo
                     st.session_state["restore_blocked_channel"] = channel
                     st.session_state["restore_blocked_consent"] = consent
                     st.warning(
@@ -3248,7 +3273,7 @@ def main() -> None:
                 unblock_target(restore_email)
                 restored = add_contact(
                     restore_email,
-                    st.session_state.get("restore_blocked_name", ""),
+                    st.session_state.get("restore_blocked_memo", ""),
                     st.session_state.get("restore_blocked_channel", ""),
                     bool(st.session_state.get("restore_blocked_consent", False)),
                 )
@@ -3264,14 +3289,14 @@ def main() -> None:
 
         st.subheader("ファイル取り込み")
         uploaded = st.file_uploader("CSV / Excelファイル", type=["csv", "tsv", "xlsx", "xls"])
-        st.caption("email / メールアドレス、channel / チャンネル名、name / 名前 などの列名を自動判別します。取り込んだ宛先は自動的に送信可になります。")
+        st.caption("email / メールアドレス、channel / チャンネル名、memo / メモ などの列名を自動判別します。取り込んだ宛先は自動的に送信可になります。")
         if uploaded and st.button("取り込む"):
             try:
                 added, skipped, mapping = import_contacts_file(uploaded)
                 st.success(f"{added}件を取り込みました。重複や空欄は{skipped}件スキップしました。")
                 st.caption(
                     f"判別した列: email={mapping['email'] or '-'} / "
-                    f"channel={mapping['channel'] or '-'} / name={mapping['name'] or '-'}"
+                    f"channel={mapping['channel'] or '-'} / memo={mapping['memo'] or '-'}"
                 )
             except Exception as exc:
                 st.error(str(exc))
@@ -3292,7 +3317,7 @@ def main() -> None:
                     st.success(f"{source_type}から{added}件を取り込みました。重複や空欄は{skipped}件スキップしました。")
                     st.caption(
                         f"判別した項目: email={mapping['email'] or '-'} / "
-                        f"channel={mapping['channel'] or '-'} / name={mapping['name'] or '-'}"
+                        f"channel={mapping['channel'] or '-'} / memo={mapping['memo'] or '-'}"
                     )
                 except Exception as exc:
                     st.error(str(exc))
@@ -3862,9 +3887,9 @@ def main() -> None:
                     pd.DataFrame(
                         [
                             {
-                                "チャンネル": contact["channel"] or "-",
-                                "メールアドレス": contact["email"] or "-",
-                                "名前": contact["name"] or "-",
+                                "チャンネル名": contact["channel"] or "-",
+                                "Eメール": contact["email"] or "-",
+                                "メモ": contact["memo"] or "-",
                                 "最終送信": contact["last_sent"] or "未送信",
                             }
                             for contact in confirmation_contacts
@@ -4177,14 +4202,14 @@ def main() -> None:
             with st.expander(f"返信あり管理（{len(replied_contacts)}件）"):
                 st.caption("返信があった宛先です。返信ありの宛先は自動送信対象から外れます。")
                 header = st.columns([2.0, 2.0, 1.4, 1.4, 1.0])
-                headers = ["チャンネル", "メールアドレス", "名前", "返信日時", "操作"]
+                headers = ["チャンネル名", "Eメール", "メモ", "返信日時", "操作"]
                 for column, label in zip(header, headers):
                     column.markdown(f"**{label}**")
                 for row in replied_contacts.itertuples():
                     columns = st.columns([2.0, 2.0, 1.4, 1.4, 1.0])
                     columns[0].write(row.channel or "-")
                     columns[1].write(row.email or "-")
-                    columns[2].write(row.name or "-")
+                    columns[2].write(row.memo or "-")
                     columns[3].write(row.replied_at or "-")
                     if columns[4].button("送信対象に戻す", key=f"restore_sendable_status_{row.id}"):
                         set_contact_status(int(row.id), "送信対象")
@@ -4194,7 +4219,7 @@ def main() -> None:
         search_col, sort_col, direction_col = st.columns([2.4, 1.2, 1.0])
         search_text = search_col.text_input(
             "宛先一覧を検索",
-            placeholder="メールアドレス、名前、チャンネル名で検索",
+            placeholder="メールアドレス、メモ、チャンネル名で検索",
         ).strip().lower()
         sort_key = sort_col.selectbox(
             "並び順",
@@ -4210,7 +4235,7 @@ def main() -> None:
         )
 
         if search_text:
-            search_columns = ["email", "name", "channel", "contact_status"]
+            search_columns = ["email", "memo", "channel", "contact_status"]
             mask = contacts[search_columns].fillna("").astype(str).apply(
                 lambda column: column.str.lower().str.contains(search_text, regex=False)
             ).any(axis=1)
@@ -4289,16 +4314,16 @@ def main() -> None:
         visible_contacts = contacts.iloc[start_index:end_index]
         info_col.caption(f"{total_contacts}件中 {start_index + 1}〜{end_index}件を表示 / {total_pages}ページ")
 
-        header = st.columns([1.7, 2.1, 1.2, 1.2, 1.2, 0.9, 0.8, 0.7, 0.7])
-        headers = ["チャンネル", "email", "name", "分類", "last_sent", "返信あり", "候補へ戻す", "保存", "削除"]
+        header = st.columns([1.8, 2.1, 1.8, 1.2, 1.2, 0.9, 0.8, 0.7, 0.7])
+        headers = ["チャンネル名", "Eメール", "メモ", "分類", "last_sent", "返信あり", "候補へ戻す", "保存", "削除"]
         for column, label in zip(header, headers):
             column.markdown(f"**{label}**")
 
         for row in visible_contacts.itertuples():
-            columns = st.columns([1.7, 2.1, 1.2, 1.2, 1.2, 0.9, 0.8, 0.7, 0.7])
+            columns = st.columns([1.8, 2.1, 1.8, 1.2, 1.2, 0.9, 0.8, 0.7, 0.7])
             edited_channel = columns[0].text_input("channel", value=row.channel or "", key=f"contact_channel_{row.id}", label_visibility="collapsed")
             edited_email = columns[1].text_input("email", value=row.email or "", key=f"contact_email_{row.id}", label_visibility="collapsed")
-            edited_name = columns[2].text_input("name", value=row.name or "", key=f"contact_name_{row.id}", label_visibility="collapsed")
+            edited_memo = columns[2].text_input("memo", value=row.memo or "", key=f"contact_memo_{row.id}", label_visibility="collapsed")
             current_status = row.contact_status if row.contact_status in CONTACT_STATUS_OPTIONS else "送信対象"
             edited_status = columns[3].selectbox(
                 "分類",
@@ -4320,7 +4345,7 @@ def main() -> None:
                 else:
                     st.warning(message)
             if columns[7].button("保存", key=f"save_contact_{row.id}"):
-                ok, message = update_contact(int(row.id), edited_email, edited_name, edited_channel, True, edited_status)
+                ok, message = update_contact(int(row.id), edited_email, edited_memo, edited_channel, True, edited_status)
                 if ok:
                     st.success(message)
                     st.rerun()
