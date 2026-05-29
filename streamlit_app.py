@@ -1080,6 +1080,35 @@ def is_blocked(email: str = "", youtube_channel_id: str = "") -> bool:
     )
 
 
+def blocked_target_reason(email: str = "", youtube_channel_id: str = "") -> str:
+    normalized_email = email.strip().lower()
+    channel_id = youtube_channel_id.strip()
+    if not normalized_email and not channel_id:
+        return ""
+    result = rows(
+        """
+        select reason from blocked_targets
+        where user_id = ? and ((email != '' and email = ?) or (youtube_channel_id != '' and youtube_channel_id = ?))
+        order by id desc
+        limit 1
+        """,
+        (current_user_id(), normalized_email, channel_id),
+    )
+    return str(result[0]["reason"] or "") if result else ""
+
+
+def unblock_target(email: str = "", youtube_channel_id: str = "") -> None:
+    normalized_email = email.strip().lower()
+    channel_id = youtube_channel_id.strip()
+    execute(
+        """
+        delete from blocked_targets
+        where user_id = ? and ((email != '' and email = ?) or (youtube_channel_id != '' and youtube_channel_id = ?))
+        """,
+        (current_user_id(), normalized_email, channel_id),
+    )
+
+
 def delete_contact(contact_id: int, block: bool = False, reason: str = "") -> None:
     if block:
         contact = rows("select * from contacts where user_id = ? and id = ?", (current_user_id(), contact_id))
@@ -1986,13 +2015,51 @@ def main() -> None:
             submitted = st.form_submit_button("追加")
         if submitted:
             if email:
+                normalized_email = email.strip().lower()
+                blocked_reason = blocked_target_reason(normalized_email)
+                if "restore_blocked_email" not in st.session_state:
+                    st.session_state["restore_blocked_email"] = ""
+                    st.session_state["restore_blocked_name"] = ""
+                    st.session_state["restore_blocked_channel"] = ""
+                    st.session_state["restore_blocked_consent"] = False
                 was_added = add_contact(email, name, channel, consent)
                 if was_added:
                     st.success("宛先を追加しました")
+                elif blocked_reason:
+                    st.session_state["restore_blocked_email"] = normalized_email
+                    st.session_state["restore_blocked_name"] = name
+                    st.session_state["restore_blocked_channel"] = channel
+                    st.session_state["restore_blocked_consent"] = consent
+                    st.warning(
+                        "このメールアドレスは以前に登録され、配信停止または削除されています。"
+                        "再度、宛先一覧に戻す場合は下のボタンを押してください。"
+                    )
+                    st.caption(f"記録理由: {blocked_reason}")
                 else:
                     st.warning("このメールアドレスはすでに登録されています")
             else:
                 st.error("メールアドレスを入力してください")
+        restore_email = st.session_state.get("restore_blocked_email", "")
+        if restore_email:
+            st.info(f"{restore_email} を宛先一覧に戻しますか？")
+            restore_yes_col, restore_no_col = st.columns(2)
+            if restore_yes_col.button("はい、再登録する", key="confirm_restore_blocked_email", use_container_width=True):
+                unblock_target(restore_email)
+                restored = add_contact(
+                    restore_email,
+                    st.session_state.get("restore_blocked_name", ""),
+                    st.session_state.get("restore_blocked_channel", ""),
+                    bool(st.session_state.get("restore_blocked_consent", False)),
+                )
+                st.session_state["restore_blocked_email"] = ""
+                if restored:
+                    st.success("宛先一覧に戻しました")
+                    st.rerun()
+                else:
+                    st.error("再登録できませんでした。すでに宛先一覧にある可能性があります。")
+            if restore_no_col.button("いいえ、戻さない", key="cancel_restore_blocked_email", use_container_width=True):
+                st.session_state["restore_blocked_email"] = ""
+                st.rerun()
 
         st.subheader("ファイル取り込み")
         uploaded = st.file_uploader("CSV / Excelファイル", type=["csv", "tsv", "xlsx", "xls"])
