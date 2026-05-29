@@ -1173,7 +1173,7 @@ def main() -> None:
 
         templates = fetch_campaign_templates()
         template_names = [template["name"] for template in templates]
-        template_options = template_names + ["新しく作る"]
+        template_options = ["新しく作る"] + template_names
         selected_index = template_options.index(current_campaign_name) if current_campaign_name in template_options else 0
         selected_template = st.selectbox("保存済み配信", template_options, index=selected_index)
         load_col, save_col, delete_col = st.columns(3)
