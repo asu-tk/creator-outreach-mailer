@@ -11,11 +11,12 @@ import hashlib
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, time as datetime_time, timedelta, timezone
 from email.message import EmailMessage
 from pathlib import Path
 from string import Template
 from urllib.parse import quote
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -35,6 +36,7 @@ except Exception:
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 DB_PATH = DATA_DIR / "mailer.sqlite3"
+APP_TIMEZONE = ZoneInfo("Asia/Tokyo")
 
 YOUTUBE_VIDEO_CATEGORIES = {
     "エンターテイメント": "24",
@@ -1511,6 +1513,43 @@ def register_unsubscribe_token(contact: sqlite3.Row, user_email: str) -> None:
     )
 
 
+def next_window_start(moment: datetime, window_start: datetime_time) -> datetime:
+    return datetime.combine(moment.date() + timedelta(days=1), window_start, APP_TIMEZONE)
+
+
+def build_send_schedule(
+    send_count: int,
+    delay_seconds: int,
+    window_start: datetime_time,
+    window_end: datetime_time,
+) -> list[datetime]:
+    if send_count <= 0 or window_end <= window_start:
+        return []
+
+    scheduled_times = []
+    cursor = datetime.now(APP_TIMEZONE)
+    today_start = datetime.combine(cursor.date(), window_start, APP_TIMEZONE)
+    today_end = datetime.combine(cursor.date(), window_end, APP_TIMEZONE)
+
+    if cursor < today_start:
+        cursor = today_start
+    elif cursor >= today_end:
+        cursor = next_window_start(cursor, window_start)
+
+    for _ in range(send_count):
+        day_end = datetime.combine(cursor.date(), window_end, APP_TIMEZONE)
+        if cursor >= day_end:
+            cursor = next_window_start(cursor, window_start)
+        scheduled_times.append(cursor.astimezone(timezone.utc))
+        cursor = cursor + timedelta(seconds=int(delay_seconds))
+
+    return scheduled_times
+
+
+def format_local_datetime(value: datetime) -> str:
+    return value.astimezone(APP_TIMEZONE).strftime("%Y-%m-%d %H:%M")
+
+
 def send_email(to_email: str, subject: str, body: str) -> tuple[bool, str]:
     if not smtp_configured():
         return True, "DRY_RUN: SMTP設定がないため実送信はしていません"
@@ -1552,6 +1591,8 @@ def create_send_job(
     body_template: str,
     contacts: list[sqlite3.Row],
     delay_seconds: int,
+    window_start: datetime_time,
+    window_end: datetime_time,
 ) -> tuple[bool, str]:
     if not supabase_configured():
         return False, "送信予約にはSupabase設定が必要です"
@@ -1561,6 +1602,9 @@ def create_send_job(
     smtp_ok, smtp_message = check_smtp_login()
     if not smtp_ok:
         return False, smtp_message
+    schedule_times = build_send_schedule(len(contacts), int(delay_seconds), window_start, window_end)
+    if len(schedule_times) != len(contacts):
+        return False, "送信可能時間帯の設定を確認してください。終了時刻は開始時刻より後にしてください。"
     user_email = current_user_profile()["email"].strip().lower() or current_user_id()
     job_payload = {
         "user_email": user_email,
@@ -1584,14 +1628,12 @@ def create_send_job(
     if not isinstance(created_job, list) or not created_job:
         return False, "送信予約の作成に失敗しました"
     job_id = created_job[0]["id"]
-    start_time = datetime.now(timezone.utc)
     queue_rows = []
     for index, contact in enumerate(contacts):
         register_unsubscribe_token(contact, user_email)
         unsubscribe_url = build_unsubscribe_url(contact)
         subject = render_template(subject_template, contact, unsubscribe_url)
         body = render_template(ensure_unsubscribe_link_template(body_template), contact, unsubscribe_url)
-        scheduled_at = (start_time.timestamp() + (index * int(delay_seconds)))
         queue_rows.append(
             {
                 "job_id": job_id,
@@ -1604,7 +1646,7 @@ def create_send_job(
                 "subject": subject,
                 "body": body,
                 "status": "pending",
-                "scheduled_at": datetime.fromtimestamp(scheduled_at, timezone.utc).isoformat(),
+                "scheduled_at": schedule_times[index].isoformat(),
             }
         )
     if queue_rows:
@@ -2216,6 +2258,20 @@ def main() -> None:
         st.caption("送信間隔は90秒を初期値にしています。短すぎる間隔は迷惑メール判定やサーバー制限の原因になるため、実運用では60〜120秒以上を目安にしてください。")
         send_limit = st.number_input("今回送信する件数", min_value=1, max_value=500, value=50)
         st.caption("大量送信はメールサーバー側で制限される場合があります。営業メールの実運用では、まず1日50〜100件程度から始め、送信エラーや迷惑メール判定が増えないことを確認しながら、必要に応じて100〜300件程度まで増やしてください。1日500件以上を継続して送る場合は、専用のメール配信サービスの利用を推奨します。")
+        window_col_start, window_col_end = st.columns(2)
+        send_window_start = window_col_start.time_input(
+            "送信可能 開始時刻",
+            value=datetime_time(8, 0),
+            step=1800,
+        )
+        send_window_end = window_col_end.time_input(
+            "送信可能 終了時刻",
+            value=datetime_time(20, 0),
+            step=1800,
+        )
+        if send_window_end <= send_window_start:
+            st.warning("送信可能時間帯は、終了時刻を開始時刻より後にしてください。")
+        st.caption("送信可能時間外にかかる分は、自動で翌日の開始時刻に持ち越します。")
         if int(send_limit) > 300:
             st.warning("今回の送信件数が多めです。送信先の反応、迷惑メール判定、サーバー制限を確認しながら少しずつ増やしてください。")
         confirmed = st.checkbox("送信対象が許諾済み、または法的に送信可能な宛先であることを確認しました")
@@ -2265,6 +2321,23 @@ def main() -> None:
         metric_cols[1].metric("この配信を送信済み", f"{already_sent_count}件")
         metric_cols[2].metric("送信待ち", f"{queued_count}件")
         metric_cols[3].metric("この配信の未送信", f"{remaining_count}件")
+        planned_count = min(int(send_limit), int(remaining_count))
+        preview_schedule = build_send_schedule(
+            planned_count,
+            int(delay),
+            send_window_start,
+            send_window_end,
+        )
+        if planned_count > 0 and preview_schedule:
+            first_time = format_local_datetime(preview_schedule[0])
+            last_time = format_local_datetime(preview_schedule[-1])
+            total_minutes = max(1, int((preview_schedule[-1] - preview_schedule[0]).total_seconds() // 60) + 1)
+            st.info(
+                f"送信予定: {planned_count}件 / 開始予定 {first_time} / 完了予定 {last_time} / "
+                f"所要目安 約{total_minutes:,}分"
+            )
+        elif planned_count > 0:
+            st.warning("送信可能時間帯の設定を確認してください。終了時刻は開始時刻より後にしてください。")
         if remaining_count == 0 and target_count > 0:
             st.success("この配信名では、現在の送信対象すべてが送信済み、または送信待ちです。")
         st.caption("同じ配信名ですでに送った宛先、または送信待ちの宛先は自動で除外します。送信対象は、未送信の宛先を優先し、その後は最終送信日時が古い順に選ばれます。")
@@ -2341,6 +2414,8 @@ def main() -> None:
                 preflight_errors.append("配信名を入力してください。")
             if not smtp_configured():
                 preflight_errors.append("送信元メール設定が未完了です。SMTPサーバー、ポート、送信元メールアドレス、SMTPパスワードを確認してください。")
+            if send_window_end <= send_window_start:
+                preflight_errors.append("送信可能時間帯は、終了時刻を開始時刻より後にしてください。")
             if not confirmed:
                 preflight_errors.append("送信前の確認にチェックしてください。これは、送信対象が許諾済み、または法的に送信可能な宛先であることを確認するためのチェックです。")
             if preflight_errors:
@@ -2387,6 +2462,8 @@ def main() -> None:
                         body_template,
                         contacts,
                         int(delay),
+                        send_window_start,
+                        send_window_end,
                     )
                     if ok:
                         st.success(message)
