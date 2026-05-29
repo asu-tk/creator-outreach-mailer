@@ -2627,6 +2627,58 @@ def fetch_campaign_template_stats(template_names: list[str]) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
+def fetch_scenario_stats(scenarios: list[sqlite3.Row]) -> pd.DataFrame:
+    records = []
+    for scenario in scenarios:
+        scenario_id = int(scenario["id"])
+        steps = fetch_scenario_steps(scenario_id)
+        step_keys = [
+            scenario_step_campaign_key(scenario_id, int(step["step_number"]))
+            for step in steps
+        ]
+        if step_keys:
+            placeholders = ",".join("?" for _ in step_keys)
+            counts = rows(
+                f"""
+                select
+                    sum(case when status = 'sent' then 1 else 0 end) as sent_count,
+                    sum(case when status = 'failed' then 1 else 0 end) as failed_count,
+                    sum(case when status = 'queued' then 1 else 0 end) as queued_count,
+                    count(*) as total_count
+                from sends
+                where user_id = ? and campaign_key in ({placeholders})
+                """,
+                (current_user_id(), *step_keys),
+            )[0]
+            unsubscribe_count = rows(
+                f"""
+                select count(*) as count
+                from unsubscribe_events
+                where user_id = ? and campaign_key in ({placeholders})
+                """,
+                (current_user_id(), *step_keys),
+            )[0]["count"]
+        else:
+            counts = {"sent_count": 0, "failed_count": 0, "queued_count": 0, "total_count": 0}
+            unsubscribe_count = 0
+
+        sent_count = int(counts["sent_count"] or 0)
+        unsubscribe_rate = (int(unsubscribe_count or 0) / sent_count * 100) if sent_count else 0
+        records.append(
+            {
+                "シナリオ": scenario["name"],
+                "ステップ数": len(steps),
+                "送信済み": sent_count,
+                "送信失敗": int(counts["failed_count"] or 0),
+                "送信待ち": int(counts["queued_count"] or 0),
+                "配信停止": int(unsubscribe_count or 0),
+                "配信停止率": f"{unsubscribe_rate:.1f}%",
+                "記録合計": int(counts["total_count"] or 0),
+            }
+        )
+    return pd.DataFrame(records)
+
+
 def safety_check_messages(
     subject_template: str,
     body_template: str,
@@ -3235,6 +3287,14 @@ def main() -> None:
                 )
         if template_names:
             scenarios = fetch_scenarios()
+            if scenarios:
+                with st.expander("シナリオごとの成績"):
+                    st.caption("シナリオ全体で、各ステップの送信済み・失敗・送信待ち・配信停止をまとめて確認できます。")
+                    st.dataframe(
+                        fetch_scenario_stats(scenarios),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
             with st.expander("シナリオ設定"):
                 st.caption("テンプレートの並び順とは別に、ステップメールの順番を固定できます。最初は10通分を表示し、必要なら11通目以降も追加できます。")
                 if st.session_state.pop("_force_new_scenario_editor", False):
