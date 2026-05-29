@@ -2894,127 +2894,132 @@ def add_contact(
 
 def settings_panel() -> None:
     st.subheader("送信元メール設定")
-    st.caption("複数の送信元メールを登録し、送信時に使うアカウントを選べます。相手には「送信者表示名 <送信元メールアドレス>」の形で見えます。")
-
     accounts = fetch_smtp_accounts()
     account_labels = [f"{account['label']} / {account['sender_email']}" for account in accounts]
     account_ids = [int(account["id"]) for account in accounts]
     active_account = active_smtp_account()
     active_account_id = int(active_account.get("id") or 0)
-    current_youtube_api_key = get_setting("YOUTUBE_API_KEY")
-    current_youtube_daily_limit = get_youtube_daily_limit()
-
-    if "smtp_account_id_input" not in st.session_state:
-        st.session_state["smtp_account_id_input"] = active_account_id
-    if "smtp_label_input" not in st.session_state:
-        st.session_state["smtp_label_input"] = str(active_account.get("label") or "")
-    if "smtp_sender_name_input" not in st.session_state:
-        st.session_state["smtp_sender_name_input"] = str(active_account.get("sender_name") or "")
-    if "smtp_sender_email_input" not in st.session_state:
-        st.session_state["smtp_sender_email_input"] = str(active_account.get("sender_email") or "")
-    if "smtp_host_input" not in st.session_state:
-        st.session_state["smtp_host_input"] = str(active_account.get("smtp_host") or "smtp.gmail.com")
-    if "smtp_port_input" not in st.session_state:
-        st.session_state["smtp_port_input"] = str(active_account.get("smtp_port") or "587")
-    if "smtp_ssl_input" not in st.session_state:
-        st.session_state["smtp_ssl_input"] = int(active_account.get("smtp_ssl") or 0) == 1
-
-    options = ["新しく作る"] + account_labels
-    selected_index = 0
-    if active_account_id in account_ids:
-        selected_index = account_ids.index(active_account_id) + 1
-    selected_account = st.selectbox("保存済み送信元", options, index=selected_index)
-    load_col, save_col, delete_col = st.columns(3)
-    selected_account_id = 0
-    if selected_account != "新しく作る":
-        selected_account_id = account_ids[options.index(selected_account) - 1]
-    if load_col.button("読み込む", key="load_smtp_account", use_container_width=True, disabled=selected_account_id == 0):
-        account = get_smtp_account(selected_account_id)
-        if account:
-            st.session_state["smtp_account_id_input"] = int(account["id"])
-            st.session_state["smtp_label_input"] = account["label"]
-            st.session_state["smtp_sender_name_input"] = account["sender_name"]
-            st.session_state["smtp_sender_email_input"] = account["sender_email"]
-            st.session_state["smtp_host_input"] = account["smtp_host"]
-            st.session_state["smtp_port_input"] = account["smtp_port"]
-            st.session_state["smtp_ssl_input"] = int(account["smtp_ssl"]) == 1
-            save_setting("ACTIVE_SMTP_ACCOUNT_ID", str(account["id"]))
-            st.rerun()
-
-    account_label = st.text_input("設定名", key="smtp_label_input", placeholder="例: UniVerse公式")
-    sender_name = st.text_input("送信者表示名", key="smtp_sender_name_input")
-    sender_email = st.text_input("送信元メールアドレス", key="smtp_sender_email_input")
-    smtp_host = st.text_input("SMTPサーバー", key="smtp_host_input")
-    smtp_port = st.text_input("SMTPポート", key="smtp_port_input")
-    smtp_ssl = st.checkbox("SSL接続を使う（465の場合だけON。587の場合はOFF）", key="smtp_ssl_input")
-    port_text = str(smtp_port).strip()
-    if port_text == "587" and smtp_ssl:
-        st.warning("587を使う場合は、SSL接続をOFFにしてください。587はSTARTTLSで送信します。")
-    elif port_text == "465" and not smtp_ssl:
-        st.warning("465を使う場合は、SSL接続をONにしてください。465はSSL/TLSで送信します。")
-    else:
-        st.caption("Xserverの目安: 587ならSSL OFF、465ならSSL ONです。")
-    editing_account_id = int(st.session_state.get("smtp_account_id_input") or 0)
-    if selected_account == "新しく作る":
-        editing_account_id = 0
-    editing_account = get_smtp_account(editing_account_id) if editing_account_id else None
-    has_password = bool(editing_account["smtp_pass"]) if editing_account else False
-    smtp_pass = st.text_input(
-        "SMTPパスワード / アプリパスワード",
-        type="password",
-        placeholder="保存済み" if has_password else "Gmailの場合はアプリパスワード",
-    )
-
-    if save_col.button("保存 / 更新", key="save_smtp_account", use_container_width=True):
-        if not sender_email.strip():
-            st.error("送信元メールアドレスを入力してください")
-        else:
-            account_id = save_smtp_account(
-                editing_account_id or None,
-                account_label,
-                sender_name,
-                sender_email,
-                smtp_host,
-                smtp_port,
-                smtp_ssl,
-                smtp_pass,
-            )
-            save_setting("ACTIVE_SMTP_ACCOUNT_ID", str(account_id))
-            st.session_state["smtp_account_id_input"] = account_id
-            st.success(f"保存しました。相手には {smtp_mail_from(active_smtp_account())} から届きます。")
-            st.rerun()
-
-    if delete_col.button("削除", key="delete_smtp_account", use_container_width=True, disabled=selected_account_id == 0):
-        delete_smtp_account(selected_account_id)
-        st.success("送信元設定を削除しました")
-        st.rerun()
-
     display_account = active_smtp_account()
     if display_account.get("sender_email"):
-        st.write(f"現在の送信元: `{smtp_mail_from(display_account)}`")
-    if has_password:
-        st.caption("パスワードは保存済みです。変更したい時だけ新しいパスワードを入力してください。")
+        st.caption(f"現在の送信元: {smtp_mail_from(display_account)}")
+    else:
+        st.caption("未設定")
 
-    st.divider()
-    st.caption("YouTube API設定")
-    youtube_api_key = st.text_input(
-        "YouTube APIキー",
-        type="password",
-        placeholder="保存済み" if current_youtube_api_key else "Google Cloud ConsoleのAPIキー",
-    )
-    youtube_daily_limit = st.number_input(
-        "YouTube API 1日上限 units",
-        min_value=1,
-        value=current_youtube_daily_limit,
-        step=100,
-    )
-    if st.button("YouTube API設定を保存"):
-        if youtube_api_key:
-            save_setting("YOUTUBE_API_KEY", youtube_api_key.strip())
-        save_setting("YOUTUBE_DAILY_LIMIT", str(int(youtube_daily_limit)))
-        st.success("YouTube API設定を保存しました")
-    if current_youtube_api_key:
-        st.caption("YouTube APIキーは保存済みです。変更したい時だけ新しいキーを入力してください。")
+    with st.expander("送信元メール設定を開く", expanded=False):
+        st.caption("複数の送信元メールを登録し、送信時に使うアカウントを選べます。相手には「送信者表示名 <送信元メールアドレス>」の形で見えます。")
+
+        if "smtp_account_id_input" not in st.session_state:
+            st.session_state["smtp_account_id_input"] = active_account_id
+        if "smtp_label_input" not in st.session_state:
+            st.session_state["smtp_label_input"] = str(active_account.get("label") or "")
+        if "smtp_sender_name_input" not in st.session_state:
+            st.session_state["smtp_sender_name_input"] = str(active_account.get("sender_name") or "")
+        if "smtp_sender_email_input" not in st.session_state:
+            st.session_state["smtp_sender_email_input"] = str(active_account.get("sender_email") or "")
+        if "smtp_host_input" not in st.session_state:
+            st.session_state["smtp_host_input"] = str(active_account.get("smtp_host") or "smtp.gmail.com")
+        if "smtp_port_input" not in st.session_state:
+            st.session_state["smtp_port_input"] = str(active_account.get("smtp_port") or "587")
+        if "smtp_ssl_input" not in st.session_state:
+            st.session_state["smtp_ssl_input"] = int(active_account.get("smtp_ssl") or 0) == 1
+
+        options = ["新しく作る"] + account_labels
+        selected_index = 0
+        if active_account_id in account_ids:
+            selected_index = account_ids.index(active_account_id) + 1
+        selected_account = st.selectbox("保存済み送信元", options, index=selected_index)
+        load_col, save_col, delete_col = st.columns(3)
+        selected_account_id = 0
+        if selected_account != "新しく作る":
+            selected_account_id = account_ids[options.index(selected_account) - 1]
+        if load_col.button("読み込む", key="load_smtp_account", use_container_width=True, disabled=selected_account_id == 0):
+            account = get_smtp_account(selected_account_id)
+            if account:
+                st.session_state["smtp_account_id_input"] = int(account["id"])
+                st.session_state["smtp_label_input"] = account["label"]
+                st.session_state["smtp_sender_name_input"] = account["sender_name"]
+                st.session_state["smtp_sender_email_input"] = account["sender_email"]
+                st.session_state["smtp_host_input"] = account["smtp_host"]
+                st.session_state["smtp_port_input"] = account["smtp_port"]
+                st.session_state["smtp_ssl_input"] = int(account["smtp_ssl"]) == 1
+                save_setting("ACTIVE_SMTP_ACCOUNT_ID", str(account["id"]))
+                st.rerun()
+
+        account_label = st.text_input("設定名", key="smtp_label_input", placeholder="例: UniVerse公式")
+        sender_name = st.text_input("送信者表示名", key="smtp_sender_name_input")
+        sender_email = st.text_input("送信元メールアドレス", key="smtp_sender_email_input")
+        smtp_host = st.text_input("SMTPサーバー", key="smtp_host_input")
+        smtp_port = st.text_input("SMTPポート", key="smtp_port_input")
+        smtp_ssl = st.checkbox("SSL接続を使う（465の場合だけON。587の場合はOFF）", key="smtp_ssl_input")
+        port_text = str(smtp_port).strip()
+        if port_text == "587" and smtp_ssl:
+            st.warning("587を使う場合は、SSL接続をOFFにしてください。587はSTARTTLSで送信します。")
+        elif port_text == "465" and not smtp_ssl:
+            st.warning("465を使う場合は、SSL接続をONにしてください。465はSSL/TLSで送信します。")
+        else:
+            st.caption("Xserverの目安: 587ならSSL OFF、465ならSSL ONです。")
+        editing_account_id = int(st.session_state.get("smtp_account_id_input") or 0)
+        if selected_account == "新しく作る":
+            editing_account_id = 0
+        editing_account = get_smtp_account(editing_account_id) if editing_account_id else None
+        has_password = bool(editing_account["smtp_pass"]) if editing_account else False
+        smtp_pass = st.text_input(
+            "SMTPパスワード / アプリパスワード",
+            type="password",
+            placeholder="保存済み" if has_password else "Gmailの場合はアプリパスワード",
+        )
+
+        if save_col.button("保存 / 更新", key="save_smtp_account", use_container_width=True):
+            if not sender_email.strip():
+                st.error("送信元メールアドレスを入力してください")
+            else:
+                account_id = save_smtp_account(
+                    editing_account_id or None,
+                    account_label,
+                    sender_name,
+                    sender_email,
+                    smtp_host,
+                    smtp_port,
+                    smtp_ssl,
+                    smtp_pass,
+                )
+                save_setting("ACTIVE_SMTP_ACCOUNT_ID", str(account_id))
+                st.session_state["smtp_account_id_input"] = account_id
+                st.success(f"保存しました。相手には {smtp_mail_from(active_smtp_account())} から届きます。")
+                st.rerun()
+
+        if delete_col.button("削除", key="delete_smtp_account", use_container_width=True, disabled=selected_account_id == 0):
+            delete_smtp_account(selected_account_id)
+            st.success("送信元設定を削除しました")
+            st.rerun()
+
+        if has_password:
+            st.caption("パスワードは保存済みです。変更したい時だけ新しいパスワードを入力してください。")
+
+    st.subheader("YouTube API設定")
+    current_youtube_api_key = get_setting("YOUTUBE_API_KEY")
+    current_youtube_daily_limit = get_youtube_daily_limit()
+    st.caption("保存済み" if current_youtube_api_key else "未設定")
+
+    with st.expander("YouTube API設定を開く", expanded=False):
+        youtube_api_key = st.text_input(
+            "YouTube APIキー",
+            type="password",
+            placeholder="保存済み" if current_youtube_api_key else "Google Cloud ConsoleのAPIキー",
+        )
+        youtube_daily_limit = st.number_input(
+            "YouTube API 1日上限 units",
+            min_value=1,
+            value=current_youtube_daily_limit,
+            step=100,
+        )
+        if st.button("YouTube API設定を保存"):
+            if youtube_api_key:
+                save_setting("YOUTUBE_API_KEY", youtube_api_key.strip())
+            save_setting("YOUTUBE_DAILY_LIMIT", str(int(youtube_daily_limit)))
+            st.success("YouTube API設定を保存しました")
+        if current_youtube_api_key:
+            st.caption("YouTube APIキーは保存済みです。変更したい時だけ新しいキーを入力してください。")
 
 
 def normalize_column_name(value: object) -> str:
