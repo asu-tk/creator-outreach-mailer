@@ -2260,18 +2260,18 @@ def main() -> None:
         st.caption("大量送信はメールサーバー側で制限される場合があります。営業メールの実運用では、まず1日50〜100件程度から始め、送信エラーや迷惑メール判定が増えないことを確認しながら、必要に応じて100〜300件程度まで増やしてください。1日500件以上を継続して送る場合は、専用のメール配信サービスの利用を推奨します。")
         window_col_start, window_col_end = st.columns(2)
         send_window_start = window_col_start.time_input(
-            "送信可能 開始時刻",
+            "メールを送ってよい時間（この時間から）",
             value=datetime_time(8, 0),
             step=1800,
         )
         send_window_end = window_col_end.time_input(
-            "送信可能 終了時刻",
+            "メールを送ってよい時間（この時間まで）",
             value=datetime_time(20, 0),
             step=1800,
         )
         if send_window_end <= send_window_start:
-            st.warning("送信可能時間帯は、終了時刻を開始時刻より後にしてください。")
-        st.caption("送信可能時間外にかかる分は、自動で翌日の開始時刻に持ち越します。")
+            st.warning("メールを送ってよい時間は、「この時間まで」を「この時間から」より後にしてください。")
+        st.caption("この時間帯の外では送信しません。時間を超えた分は、翌日の「この時間から」に自動で持ち越します。")
         if int(send_limit) > 300:
             st.warning("今回の送信件数が多めです。送信先の反応、迷惑メール判定、サーバー制限を確認しながら少しずつ増やしてください。")
         confirmed = st.checkbox("送信対象が許諾済み、または法的に送信可能な宛先であることを確認しました")
@@ -2415,7 +2415,7 @@ def main() -> None:
             if not smtp_configured():
                 preflight_errors.append("送信元メール設定が未完了です。SMTPサーバー、ポート、送信元メールアドレス、SMTPパスワードを確認してください。")
             if send_window_end <= send_window_start:
-                preflight_errors.append("送信可能時間帯は、終了時刻を開始時刻より後にしてください。")
+                preflight_errors.append("メールを送ってよい時間は、「この時間まで」を「この時間から」より後にしてください。")
             if not confirmed:
                 preflight_errors.append("送信前の確認にチェックしてください。これは、送信対象が許諾済み、または法的に送信可能な宛先であることを確認するためのチェックです。")
             if preflight_errors:
