@@ -25,6 +25,11 @@ try:
 except Exception:
     sort_items = None
 
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:
+    st_autorefresh = None
+
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
@@ -1913,14 +1918,23 @@ def main() -> None:
         metric_cols = st.columns(4)
         metric_cols[0].metric("送信対象", f"{target_count}件")
         metric_cols[1].metric("この配信を送信済み", f"{already_sent_count}件")
-        metric_cols[2].metric("予約済み", f"{queued_count}件")
+        metric_cols[2].metric("送信待ち", f"{queued_count}件")
         metric_cols[3].metric("この配信の未送信", f"{remaining_count}件")
         if remaining_count == 0 and target_count > 0:
-            st.success("この配信名では、現在の送信対象すべてが送信済み、または予約済みです。")
-        st.caption("同じ配信名ですでに送った宛先、または予約済みの宛先は自動で除外します。送信対象は、未送信の宛先を優先し、その後は最終送信日時が古い順に選ばれます。")
+            st.success("この配信名では、現在の送信対象すべてが送信済み、または送信待ちです。")
+        st.caption("同じ配信名ですでに送った宛先、または送信待ちの宛先は自動で除外します。送信対象は、未送信の宛先を優先し、その後は最終送信日時が古い順に選ばれます。")
         recent_jobs = fetch_recent_send_jobs()
         if recent_jobs:
             with st.expander("最近の送信予約"):
+                refresh_col, note_col = st.columns([1.0, 2.4])
+                if refresh_col.button("状態を更新", use_container_width=True):
+                    sync_send_queue_results()
+                    st.rerun()
+                note_col.caption("送信予約の進捗は30秒ごとに自動更新されます。")
+                if st_autorefresh:
+                    st_autorefresh(interval=30_000, key="send_jobs_autorefresh")
+                else:
+                    st.caption("自動更新部品の反映後は、30秒ごとに進捗が更新されます。")
                 st.dataframe(
                     pd.DataFrame(recent_jobs).rename(
                         columns={
