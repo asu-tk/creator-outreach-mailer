@@ -2355,7 +2355,12 @@ def prerequisite_sql(prerequisite_keys: list[str], contact_alias: str = "c") -> 
     return "\n".join(conditions), params
 
 
-def fetch_next_send_contacts(campaign_key_value: str, limit: int, prerequisite_keys: list[str] | None = None) -> list[sqlite3.Row]:
+def fetch_next_send_contacts(
+    campaign_key_value: str,
+    limit: int,
+    prerequisite_keys: list[str] | None = None,
+    offset: int = 0,
+) -> list[sqlite3.Row]:
     prereq_sql, prereq_params = prerequisite_sql(prerequisite_keys or [])
     return rows(
         f"""
@@ -2380,9 +2385,9 @@ def fetch_next_send_contacts(campaign_key_value: str, limit: int, prerequisite_k
             case when max(s.sent_at) is null then 0 else 1 end,
             max(s.sent_at) asc,
             c.id asc
-        limit ?
+        limit ? offset ?
         """,
-        (current_user_id(), campaign_key_value, *prereq_params, int(limit)),
+        (current_user_id(), campaign_key_value, *prereq_params, int(limit), int(offset)),
     )
 
 
@@ -3344,8 +3349,23 @@ def main() -> None:
         st.caption("同じ配信名ですでに送った宛先、または送信待ちの宛先は自動で除外します。送信対象は、未送信の宛先を優先し、その後は最終送信日時が古い順に選ばれます。")
 
         preview_contacts = fetch_next_send_contacts(current_campaign_key, 1, prerequisite_campaign_keys) if effective_campaign_name.strip() else []
+        confirmation_page_size = 10
+        confirmation_total_pages = max(1, (int(planned_count) + confirmation_page_size - 1) // confirmation_page_size)
+        if "final_confirmation_page" not in st.session_state:
+            st.session_state["final_confirmation_page"] = 1
+        st.session_state["final_confirmation_page"] = max(
+            1,
+            min(int(confirmation_total_pages), int(st.session_state.get("final_confirmation_page", 1))),
+        )
+        confirmation_page = int(st.session_state["final_confirmation_page"])
+        confirmation_offset = (confirmation_page - 1) * confirmation_page_size
         confirmation_contacts = (
-            fetch_next_send_contacts(current_campaign_key, min(int(planned_count), 3), prerequisite_campaign_keys)
+            fetch_next_send_contacts(
+                current_campaign_key,
+                confirmation_page_size,
+                prerequisite_campaign_keys,
+                confirmation_offset,
+            )
             if effective_campaign_name.strip() and planned_count > 0
             else []
         )
@@ -3412,7 +3432,25 @@ def main() -> None:
             st.dataframe(detail_frame, use_container_width=True, hide_index=True)
 
             if confirmation_contacts:
-                st.caption("今回の先頭候補です。実際の送信対象は、未送信優先・最終送信が古い順で選ばれます。")
+                st.caption("今回の選択候補です。実際の送信対象は、未送信優先・最終送信が古い順で選ばれます。10件ずつ確認できます。")
+                page_col, prev_col, next_col = st.columns([2.0, 1.0, 1.0])
+                page_col.caption(f"{confirmation_page}/{confirmation_total_pages}ページ（今回送信予定 {planned_count}件）")
+                if prev_col.button(
+                    "前の10件",
+                    key="final_confirmation_prev_page",
+                    use_container_width=True,
+                    disabled=confirmation_page <= 1,
+                ):
+                    st.session_state["final_confirmation_page"] = max(1, confirmation_page - 1)
+                    st.rerun()
+                if next_col.button(
+                    "次の10件",
+                    key="final_confirmation_next_page",
+                    use_container_width=True,
+                    disabled=confirmation_page >= confirmation_total_pages,
+                ):
+                    st.session_state["final_confirmation_page"] = min(confirmation_total_pages, confirmation_page + 1)
+                    st.rerun()
                 st.dataframe(
                     pd.DataFrame(
                         [
