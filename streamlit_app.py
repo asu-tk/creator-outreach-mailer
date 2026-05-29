@@ -1069,6 +1069,13 @@ def load_campaign_template_into_session(template_name: str) -> bool:
     return True
 
 
+def reset_campaign_template_session(name: str, subject: str, body: str) -> None:
+    st.session_state["campaign_name_input"] = name
+    st.session_state["subject_template_input"] = subject
+    st.session_state["body_template_input"] = body
+    st.session_state["loaded_campaign_template"] = name
+
+
 def block_target(email: str = "", youtube_channel_id: str = "", channel: str = "", reason: str = "") -> None:
     normalized_email = email.strip().lower()
     channel_id = youtube_channel_id.strip()
@@ -2218,11 +2225,12 @@ def main() -> None:
         template_options = ["新しく作る"] + template_names
         selected_index = template_options.index(current_campaign_name) if current_campaign_name in template_options else 0
         selected_template = st.selectbox("保存済み配信", template_options, index=selected_index)
+        st.caption("テンプレートを選んで「読み込む」と、下の件名・本文に反映されます。新しく作る場合は配信名を変えて保存してください。")
         load_col, save_col, delete_col = st.columns(3)
         if load_col.button("読み込む", key="load_campaign_template", use_container_width=True, disabled=selected_template == "新しく作る"):
             if load_campaign_template_into_session(selected_template):
                 save_setting("CURRENT_CAMPAIGN_NAME", selected_template)
-                st.rerun()
+                st.success(f"{selected_template} を読み込みました")
         if len(template_names) > 1:
             with st.expander("配信テンプレートの並び替え"):
                 if sort_items:
@@ -2272,14 +2280,32 @@ def main() -> None:
             if campaign_name.strip():
                 save_campaign_template(campaign_name, subject_template, body_template)
                 save_setting("CURRENT_CAMPAIGN_NAME", campaign_name.strip())
+                reset_campaign_template_session(campaign_name.strip(), subject_template, body_template)
                 st.success(f"{campaign_name} を保存しました")
-                st.rerun()
             else:
                 st.error("配信名を入力してください")
-        if delete_col.button("削除", key="delete_campaign_template", use_container_width=True, disabled=selected_template == "新しく作る"):
-            delete_campaign_template(selected_template)
-            st.success(f"{selected_template} を削除しました")
-            st.rerun()
+        if delete_col.button("このテンプレートを削除", key="delete_campaign_template", use_container_width=True, disabled=selected_template == "新しく作る"):
+            st.session_state["confirm_delete_campaign_template"] = selected_template
+        pending_delete_template = st.session_state.get("confirm_delete_campaign_template", "")
+        if pending_delete_template:
+            st.warning(f"配信テンプレート「{pending_delete_template}」を削除しますか？この操作は元に戻せません。")
+            confirm_delete_col, cancel_delete_col = st.columns(2)
+            if confirm_delete_col.button("はい、削除する", key="confirm_delete_campaign_template_yes", use_container_width=True):
+                delete_campaign_template(pending_delete_template)
+                st.session_state["confirm_delete_campaign_template"] = ""
+                remaining_templates = fetch_campaign_templates()
+                if remaining_templates:
+                    first_template = remaining_templates[0]
+                    save_setting("CURRENT_CAMPAIGN_NAME", first_template["name"])
+                    reset_campaign_template_session(first_template["name"], first_template["subject"], first_template["body"])
+                else:
+                    save_setting("CURRENT_CAMPAIGN_NAME", "")
+                    reset_campaign_template_session("", "", "")
+                st.success(f"{pending_delete_template} を削除しました")
+                st.rerun()
+            if cancel_delete_col.button("いいえ、削除しない", key="confirm_delete_campaign_template_no", use_container_width=True):
+                st.session_state["confirm_delete_campaign_template"] = ""
+                st.rerun()
         delay = st.number_input("送信間隔（秒）", min_value=30, max_value=300, value=90, step=10)
         st.caption("送信間隔は90秒を初期値にしています。短すぎる間隔は迷惑メール判定やサーバー制限の原因になるため、実運用では60〜120秒以上を目安にしてください。")
         send_limit = st.number_input("今回送信する件数", min_value=1, max_value=500, value=50)
