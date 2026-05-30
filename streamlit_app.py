@@ -7,6 +7,7 @@ import smtplib
 import sqlite3
 import time
 import json
+import base64
 import hashlib
 import html
 import math
@@ -2608,6 +2609,205 @@ def save_campaign_template_order(names: list[str]) -> None:
             "update campaign_templates set sort_order = ? where user_id = ? and name = ?",
             ((index + 1) * 10, current_user_id(), name),
         )
+
+
+def openai_api_key() -> str:
+    return get_nested_secret("openai", "api_key") or read_secret("OPENAI_API_KEY")
+
+
+def openai_model() -> str:
+    return get_nested_secret("openai", "model") or read_secret("OPENAI_MODEL") or "gpt-5.2"
+
+
+def ai_scenario_schema() -> dict:
+    step_schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "step_number": {"type": "integer"},
+            "template_name": {"type": "string"},
+            "purpose": {"type": "string"},
+            "subject": {"type": "string"},
+            "body": {"type": "string"},
+        },
+        "required": ["step_number", "template_name", "purpose", "subject", "body"],
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "scenario_name": {"type": "string"},
+            "strategy_summary": {"type": "string"},
+            "target_persona": {"type": "string"},
+            "offer_angle": {"type": "string"},
+            "recommended_send_gap_days": {"type": "integer"},
+            "steps": {
+                "type": "array",
+                "items": step_schema,
+            },
+            "risk_notes": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
+        },
+        "required": [
+            "scenario_name",
+            "strategy_summary",
+            "target_persona",
+            "offer_angle",
+            "recommended_send_gap_days",
+            "steps",
+            "risk_notes",
+        ],
+    }
+
+
+def extract_openai_output_text(response: dict) -> str:
+    direct_text = str(response.get("output_text") or "").strip()
+    if direct_text:
+        return direct_text
+    chunks: list[str] = []
+    for item in response.get("output", []) or []:
+        if not isinstance(item, dict):
+            continue
+        for content in item.get("content", []) or []:
+            if not isinstance(content, dict):
+                continue
+            if content.get("type") in {"output_text", "text"}:
+                chunks.append(str(content.get("text") or ""))
+    return "".join(chunks).strip()
+
+
+def uploaded_image_to_data_url(uploaded_file) -> str:
+    if not uploaded_file:
+        return ""
+    mime_type = str(getattr(uploaded_file, "type", "") or "image/png")
+    raw = uploaded_file.getvalue()
+    if len(raw) > 8 * 1024 * 1024:
+        raise RuntimeError("商品写真は8MB以下の画像にしてください。")
+    encoded = base64.b64encode(raw).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def friendly_openai_error(detail: str, status_code: int = 0) -> str:
+    message = detail.strip()
+    try:
+        payload = json.loads(detail)
+        error = payload.get("error", {})
+        message = str(error.get("message") or message)
+    except Exception:
+        pass
+    if status_code == 401:
+        return "OpenAI APIキーが正しくありません。Streamlit Secretsの[openai] api_keyを確認してください。"
+    if status_code == 429:
+        return "OpenAI APIの利用上限、または一時的な制限に達している可能性があります。少し時間を置いて再度試してください。"
+    if status_code == 404:
+        return "指定したOpenAIモデルが見つかりません。Streamlit Secretsの[openai] modelを確認してください。"
+    return f"OpenAI APIエラー: {message[:260]}"
+
+
+def generate_ai_scenario(
+    product_name: str,
+    product_url: str,
+    product_info: str,
+    persona_info: str,
+    tone: str,
+    step_count: int,
+    image_data_url: str = "",
+) -> dict:
+    api_key = openai_api_key()
+    if not api_key:
+        raise RuntimeError("OpenAI APIキーが未設定です。Streamlit Secretsの[openai] api_keyに追加してください。")
+
+    clean_step_count = max(1, min(10, int(step_count)))
+    instructions = (
+        "あなたは日本語のB2Bアウトリーチメールとステップ配信シナリオの設計者です。"
+        "商品情報、ASPの紹介文、ペルソナ情報、必要に応じて商品画像を読み取り、"
+        "YouTubeチャンネル運営者に送る自然で丁寧な営業シナリオを作成してください。"
+        "必ずJSON Schemaに従って出力します。"
+        "各メール本文はプレーンテキストで、HTMLやMarkdownは使いません。"
+        "チャンネル名の差し込みには必ず ${channel} を使ってください。"
+        "成果保証、断定的な収益表現、誇大表現、虚偽の実績、相手を不安にさせすぎる表現は避けてください。"
+        "薬機法・景表法・金融/健康/稼げる系のリスクがありそうな場合は、risk_notesに注意点を書いてください。"
+        "配信停止URLはアプリが自動付与するため、本文にはURLを入れないでください。"
+    )
+    user_text = f"""
+商品名:
+{product_name.strip()}
+
+誘導したいURL:
+{product_url.strip() or "未指定"}
+
+商品・商材情報:
+{product_info.strip()}
+
+ASP紹介文・ペルソナ・訴求情報:
+{persona_info.strip() or "未指定"}
+
+希望する文体:
+{tone}
+
+作成するステップ数:
+{clean_step_count}
+
+出力条件:
+- scenario_nameは商品名が分かる短い名前にする
+- stepsは必ず{clean_step_count}件作る
+- template_nameは各ステップで重複しない名前にする
+- subjectは自然な日本語で、釣りすぎない
+- bodyは1通ごとに目的が違う内容にする
+- 1通目は突然の連絡として自然に入る
+- 後続メールは前回連絡への補足として自然につなげる
+- 相手がYouTubeチャンネル運営者である前提で書く
+""".strip()
+
+    content: list[dict] = [{"type": "input_text", "text": user_text}]
+    if image_data_url:
+        content.append({"type": "input_image", "image_url": image_data_url, "detail": "auto"})
+
+    payload = {
+        "model": openai_model(),
+        "instructions": instructions,
+        "input": [{"role": "user", "content": content}],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "outreach_scenario",
+                "schema": ai_scenario_schema(),
+                "strict": True,
+            }
+        },
+        "max_output_tokens": 9000,
+    }
+    request = urllib.request.Request(
+        "https://api.openai.com/v1/responses",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=90) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(friendly_openai_error(detail, exc.code)) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"OpenAI APIに接続できませんでした: {exc.reason}") from exc
+
+    output_text = extract_openai_output_text(result)
+    if not output_text:
+        raise RuntimeError("OpenAIからシナリオ本文を取得できませんでした。入力内容を少し短くして再度試してください。")
+    try:
+        scenario = json.loads(output_text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("OpenAIの出力をシナリオとして読み取れませんでした。もう一度生成してください。") from exc
+    steps = scenario.get("steps") or []
+    if not isinstance(steps, list) or not steps:
+        raise RuntimeError("シナリオのステップが生成されませんでした。入力内容を増やして再度試してください。")
+    return scenario
 
 
 def campaign_template_list_key(names: list[str]) -> str:
@@ -6090,6 +6290,231 @@ def main() -> None:
                     )
                 else:
                     st.write("通常配信用のテンプレートはありません。シナリオに含まれるテンプレートは「シナリオごとの成績」で確認してください。")
+        with st.expander("AIシナリオ作成", expanded=False):
+            st.caption("商品写真、ASP紹介文、ペルソナ情報からステップ配信用の下書きを作ります。生成後に件名・本文を確認してから保存できます。")
+            st.caption(f"生成ボタンを押した時だけOpenAI APIを呼びます。使用モデル: {openai_model()}")
+            if not openai_api_key():
+                st.warning("AI生成を使うには、Streamlit SecretsにOpenAI APIキーを追加してください。")
+                st.code(
+                    '[openai]\napi_key = "sk-..."\nmodel = "gpt-5.2"',
+                    language="toml",
+                )
+                st.caption("貼る場所はSecretsの一番上です。[auth]や[google]の下には入れないでください。")
+
+            ai_input_left, ai_input_right = st.columns([1.2, 1.0])
+            with ai_input_left:
+                ai_product_name = st.text_input(
+                    "商品名",
+                    placeholder="例: UniVerse / サッカーボール教材",
+                    key="ai_scenario_product_name",
+                )
+                ai_product_url = st.text_input(
+                    "誘導URL（任意）",
+                    placeholder="https://...",
+                    key="ai_scenario_product_url",
+                )
+                ai_product_image = st.file_uploader(
+                    "商品写真（任意）",
+                    type=["png", "jpg", "jpeg", "webp"],
+                    key="ai_scenario_product_image",
+                )
+                if ai_product_image:
+                    st.image(ai_product_image, caption="商品写真プレビュー", width=260)
+            with ai_input_right:
+                ai_step_count = st.number_input(
+                    "作成する通数",
+                    min_value=1,
+                    max_value=10,
+                    value=5,
+                    step=1,
+                    key="ai_scenario_step_count",
+                )
+                ai_tone = st.selectbox(
+                    "文体",
+                    ["丁寧で自然", "やわらかめ", "法人向け", "フランク", "少し強め"],
+                    key="ai_scenario_tone",
+                )
+                st.info("本文には配信停止URLを入れません。アプリ側が送信時に自動で付けます。")
+
+            ai_product_info = st.text_area(
+                "商品説明・LP本文・ASP紹介文",
+                placeholder="商品ページやASPに書かれている説明文、報酬条件、強み、注意点などを貼り付けます。",
+                height=190,
+                key="ai_scenario_product_info",
+            )
+            ai_persona_info = st.text_area(
+                "ペルソナ・ターゲット・訴求条件（任意）",
+                placeholder="例: 子育て系YouTuber向け / 初心者向け / 単価は高いが信頼重視 / NG表現など",
+                height=150,
+                key="ai_scenario_persona_info",
+            )
+            generate_disabled = not bool(openai_api_key())
+            if st.button(
+                "AIでシナリオ案を作成",
+                key="generate_ai_scenario_button",
+                width="stretch",
+                disabled=generate_disabled,
+            ):
+                if not ai_product_name.strip():
+                    st.error("商品名を入力してください。")
+                elif not ai_product_info.strip():
+                    st.error("商品説明・ASP紹介文を入力してください。")
+                else:
+                    try:
+                        with st.spinner("AIがシナリオ案を作成しています..."):
+                            generated_scenario = generate_ai_scenario(
+                                ai_product_name,
+                                ai_product_url,
+                                ai_product_info,
+                                ai_persona_info,
+                                ai_tone,
+                                int(ai_step_count),
+                                uploaded_image_to_data_url(ai_product_image),
+                            )
+                        scenario_digest = hashlib.sha1(
+                            json.dumps(generated_scenario, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                        ).hexdigest()[:10]
+                        st.session_state["ai_generated_scenario"] = generated_scenario
+                        st.session_state["ai_generated_scenario_token"] = scenario_digest
+                        st.success("AIシナリオ案を作成しました。下の内容を確認してから保存してください。")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+
+            generated_scenario = st.session_state.get("ai_generated_scenario")
+            if isinstance(generated_scenario, dict) and generated_scenario:
+                generated_steps = [
+                    step for step in generated_scenario.get("steps", [])
+                    if isinstance(step, dict)
+                ]
+                ai_token = str(st.session_state.get("ai_generated_scenario_token") or "")
+                if not ai_token:
+                    ai_token = hashlib.sha1(
+                        json.dumps(generated_scenario, ensure_ascii=False, sort_keys=True).encode("utf-8")
+                    ).hexdigest()[:10]
+                    st.session_state["ai_generated_scenario_token"] = ai_token
+                st.divider()
+                st.markdown("**生成結果**")
+                summary_cols = st.columns(3)
+                summary_cols[0].metric("作成通数", len(generated_steps))
+                summary_cols[1].metric("推奨間隔", f"{int(generated_scenario.get('recommended_send_gap_days') or 0)}日")
+                summary_cols[2].metric("保存先", "テンプレート + シナリオ")
+                strategy_summary = str(generated_scenario.get("strategy_summary") or "").strip()
+                target_persona = str(generated_scenario.get("target_persona") or "").strip()
+                offer_angle = str(generated_scenario.get("offer_angle") or "").strip()
+                if strategy_summary:
+                    st.write(f"方針: {strategy_summary}")
+                if target_persona:
+                    st.write(f"想定相手: {target_persona}")
+                if offer_angle:
+                    st.write(f"訴求: {offer_angle}")
+                risk_notes = [
+                    str(note).strip()
+                    for note in generated_scenario.get("risk_notes", [])
+                    if str(note).strip()
+                ]
+                if risk_notes:
+                    with st.expander("AIからの注意点"):
+                        for note in risk_notes:
+                            st.write(f"- {note}")
+
+                edited_scenario_name = st.text_input(
+                    "保存するシナリオ名",
+                    value=str(generated_scenario.get("scenario_name") or ai_product_name or "").strip(),
+                    key=f"ai_generated_scenario_name_{ai_token}",
+                )
+                existing_scenario_names = {
+                    str(scenario["name"]).strip()
+                    for scenario in fetch_scenarios()
+                    if str(scenario["name"]).strip()
+                }
+                overwrites_existing_scenario = edited_scenario_name.strip() in existing_scenario_names
+                allow_scenario_overwrite = True
+                if overwrites_existing_scenario:
+                    st.warning("同じ名前のシナリオがあります。保存すると同じシナリオIDのまま中身を更新します。")
+                    allow_scenario_overwrite = st.checkbox(
+                        "同名シナリオを上書きして保存する",
+                        key=f"ai_allow_scenario_overwrite_{ai_token}",
+                    )
+
+                edited_template_names: list[str] = []
+                edited_subjects: list[str] = []
+                edited_bodies: list[str] = []
+                for index, step in enumerate(generated_steps, start=1):
+                    default_step_number = int(step.get("step_number") or index)
+                    default_template_name = str(step.get("template_name") or f"{edited_scenario_name} {index}通目").strip()
+                    default_purpose = str(step.get("purpose") or "").strip()
+                    with st.expander(f"{default_step_number}通目: {default_template_name}", expanded=index == 1):
+                        if default_purpose:
+                            st.caption(f"目的: {default_purpose}")
+                        template_name_value = st.text_input(
+                            "テンプレート名",
+                            value=default_template_name,
+                            key=f"ai_template_name_{ai_token}_{index}",
+                        )
+                        subject_value = st.text_input(
+                            "件名",
+                            value=str(step.get("subject") or "").strip(),
+                            key=f"ai_subject_{ai_token}_{index}",
+                        )
+                        body_value = st.text_area(
+                            "本文",
+                            value=str(step.get("body") or "").strip(),
+                            height=300,
+                            key=f"ai_body_{ai_token}_{index}",
+                        )
+                        edited_template_names.append(template_name_value.strip())
+                        edited_subjects.append(subject_value.strip())
+                        edited_bodies.append(body_value.strip())
+
+                existing_template_hits = [
+                    name for name in edited_template_names
+                    if name and name in set(template_names)
+                ]
+                if existing_template_hits:
+                    st.caption("同名テンプレートがある場合は、保存するとそのテンプレート本文を更新します。")
+
+                save_ai_col, clear_ai_col = st.columns(2)
+                if save_ai_col.button(
+                    "この内容でテンプレートとシナリオに保存",
+                    key=f"save_ai_generated_scenario_{ai_token}",
+                    width="stretch",
+                ):
+                    duplicate_template_names = {
+                        name for name in edited_template_names
+                        if edited_template_names.count(name) > 1 and name
+                    }
+                    if not edited_scenario_name.strip():
+                        st.error("保存するシナリオ名を入力してください。")
+                    elif not allow_scenario_overwrite:
+                        st.error("同名シナリオを更新する場合は、上書き確認にチェックしてください。")
+                    elif not generated_steps:
+                        st.error("保存できるステップがありません。もう一度生成してください。")
+                    elif any(not name for name in edited_template_names):
+                        st.error("テンプレート名が空のステップがあります。")
+                    elif duplicate_template_names:
+                        st.error("テンプレート名が重複しています。各ステップで違う名前にしてください。")
+                    elif any(not subject for subject in edited_subjects):
+                        st.error("件名が空のステップがあります。")
+                    elif any(not body for body in edited_bodies):
+                        st.error("本文が空のステップがあります。")
+                    else:
+                        for template_name, subject, body in zip(edited_template_names, edited_subjects, edited_bodies):
+                            save_campaign_template(template_name, subject, body)
+                        save_scenario(edited_scenario_name, edited_template_names)
+                        st.session_state.pop("ai_generated_scenario", None)
+                        st.session_state.pop("ai_generated_scenario_token", None)
+                        st.session_state["scenario_editor_select"] = edited_scenario_name
+                        st.success(f"シナリオ「{edited_scenario_name}」を保存しました。")
+                        st.rerun()
+                if clear_ai_col.button(
+                    "生成結果を閉じる",
+                    key=f"clear_ai_generated_scenario_{ai_token}",
+                    width="stretch",
+                ):
+                    st.session_state.pop("ai_generated_scenario", None)
+                    st.session_state.pop("ai_generated_scenario_token", None)
+                    st.rerun()
         if template_names:
             scenarios = fetch_scenarios()
             with st.expander("シナリオ設定"):
