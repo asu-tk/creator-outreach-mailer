@@ -72,6 +72,8 @@ AI_SCENARIO_EXPECTED_SECONDS = 75
 AI_SCENARIO_STALE_SECONDS = 90
 AI_OPENAI_TIMEOUT_SECONDS = 75
 AI_IMAGE_MAX_BYTES = 8 * 1024 * 1024
+STREAMLIT_SEND_QUEUE_BATCH_SIZE = 1
+STREAMLIT_SEND_QUEUE_MIN_INTERVAL_SECONDS = 25
 UNSUBSCRIBE_SCOPE_GLOBAL = "global"
 UNSUBSCRIBE_SCOPE_SCENARIO = "scenario"
 UNSUBSCRIBE_SCOPE_CAMPAIGN = "campaign"
@@ -4058,11 +4060,24 @@ def format_local_datetime(value: datetime) -> str:
     return value.astimezone(APP_TIMEZONE).strftime("%Y-%m-%d %H:%M（日本時間）")
 
 
-def send_email(to_email: str, subject: str, body: str) -> tuple[bool, str]:
-    if not smtp_configured():
-        return True, "DRY_RUN: SMTP設定がないため実送信はしていません"
+def smtp_account_configured(account: dict) -> bool:
+    return all(
+        str(account.get(key) or "").strip()
+        for key in ["smtp_host", "smtp_port", "sender_email", "smtp_pass"]
+    )
 
-    account = active_smtp_account()
+
+def smtp_account_uses_ssl(account: dict) -> bool:
+    value = account.get("smtp_ssl")
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def send_email_with_account(account: dict, to_email: str, subject: str, body: str) -> tuple[bool, str]:
+    if not smtp_account_configured(account):
+        return False, "送信元メール設定が未完了です。SMTPサーバー、ポート、送信元メールアドレス、SMTPパスワードを確認してください。"
+
     message = EmailMessage()
     message["From"] = smtp_mail_from(account)
     message["To"] = to_email
@@ -4071,7 +4086,7 @@ def send_email(to_email: str, subject: str, body: str) -> tuple[bool, str]:
 
     host = str(account.get("smtp_host") or "")
     port = int(str(account.get("smtp_port") or "587"))
-    use_ssl = int(account.get("smtp_ssl") or 0) == 1
+    use_ssl = smtp_account_uses_ssl(account)
     sender_email = str(account.get("sender_email") or "")
     smtp_pass = str(account.get("smtp_pass") or "")
 
@@ -4092,6 +4107,12 @@ def send_email(to_email: str, subject: str, body: str) -> tuple[bool, str]:
         return False, friendly_smtp_error(str(exc))
 
 
+def send_email(to_email: str, subject: str, body: str) -> tuple[bool, str]:
+    if not smtp_configured():
+        return True, "DRY_RUN: SMTP設定がないため実送信はしていません"
+    return send_email_with_account(active_smtp_account(), to_email, subject, body)
+
+
 def post_send_queue_rows(queue_rows: list[dict]) -> None:
     chunk_size = 100
     for index in range(0, len(queue_rows), chunk_size):
@@ -4101,6 +4122,17 @@ def post_send_queue_rows(queue_rows: list[dict]) -> None:
             queue_rows[index : index + chunk_size],
             prefer="return=minimal",
         )
+
+
+def send_queue_has_rows(job_id: str) -> bool:
+    if not supabase_configured() or not str(job_id or "").strip():
+        return False
+    query_job_id = urllib.parse.quote(str(job_id), safe="")
+    result = supabase_request(
+        "GET",
+        f"send_queue?job_id=eq.{query_job_id}&select=id&limit=1",
+    )
+    return bool(isinstance(result, list) and result)
 
 
 def insert_queued_send_rows(send_rows: list[tuple]) -> None:
@@ -4199,6 +4231,14 @@ def create_send_job(
         )
     if queue_rows:
         post_send_queue_rows(queue_rows)
+        if not send_queue_has_rows(str(job_id)):
+            supabase_request(
+                "PATCH",
+                f"send_jobs?id=eq.{urllib.parse.quote(str(job_id), safe='')}",
+                {"status": "failed", "updated_at": now_iso()},
+                prefer="return=minimal",
+            )
+            return False, "送信予約の中身をクラウドへ保存できませんでした。もう一度予約を作り直してください。"
     queued_at = now_iso()
     insert_queued_send_rows(
         [
@@ -4350,8 +4390,186 @@ def create_scenario_full_send_job(
 
     if queue_rows:
         post_send_queue_rows(queue_rows)
+        if not send_queue_has_rows(job_id):
+            supabase_request(
+                "PATCH",
+                f"send_jobs?id=eq.{urllib.parse.quote(job_id, safe='')}",
+                {"status": "failed", "updated_at": now_iso()},
+                prefer="return=minimal",
+            )
+            return False, "送信予約の中身をクラウドへ保存できませんでした。もう一度予約を作り直してください。"
     insert_queued_send_rows(local_rows)
     return True, f"{len(contacts)}件の宛先に、{len(prepared_steps)}ステップ分（合計{total_count}通）の送信予約を作成しました"
+
+
+def smtp_account_from_send_job(job: dict) -> dict:
+    return {
+        "sender_name": str(job.get("sender_name") or ""),
+        "sender_email": str(job.get("sender_email") or ""),
+        "smtp_host": str(job.get("smtp_host") or ""),
+        "smtp_port": str(job.get("smtp_port") or "587"),
+        "smtp_ssl": job.get("smtp_ssl"),
+        "smtp_pass": str(job.get("smtp_pass") or ""),
+    }
+
+
+def update_send_queue_row_status(row_id: str, status: str, error: str = "") -> None:
+    payload = {
+        "status": status,
+        "error": error,
+        "updated_at": now_iso(),
+    }
+    if status == "sent":
+        payload["sent_at"] = now_iso()
+    supabase_request(
+        "PATCH",
+        f"send_queue?id=eq.{urllib.parse.quote(str(row_id), safe='')}",
+        payload,
+        prefer="return=minimal",
+    )
+
+
+def claim_send_queue_row(row_id: str) -> dict:
+    claimed_rows = supabase_request(
+        "PATCH",
+        f"send_queue?id=eq.{urllib.parse.quote(str(row_id), safe='')}&status=eq.pending",
+        {"status": "sending", "updated_at": now_iso()},
+        prefer="return=representation",
+    )
+    if isinstance(claimed_rows, list) and claimed_rows:
+        return claimed_rows[0]
+    return {}
+
+
+def update_local_queued_send_result(item: dict, status: str, error: str, sent_at: str) -> None:
+    contact_id = item.get("contact_local_id")
+    campaign_key_value = str(item.get("campaign_key") or "")
+    if not contact_id or not campaign_key_value:
+        return
+    send_job_id = str(item.get("job_id") or "")
+    if send_job_id:
+        execute(
+            """
+            update sends
+            set status = ?, error = ?, sent_at = ?
+            where user_id = ?
+              and send_job_id = ?
+              and contact_id = ?
+              and campaign_key = ?
+              and status = 'queued'
+            """,
+            (status, error, sent_at, current_user_id(), send_job_id, int(contact_id), campaign_key_value),
+        )
+    execute(
+        """
+        update sends
+        set status = ?, error = ?, sent_at = ?
+        where user_id = ?
+          and contact_id = ?
+          and campaign_key = ?
+          and subject = ?
+          and status = 'queued'
+        """,
+        (status, error, sent_at, current_user_id(), int(contact_id), campaign_key_value, str(item.get("subject") or "")),
+    )
+
+
+def process_due_send_queue_from_streamlit() -> dict[str, int | bool]:
+    result: dict[str, int | bool] = {"checked": False, "processed": 0, "failed": 0}
+    if not supabase_configured():
+        return result
+    user_email = current_user_profile()["email"].strip().lower()
+    if not user_email:
+        return result
+
+    now_epoch = time.time()
+    last_checked = float(st.session_state.get("_send_queue_last_checked_at", 0) or 0)
+    if now_epoch - last_checked < STREAMLIT_SEND_QUEUE_MIN_INTERVAL_SECONDS:
+        return result
+    st.session_state["_send_queue_last_checked_at"] = now_epoch
+    result["checked"] = True
+
+    try:
+        query_email = urllib.parse.quote(user_email, safe="")
+        now_value = urllib.parse.quote(datetime.now(timezone.utc).isoformat(timespec="seconds"), safe="")
+        due_rows = supabase_request(
+            "GET",
+            (
+                "send_queue"
+                f"?user_email=eq.{query_email}"
+                "&status=eq.pending"
+                f"&scheduled_at=lte.{now_value}"
+                "&select=id,job_id,contact_local_id,campaign_key,contact_email,subject,body,scheduled_at"
+                "&order=scheduled_at.asc"
+                f"&limit={STREAMLIT_SEND_QUEUE_BATCH_SIZE}"
+            ),
+        )
+    except Exception as exc:
+        print(f"[send queue] fetch-failed error={exc}", flush=True)
+        return result
+
+    if not isinstance(due_rows, list) or not due_rows:
+        return result
+
+    affected_job_ids: set[str] = set()
+    for item in due_rows:
+        row_id = str(item.get("id") or "").strip()
+        job_id = str(item.get("job_id") or "").strip()
+        if not row_id or not job_id:
+            continue
+        claimed = False
+        status = "failed"
+        error = ""
+        try:
+            claimed_row = claim_send_queue_row(row_id)
+            if not claimed_row:
+                continue
+            claimed = True
+
+            query_job_id = urllib.parse.quote(job_id, safe="")
+            jobs = supabase_request("GET", f"send_jobs?id=eq.{query_job_id}&select=*")
+            if not isinstance(jobs, list) or not jobs:
+                error = "送信予約の設定が見つかりませんでした。"
+            else:
+                to_email = str(item.get("contact_email") or "").strip()
+                if not to_email:
+                    error = "宛先メールアドレスが空です。"
+                else:
+                    ok, message = send_email_with_account(
+                        smtp_account_from_send_job(jobs[0]),
+                        to_email,
+                        str(item.get("subject") or ""),
+                        str(item.get("body") or ""),
+                    )
+                    status = "sent" if ok else "failed"
+                    error = "" if ok else message
+
+            processed_at = now_iso()
+            update_send_queue_row_status(row_id, status, error)
+            update_local_queued_send_result(item, status, error, processed_at)
+            affected_job_ids.add(job_id)
+            result["processed"] = int(result["processed"]) + 1
+            if status == "failed":
+                result["failed"] = int(result["failed"]) + 1
+            print(
+                f"[send queue] processed status={status} job={job_id} row={row_id} to={mask_email_address(str(item.get('contact_email') or ''))}",
+                flush=True,
+            )
+        except Exception as exc:
+            error = friendly_smtp_error(str(exc))
+            if claimed and status != "sent":
+                try:
+                    update_send_queue_row_status(row_id, "failed", error)
+                    update_local_queued_send_result(item, "failed", error, now_iso())
+                    affected_job_ids.add(job_id)
+                    result["processed"] = int(result["processed"]) + 1
+                    result["failed"] = int(result["failed"]) + 1
+                except Exception:
+                    pass
+            print(f"[send queue] process-failed job={job_id} row={row_id} error={exc}", flush=True)
+
+    refresh_supabase_send_jobs(affected_job_ids)
+    return result
 
 
 def sync_send_queue_results() -> None:
@@ -4369,39 +4587,10 @@ def sync_send_queue_results() -> None:
         if not isinstance(results, list):
             return
         for item in results:
-            contact_id = item.get("contact_local_id")
-            campaign_key_value = item.get("campaign_key", "")
-            if not contact_id or not campaign_key_value:
-                continue
             sent_at = item.get("sent_at") or now_iso()
             status = item.get("status", "")
             error = item.get("error", "")
-            send_job_id = str(item.get("job_id") or "")
-            if send_job_id:
-                execute(
-                    """
-                    update sends
-                    set status = ?, error = ?, sent_at = ?
-                    where user_id = ?
-                      and send_job_id = ?
-                      and contact_id = ?
-                      and campaign_key = ?
-                      and status = 'queued'
-                    """,
-                    (status, error, sent_at, current_user_id(), send_job_id, int(contact_id), campaign_key_value),
-                )
-            execute(
-                """
-                update sends
-                set status = ?, error = ?, sent_at = ?
-                where user_id = ?
-                  and contact_id = ?
-                  and campaign_key = ?
-                  and subject = ?
-                  and status = 'queued'
-                """,
-                (status, error, sent_at, current_user_id(), int(contact_id), campaign_key_value, str(item.get("subject") or "")),
-            )
+            update_local_queued_send_result(item, status, error, sent_at)
     except Exception:
         return
 
@@ -4410,10 +4599,12 @@ def send_job_status_label(status: str) -> str:
     return {
         "queued": "送信待ち",
         "pending": "送信待ち",
+        "sending": "送信中",
         "running": "送信中",
         "processing": "送信中",
         "completed": "完了",
         "done": "完了",
+        "finished": "完了",
         "failed": "失敗",
         "canceled": "取消済み",
         "cancelled": "取消済み",
@@ -4449,7 +4640,7 @@ def send_job_success_percent(job: dict) -> float:
 
 def is_active_send_job(job: dict) -> bool:
     status = str(job.get("status") or "").lower()
-    if status in {"canceled", "cancelled", "completed", "done", "failed"}:
+    if status in {"canceled", "cancelled", "completed", "done", "finished", "failed"}:
         return False
     total_count = send_job_count(job, "total_count")
     return total_count <= 0 or send_job_processed_count(job) < total_count
@@ -5002,6 +5193,9 @@ def fetch_recent_send_jobs(limit: int = 20) -> list[dict]:
 
 def fetch_send_job_queue_summary(job_id: str) -> dict[str, object]:
     summary: dict[str, object] = {
+        "has_queue": False,
+        "first_queue_status": "",
+        "first_queue_at": "",
         "next_pending_at": "",
         "overdue_pending": False,
     }
@@ -5009,6 +5203,15 @@ def fetch_send_job_queue_summary(job_id: str) -> dict[str, object]:
         return summary
     try:
         query_job_id = urllib.parse.quote(str(job_id), safe="")
+        first_rows = supabase_request(
+            "GET",
+            f"send_queue?job_id=eq.{query_job_id}&select=status,scheduled_at&order=scheduled_at.asc&limit=1",
+        )
+        if isinstance(first_rows, list) and first_rows:
+            summary["has_queue"] = True
+            summary["first_queue_status"] = str(first_rows[0].get("status") or "")
+            summary["first_queue_at"] = str(first_rows[0].get("scheduled_at") or "")
+
         next_rows = supabase_request(
             "GET",
             f"send_queue?job_id=eq.{query_job_id}&status=eq.pending&select=scheduled_at&order=scheduled_at.asc&limit=1",
@@ -5023,6 +5226,9 @@ def fetch_send_job_queue_summary(job_id: str) -> dict[str, object]:
         )
         summary["overdue_pending"] = bool(isinstance(overdue_rows, list) and overdue_rows)
     except Exception:
+        summary["has_queue"] = False
+        summary["first_queue_status"] = ""
+        summary["first_queue_at"] = ""
         summary["next_pending_at"] = ""
         summary["overdue_pending"] = False
     return summary
@@ -6397,6 +6603,7 @@ def main() -> None:
     sync_send_queue_results()
     sync_unsubscribes_from_supabase()
     cleanup_blocked_targets_for_existing_contacts()
+    process_due_send_queue_from_streamlit()
 
     st.title("Creator Outreach Mailer")
     st.caption("許諾済みの宛先だけに、1件ずつ送信する個人用Webアプリ")
@@ -6722,310 +6929,6 @@ def main() -> None:
                     )
                 else:
                     st.write("通常配信用のテンプレートはありません。シナリオに含まれるテンプレートは「シナリオごとの成績」で確認してください。")
-        ai_generated_pending = isinstance(st.session_state.get("ai_generated_scenario"), dict) and bool(
-            st.session_state.get("ai_generated_scenario")
-        )
-        ai_scenario_notice = st.session_state.pop("ai_scenario_notice", "")
-        refresh_stale_ai_scenario_status()
-        ai_scenario_last_status = st.session_state.get("ai_scenario_last_status")
-        ai_scenario_status_value = ""
-        if isinstance(ai_scenario_last_status, dict):
-            ai_scenario_status_value = str(ai_scenario_last_status.get("status") or "").strip()
-        with st.expander(
-            "AIシナリオ作成",
-            expanded=bool(ai_generated_pending or ai_scenario_notice or ai_scenario_status_value in {"failed", "generated", "running"}),
-        ):
-            st.caption("商品写真、ASP紹介文、ペルソナ情報からステップ配信用の下書きを作ります。生成後に件名・本文を確認してから保存できます。")
-            st.caption(f"生成ボタンを押した時だけOpenAI APIを呼びます。使用モデル: {openai_model()}")
-            if ai_scenario_notice:
-                st.success(ai_scenario_notice)
-            st.info("AIで作成しただけでは登録されません。生成結果を確認して、最後に「この内容でテンプレートとシナリオに保存」を押すと保存されます。")
-            if not openai_api_key():
-                st.warning("AI生成を使うには、Streamlit SecretsにOpenAI APIキーを追加してください。")
-                st.code(
-                    '[openai]\napi_key = "sk-..."\nmodel = "gpt-4.1-mini"',
-                    language="toml",
-                )
-                st.caption("貼る場所はSecretsの一番上です。[auth]や[google]の下には入れないでください。")
-
-            ai_input_left, ai_input_right = st.columns([1.2, 1.0])
-            with ai_input_left:
-                ai_requested_scenario_name = st.text_input(
-                    "シナリオ名",
-                    placeholder="例: UniVerse 初回営業シナリオ",
-                    key="ai_scenario_requested_name",
-                )
-                ai_product_name = st.text_input(
-                    "商品名",
-                    placeholder="例: UniVerse / サッカーボール教材",
-                    key="ai_scenario_product_name",
-                )
-                ai_product_url = st.text_input(
-                    "アフィリエイトURL（任意）",
-                    placeholder="https://...",
-                    key="ai_scenario_product_url",
-                )
-                ai_product_image = st.file_uploader(
-                    "商品写真をアップロード（任意）",
-                    type=["png", "jpg", "jpeg", "webp"],
-                    key="ai_scenario_product_image",
-                )
-                if ai_product_image:
-                    st.image(ai_product_image, caption="商品写真プレビュー", width=260)
-            with ai_input_right:
-                ai_step_count = st.number_input(
-                    "作成する通数",
-                    min_value=1,
-                    max_value=10,
-                    value=5,
-                    step=1,
-                    key="ai_scenario_step_count",
-                )
-                ai_tone = st.selectbox(
-                    "文体",
-                    ["丁寧で自然", "やわらかめ", "法人向け", "フランク", "少し強め"],
-                    key="ai_scenario_tone",
-                )
-                st.info("本文には配信停止URLを入れません。アプリ側が送信時に自動で付けます。")
-
-            ai_product_info = st.text_area(
-                "商品説明・LP本文・ASP紹介文",
-                placeholder="商品ページやASPに書かれている説明文、報酬条件、強み、注意点などを貼り付けます。",
-                height=190,
-                key="ai_scenario_product_info",
-            )
-            ai_persona_info = st.text_area(
-                "ペルソナ・ターゲット・訴求条件（任意）",
-                placeholder="例: 子育て系YouTuber向け / 初心者向け / 単価は高いが信頼重視 / NG表現など",
-                height=150,
-                key="ai_scenario_persona_info",
-            )
-            generate_disabled = not bool(openai_api_key())
-            recent_ai_running = (
-                isinstance(ai_scenario_last_status, dict)
-                and ai_scenario_status_value == "running"
-                and ai_scenario_status_age_seconds(ai_scenario_last_status) < AI_SCENARIO_STALE_SECONDS
-            )
-            generate_clicked = st.button(
-                "AIでシナリオ案を作成",
-                key="generate_ai_scenario_button",
-                width="stretch",
-                disabled=generate_disabled or recent_ai_running,
-            )
-            ai_status_slot = st.empty()
-            if generate_clicked:
-                if not ai_requested_scenario_name.strip():
-                    set_ai_scenario_status("failed", "AI生成を開始できませんでした。", "シナリオ名を入力してください。")
-                    with ai_status_slot.container():
-                        render_ai_scenario_status(st.session_state.get("ai_scenario_last_status"))
-                elif not ai_product_name.strip():
-                    set_ai_scenario_status("failed", "AI生成を開始できませんでした。", "商品名を入力してください。")
-                    with ai_status_slot.container():
-                        render_ai_scenario_status(st.session_state.get("ai_scenario_last_status"))
-                elif not ai_product_info.strip():
-                    set_ai_scenario_status("failed", "AI生成を開始できませんでした。", "商品説明・ASP紹介文を入力してください。")
-                    with ai_status_slot.container():
-                        render_ai_scenario_status(st.session_state.get("ai_scenario_last_status"))
-                else:
-                    try:
-                        set_ai_scenario_status("running", "AIシナリオを生成中です。ボタンのすぐ下に進み具合を表示しています。")
-                        with ai_status_slot.container():
-                            render_ai_scenario_status(st.session_state.get("ai_scenario_last_status"))
-                        log_ai_scenario_event(
-                            "started",
-                            f"model={openai_model()} steps={int(ai_step_count)} image={'yes' if ai_product_image else 'no'}",
-                        )
-                        image_reference = ai_input_image_reference(ai_product_image)
-                        with ai_status_slot.container():
-                            if image_reference:
-                                st.info("入力内容と商品写真を確認しました。AIにシナリオ作成を依頼しています。")
-                            else:
-                                st.info("入力内容を確認しました。写真なしでAIにシナリオ作成を依頼しています。")
-                            st.progress(35, text="AIへ依頼中です。通常30秒〜75秒ほどかかります。")
-                        log_ai_scenario_event(
-                            "requesting-openai",
-                            f"model={openai_model()} steps={int(ai_step_count)} image={'yes' if image_reference else 'no'}",
-                        )
-                        with st.spinner("AIがシナリオ案を作成しています..."):
-                            generated_scenario = generate_ai_scenario(
-                                ai_requested_scenario_name,
-                                ai_product_name,
-                                ai_product_url,
-                                ai_product_info,
-                                ai_persona_info,
-                                ai_tone,
-                                int(ai_step_count),
-                                image_reference,
-                            )
-                        generated_step_count = len(generated_scenario.get("steps") or [])
-                        scenario_digest = hashlib.sha1(
-                            json.dumps(generated_scenario, ensure_ascii=False, sort_keys=True).encode("utf-8")
-                        ).hexdigest()[:10]
-                        st.session_state["ai_generated_scenario"] = generated_scenario
-                        st.session_state["ai_generated_scenario_token"] = scenario_digest
-                        set_ai_scenario_status(
-                            "generated",
-                            f"{generated_step_count}通のAIシナリオ案を作成しました。まだ保存されていません。",
-                        )
-                        log_ai_scenario_event("generated", f"model={openai_model()} steps={generated_step_count}")
-                        st.session_state["ai_scenario_notice"] = "AIシナリオ案を作成しました。下の内容を確認してから保存してください。"
-                        st.rerun()
-                    except Exception as exc:
-                        error_message = str(exc)
-                        set_ai_scenario_status("failed", "AIシナリオ作成に失敗しました。理由を確認してください。", error_message)
-                        log_ai_scenario_event("failed", error_message)
-                        with ai_status_slot.container():
-                            render_ai_scenario_status(st.session_state.get("ai_scenario_last_status"))
-            else:
-                with ai_status_slot.container():
-                    render_ai_scenario_status(st.session_state.get("ai_scenario_last_status"))
-
-            generated_scenario = st.session_state.get("ai_generated_scenario")
-            if isinstance(generated_scenario, dict) and generated_scenario:
-                generated_steps = [
-                    step for step in generated_scenario.get("steps", [])
-                    if isinstance(step, dict)
-                ]
-                ai_token = str(st.session_state.get("ai_generated_scenario_token") or "")
-                if not ai_token:
-                    ai_token = hashlib.sha1(
-                        json.dumps(generated_scenario, ensure_ascii=False, sort_keys=True).encode("utf-8")
-                    ).hexdigest()[:10]
-                    st.session_state["ai_generated_scenario_token"] = ai_token
-                st.divider()
-                st.markdown("**生成結果**")
-                st.warning("この生成結果はまだ保存されていません。内容を確認して、下の保存ボタンを押してください。")
-                summary_cols = st.columns(3)
-                summary_cols[0].metric("作成通数", len(generated_steps))
-                summary_cols[1].metric("推奨間隔", f"{int(generated_scenario.get('recommended_send_gap_days') or 0)}日")
-                summary_cols[2].metric("保存先", "テンプレート + シナリオ")
-                strategy_summary = str(generated_scenario.get("strategy_summary") or "").strip()
-                target_persona = str(generated_scenario.get("target_persona") or "").strip()
-                offer_angle = str(generated_scenario.get("offer_angle") or "").strip()
-                if strategy_summary:
-                    st.write(f"方針: {strategy_summary}")
-                if target_persona:
-                    st.write(f"想定相手: {target_persona}")
-                if offer_angle:
-                    st.write(f"訴求: {offer_angle}")
-                risk_notes = [
-                    str(note).strip()
-                    for note in generated_scenario.get("risk_notes", [])
-                    if str(note).strip()
-                ]
-                if risk_notes:
-                    with st.expander("AIからの注意点"):
-                        for note in risk_notes:
-                            st.write(f"- {note}")
-
-                edited_scenario_name = st.text_input(
-                    "保存するシナリオ名",
-                    value=str(generated_scenario.get("scenario_name") or ai_product_name or "").strip(),
-                    key=f"ai_generated_scenario_name_{ai_token}",
-                )
-                existing_scenario_names = {
-                    str(scenario["name"]).strip()
-                    for scenario in fetch_scenarios()
-                    if str(scenario["name"]).strip()
-                }
-                overwrites_existing_scenario = edited_scenario_name.strip() in existing_scenario_names
-                allow_scenario_overwrite = True
-                if overwrites_existing_scenario:
-                    st.warning("同じ名前のシナリオがあります。保存すると同じシナリオIDのまま中身を更新します。")
-                    allow_scenario_overwrite = st.checkbox(
-                        "同名シナリオを上書きして保存する",
-                        key=f"ai_allow_scenario_overwrite_{ai_token}",
-                    )
-
-                edited_template_names: list[str] = []
-                edited_subjects: list[str] = []
-                edited_bodies: list[str] = []
-                for index, step in enumerate(generated_steps, start=1):
-                    default_step_number = int(step.get("step_number") or index)
-                    default_template_name = str(step.get("template_name") or f"{edited_scenario_name} {index}通目").strip()
-                    default_purpose = str(step.get("purpose") or "").strip()
-                    with st.expander(f"{default_step_number}通目: {default_template_name}", expanded=index == 1):
-                        if default_purpose:
-                            st.caption(f"目的: {default_purpose}")
-                        template_name_value = st.text_input(
-                            "テンプレート名",
-                            value=default_template_name,
-                            key=f"ai_template_name_{ai_token}_{index}",
-                        )
-                        subject_value = st.text_input(
-                            "件名",
-                            value=str(step.get("subject") or "").strip(),
-                            key=f"ai_subject_{ai_token}_{index}",
-                        )
-                        body_value = st.text_area(
-                            "本文",
-                            value=str(step.get("body") or "").strip(),
-                            height=300,
-                            key=f"ai_body_{ai_token}_{index}",
-                        )
-                        edited_template_names.append(template_name_value.strip())
-                        edited_subjects.append(subject_value.strip())
-                        edited_bodies.append(body_value.strip())
-
-                existing_template_hits = [
-                    name for name in edited_template_names
-                    if name and name in set(template_names)
-                ]
-                if existing_template_hits:
-                    st.caption("同名テンプレートがある場合は、保存するとそのテンプレート本文を更新します。")
-
-                save_ai_col, clear_ai_col = st.columns(2)
-                if save_ai_col.button(
-                    "この内容でテンプレートとシナリオに保存",
-                    key=f"save_ai_generated_scenario_{ai_token}",
-                    width="stretch",
-                ):
-                    duplicate_template_names = {
-                        name for name in edited_template_names
-                        if edited_template_names.count(name) > 1 and name
-                    }
-                    if not edited_scenario_name.strip():
-                        st.error("保存するシナリオ名を入力してください。")
-                    elif not allow_scenario_overwrite:
-                        st.error("同名シナリオを更新する場合は、上書き確認にチェックしてください。")
-                    elif not generated_steps:
-                        st.error("保存できるステップがありません。もう一度生成してください。")
-                    elif any(not name for name in edited_template_names):
-                        st.error("テンプレート名が空のステップがあります。")
-                    elif duplicate_template_names:
-                        st.error("テンプレート名が重複しています。各ステップで違う名前にしてください。")
-                    elif any(not subject for subject in edited_subjects):
-                        st.error("件名が空のステップがあります。")
-                    elif any(not body for body in edited_bodies):
-                        st.error("本文が空のステップがあります。")
-                    else:
-                        for template_name, subject, body in zip(edited_template_names, edited_subjects, edited_bodies):
-                            save_campaign_template(template_name, subject, body)
-                        saved_scenario_id = save_scenario(edited_scenario_name, edited_template_names)
-                        if not saved_scenario_id:
-                            set_ai_scenario_status(
-                                "failed",
-                                "シナリオ保存に失敗しました。",
-                                "シナリオ名とテンプレート名を確認してください。",
-                            )
-                            st.error("シナリオを保存できませんでした。シナリオ名とテンプレート名を確認してください。")
-                        else:
-                            st.session_state.pop("ai_generated_scenario", None)
-                            st.session_state.pop("ai_generated_scenario_token", None)
-                            st.session_state["scenario_editor_select"] = edited_scenario_name
-                            set_ai_scenario_status("saved", f"シナリオ「{edited_scenario_name}」を保存しました。")
-                            log_ai_scenario_event("saved", f"steps={len(edited_template_names)}")
-                            st.session_state["ai_scenario_notice"] = f"シナリオ「{edited_scenario_name}」を保存しました。下のシナリオ設定に追加されています。"
-                            st.rerun()
-                if clear_ai_col.button(
-                    "生成結果を閉じる",
-                    key=f"clear_ai_generated_scenario_{ai_token}",
-                    width="stretch",
-                ):
-                    st.session_state.pop("ai_generated_scenario", None)
-                    st.session_state.pop("ai_generated_scenario_token", None)
-                    set_ai_scenario_status("idle", "生成結果を閉じました。")
-                    st.rerun()
         if template_names:
             scenarios = fetch_scenarios()
             with st.expander("シナリオ設定"):
@@ -7727,7 +7630,7 @@ def main() -> None:
                 if refresh_col.button("状態を更新", width="stretch"):
                     sync_send_queue_results()
                     st.rerun()
-                note_col.caption("送信予約の進捗は30秒ごとに自動更新されます。複数シナリオを予約した場合もここでまとめて確認できます。")
+                note_col.caption("送信予約の進捗は30秒ごとに自動更新されます。この画面を開いている間は、予定時刻を過ぎた送信待ちも1通ずつ処理します。")
                 cancel_notice = st.session_state.pop("send_job_cancel_notice", "")
                 cancel_error = st.session_state.pop("send_job_cancel_error", "")
                 if cancel_notice:
@@ -7790,6 +7693,7 @@ def main() -> None:
                     for job in active_jobs[:8]:
                         job_id = str(job.get("id") or "")
                         queue_summary = job_queue_summaries.get(job_id, {})
+                        has_queue = bool(queue_summary.get("has_queue"))
                         next_pending_at = str(queue_summary.get("next_pending_at") or "")
                         overdue_pending = bool(queue_summary.get("overdue_pending"))
                         campaign_name_value = str(job.get("campaign_name") or "名称未設定")
@@ -7798,8 +7702,13 @@ def main() -> None:
                         st.write(f"**{campaign_name_value}**")
                         if next_pending_at:
                             st.caption(f"次の送信予定: {format_jst_datetime_compact(next_pending_at)}")
+                        elif send_job_processed_count(job) < send_job_count(job, "total_count"):
+                            if not has_queue:
+                                st.error("送信予約の中身が見つかりません。予約作成中に中断された可能性があります。いったん予約を取消して、もう一度作り直してください。")
+                            else:
+                                st.warning("送信キューはありますが、次の送信待ちが見つかりません。処理中のまま止まっている可能性があります。")
                         if overdue_pending:
-                            st.warning("予定時刻を過ぎた送信待ちがあります。数分待っても進まない場合は、サーバー側の定期送信処理を確認してください。")
+                            st.warning("予定時刻を過ぎた送信待ちがあります。この画面を開いている間は、アプリ側でも1通ずつ処理します。")
                         st.progress(progress_ratio)
                         progress_cols = st.columns([1.0, 1.0, 1.0, 1.0, 1.2])
                         progress_cols[0].metric("進捗", f"{progress_percent:.1f}%")
@@ -7821,6 +7730,9 @@ def main() -> None:
                     jobs_display["processed_count"] = jobs_display.apply(send_job_processed_count, axis=1)
                     jobs_display["status"] = jobs_display["status"].apply(send_job_status_label)
                     jobs_display["created_at_jst"] = jobs_display["created_at"].apply(format_jst_datetime_compact)
+                    jobs_display["queue_state"] = jobs_display["id"].apply(
+                        lambda value: "あり" if bool(job_queue_summaries.get(str(value), {}).get("has_queue")) else "なし"
+                    )
                     jobs_display["next_pending_at"] = jobs_display["id"].apply(
                         lambda value: format_jst_datetime_compact(
                             str(job_queue_summaries.get(str(value), {}).get("next_pending_at") or "")
@@ -7840,6 +7752,7 @@ def main() -> None:
                                 "progress_percent",
                                 "success_percent",
                                 "status",
+                                "queue_state",
                                 "created_at_jst",
                                 "next_pending_at",
                                 "overdue_pending",
@@ -7854,6 +7767,7 @@ def main() -> None:
                                 "progress_percent": "進捗",
                                 "success_percent": "送信成功率",
                                 "status": "状態",
+                                "queue_state": "送信キュー",
                                 "created_at_jst": "作成日時",
                                 "next_pending_at": "次の送信予定",
                                 "overdue_pending": "予定時刻超過",
