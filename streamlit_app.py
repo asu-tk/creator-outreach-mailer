@@ -47,6 +47,18 @@ GOOGLE_APP_SCOPES = [
     "profile",
 ]
 OUTSOURCE_SHEET_NAME = "外注用候補"
+OUTSOURCE_SHEET_COLUMNS = [
+    "チャンネル名",
+    "YouTube URL",
+    "メールアドレス",
+    "取り込まない",
+    "メモ",
+    "状態",
+    "候補ID（編集しない）",
+    "チャンネルID（編集しない）",
+    "検索キーワード",
+    "作成日時",
+]
 GOOGLE_SHEET_WRITE_DISABLED_MESSAGE = (
     "外注用GoogleシートはURL登録方式で運用しています。"
 )
@@ -1034,24 +1046,13 @@ def contacts_export_frame(contacts: pd.DataFrame) -> pd.DataFrame:
 
 def candidates_outsource_frame(candidates: pd.DataFrame) -> pd.DataFrame:
     if candidates.empty:
-        return pd.DataFrame(
-            columns=[
-                "チャンネル名",
-                "YouTube URL",
-                "メールアドレス",
-                "メモ",
-                "状態",
-                "候補ID（編集しない）",
-                "チャンネルID（編集しない）",
-                "検索キーワード",
-                "作成日時",
-            ]
-        )
+        return pd.DataFrame(columns=OUTSOURCE_SHEET_COLUMNS)
     export = pd.DataFrame(
         {
             "チャンネル名": candidates["title"].fillna("").astype(str),
             "YouTube URL": candidates["channel_url"].fillna("").astype(str),
             "メールアドレス": candidates["email"].fillna("").astype(str) if "email" in candidates.columns else "",
+            "取り込まない": "FALSE",
             "メモ": "",
             "状態": "",
             "候補ID（編集しない）": candidates["id"].fillna("").astype(str),
@@ -1325,6 +1326,64 @@ def read_outsource_sheet_values(token: str, spreadsheet_id: str) -> list[list]:
     return result.get("values", [])
 
 
+def has_outsource_discard_column(values: list[list]) -> bool:
+    if not values:
+        return False
+    header = [str(value or "").strip() for value in values[0]]
+    return any(
+        normalize_column_name(column) in {"取り込まない", "取込まない", "除外", "メールなし", "noemail", "skip", "discard"}
+        for column in header
+    )
+
+
+def add_outsource_discard_column(values: list[list]) -> list[list]:
+    if not values or has_outsource_discard_column(values):
+        return values
+    header = [str(value or "").strip() for value in values[0]]
+    email_index = next(
+        (
+            index
+            for index, column in enumerate(header)
+            if normalize_column_name(column) in {"メールアドレス", "email", "emailaddress", "mail"}
+        ),
+        -1,
+    )
+    if email_index < 0:
+        return values
+    insert_index = email_index + 1
+    migrated = []
+    for row_index, row in enumerate(values):
+        normalized = list(row)
+        while len(normalized) < insert_index:
+            normalized.append("")
+        inserted_value = "取り込まない" if row_index == 0 else "FALSE"
+        normalized.insert(insert_index, inserted_value)
+        migrated.append(normalized)
+    return migrated
+
+
+def ensure_outsource_sheet_columns(token: str, spreadsheet_id: str, values: list[list]) -> list[list]:
+    migrated_values = add_outsource_discard_column(values)
+    if migrated_values is values or migrated_values == values:
+        return values
+    encoded_id = urllib.parse.quote(spreadsheet_id, safe="")
+    encoded_range = urllib.parse.quote(google_sheet_range(OUTSOURCE_SHEET_NAME), safe="")
+    google_api_request(
+        "POST",
+        f"https://sheets.googleapis.com/v4/spreadsheets/{encoded_id}/values/{encoded_range}:clear",
+        token,
+        {},
+    )
+    update_range = urllib.parse.quote(google_sheet_range(OUTSOURCE_SHEET_NAME, "A1"), safe="")
+    google_api_request(
+        "PUT",
+        f"https://sheets.googleapis.com/v4/spreadsheets/{encoded_id}/values/{update_range}?valueInputOption=RAW",
+        token,
+        {"values": migrated_values},
+    )
+    return migrated_values
+
+
 def format_outsource_sheet(token: str, spreadsheet_id: str, sheet_id: int) -> None:
     encoded_id = urllib.parse.quote(spreadsheet_id, safe="")
     google_api_request(
@@ -1364,8 +1423,26 @@ def format_outsource_sheet(token: str, spreadsheet_id: str, sheet_id: int) -> No
                             "sheetId": sheet_id,
                             "dimension": "COLUMNS",
                             "startIndex": 0,
-                            "endIndex": 9,
+                            "endIndex": len(OUTSOURCE_SHEET_COLUMNS),
                         }
+                    }
+                },
+                {
+                    "repeatCell": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 1,
+                            "startColumnIndex": OUTSOURCE_SHEET_COLUMNS.index("取り込まない"),
+                            "endColumnIndex": OUTSOURCE_SHEET_COLUMNS.index("取り込まない") + 1,
+                        },
+                        "cell": {
+                            "dataValidation": {
+                                "condition": {"type": "BOOLEAN"},
+                                "strict": True,
+                                "showCustomUi": True,
+                            }
+                        },
+                        "fields": "dataValidation",
                     }
                 },
             ]
@@ -1427,6 +1504,7 @@ def append_new_outsource_candidates(candidates: pd.DataFrame) -> tuple[str, int,
     preferred_gid = extract_google_sheet_gid(spreadsheet_url)
     sheet_id = get_outsource_sheet_id(token, spreadsheet_id, preferred_gid)
     existing_values = read_outsource_sheet_values(token, spreadsheet_id)
+    existing_values = ensure_outsource_sheet_columns(token, spreadsheet_id, existing_values)
     existing_frame = google_values_to_frame(existing_values)
     new_candidates, already_count = pending_outsource_candidates(candidates, existing_frame)
     if new_candidates.empty:
@@ -4103,6 +4181,29 @@ def read_contacts_file(uploaded_file) -> pd.DataFrame:
     raise ValueError("対応している形式は CSV / TSV / XLSX / XLS です")
 
 
+def is_discard_requested(value: object) -> bool:
+    text = str(value or "").strip().lower()
+    return text in {
+        "1",
+        "true",
+        "yes",
+        "on",
+        "checked",
+        "x",
+        "✓",
+        "○",
+        "はい",
+        "除外",
+        "削除",
+        "不要",
+        "なし",
+        "メールなし",
+        "取り込まない",
+        "取込まない",
+        "no email",
+    }
+
+
 def import_contacts_frame(frame: pd.DataFrame) -> tuple[int, int, dict[str, str | None]]:
     email_column = find_column(
         frame,
@@ -4185,22 +4286,35 @@ def import_contacts_frame(frame: pd.DataFrame) -> tuple[int, int, dict[str, str 
             "チャンネルURL",
         },
     )
+    discard_column = find_column(
+        frame,
+        {
+            "取り込まない",
+            "取込まない",
+            "インポートしない",
+            "読み込まない",
+            "宛先にしない",
+            "メールなし",
+            "メール無し",
+            "除外",
+            "削除",
+            "discard",
+            "skip",
+            "ignore",
+            "noemail",
+            "no email",
+        },
+    )
 
-    if not email_column:
+    if not email_column and not discard_column:
         raise ValueError("メールアドレスの列を見つけられませんでした。列名に email または メールアドレス を入れてください。")
 
     added = 0
     skipped = 0
     removed_candidates = 0
+    discarded_candidates = 0
     seen_in_file: set[str] = set()
     for _, row in frame.iterrows():
-        email = str(row.get(email_column, "")).strip().lower()
-        if not email:
-            continue
-        if email in seen_in_file:
-            skipped += 1
-            continue
-        seen_in_file.add(email)
         channel = str(row.get(channel_column, "")) if channel_column else ""
         candidate = find_candidate_for_import(
             str(row.get(candidate_id_column, "")) if candidate_id_column else "",
@@ -4208,6 +4322,21 @@ def import_contacts_frame(frame: pd.DataFrame) -> tuple[int, int, dict[str, str 
             str(row.get(youtube_url_column, "")) if youtube_url_column else "",
             channel,
         )
+        if discard_column and is_discard_requested(row.get(discard_column, "")):
+            if candidate:
+                delete_candidate(int(candidate["id"]))
+                removed_candidates += 1
+                discarded_candidates += 1
+            else:
+                skipped += 1
+            continue
+        email = str(row.get(email_column, "")).strip().lower() if email_column else ""
+        if not email:
+            continue
+        if email in seen_in_file:
+            skipped += 1
+            continue
+        seen_in_file.add(email)
         if candidate:
             channel = str(candidate["title"] or channel)
         memo = str(row.get(memo_column, "")) if memo_column else ""
@@ -4241,7 +4370,9 @@ def import_contacts_frame(frame: pd.DataFrame) -> tuple[int, int, dict[str, str 
         "memo": memo_column,
         "channel": channel_column,
         "candidate_id": candidate_id_column,
+        "discard": discard_column,
         "candidate_removed": str(removed_candidates),
+        "candidate_discarded": str(discarded_candidates),
     }
 
 
@@ -4285,6 +4416,16 @@ def import_contacts_google_url(url: str) -> tuple[int, int, dict[str, str | None
         added, skipped, mapping = import_contacts_text(read_google_doc_url(clean_url))
         return added, skipped, mapping, "Googleドキュメント"
     raise ValueError("対応しているURLは、GoogleスプレッドシートまたはGoogleドキュメントです。")
+
+
+def show_candidate_import_cleanup(mapping: dict[str, str | None]) -> None:
+    removed_candidates = int(mapping.get("candidate_removed") or 0)
+    discarded_candidates = int(mapping.get("candidate_discarded") or 0)
+    imported_removed = max(0, removed_candidates - discarded_candidates)
+    if imported_removed:
+        st.caption(f"YouTube候補一覧から取込済み候補を{imported_removed}件外しました。")
+    if discarded_candidates:
+        st.caption(f"「取り込まない」指定の候補をYouTube候補一覧から{discarded_candidates}件削除しました。")
 
 
 def queue_google_contacts_url_import() -> None:
@@ -4393,9 +4534,8 @@ def main() -> None:
                     f"判別した列: email={mapping['email'] or '-'} / "
                     f"channel={mapping['channel'] or '-'} / memo={mapping['memo'] or '-'}"
                 )
-                removed_candidates = int(mapping.get("candidate_removed") or 0)
-                if removed_candidates:
-                    st.caption(f"YouTube候補一覧から取込済み候補を{removed_candidates}件外しました。")
+                show_candidate_import_cleanup(mapping)
+                if int(mapping.get("candidate_removed") or 0):
                     refreshed_message = refresh_outsource_sheet_if_possible()
                     if refreshed_message:
                         st.caption(refreshed_message)
@@ -4427,9 +4567,8 @@ def main() -> None:
                         f"判別した項目: email={mapping['email'] or '-'} / "
                         f"channel={mapping['channel'] or '-'} / memo={mapping['memo'] or '-'}"
                     )
-                    removed_candidates = int(mapping.get("candidate_removed") or 0)
-                    if removed_candidates:
-                        st.caption(f"YouTube候補一覧から取込済み候補を{removed_candidates}件外しました。")
+                    show_candidate_import_cleanup(mapping)
+                    if int(mapping.get("candidate_removed") or 0):
                         refreshed_message = refresh_outsource_sheet_if_possible()
                         if refreshed_message:
                             st.caption(refreshed_message)
@@ -5610,7 +5749,7 @@ def main() -> None:
     with st.expander("外注用Googleシートを登録 / 回収する"):
         st.caption(
             "外注用に用意したGoogleスプレッドシートのURLを登録できます。"
-            "登録したシートを開き、メールアドレスが入力されたら宛先一覧へ取り込みます。"
+            "登録したシートを開き、メールアドレスがあれば入力し、なければ「取り込まない」にチェックして回収します。"
         )
         stored_outsource_url = get_setting("OUTSOURCE_SPREADSHEET_URL").strip()
         create_sheet_col, sheet_home_col = st.columns(2)
@@ -5781,7 +5920,7 @@ def main() -> None:
                     st.error("反映できませんでした: " + " / ".join(sync_blockers))
                 else:
                     st.error(f"反映できませんでした: {exc}")
-        st.caption("列名はアプリが用意します。外注さんにはメールアドレス欄と必要ならメモだけ入力してもらってください。")
+        st.caption("列名はアプリが用意します。外注さんにはメールアドレス欄、メールがない時の「取り込まない」チェック、必要ならメモだけ入力してもらってください。")
 
         with st.expander("CSV / Excelで作る場合の予備ダウンロード"):
             outsource_frame = candidates_outsource_frame(sync_candidates)
@@ -5816,15 +5955,15 @@ def main() -> None:
                 added, skipped, mapping, source_type = import_contacts_google_url(target_outsource_url)
                 st.session_state.pop("outsource_reflection_snapshot", None)
                 st.success(f"{source_type}から{added}件を宛先一覧へ取り込みました。重複や空欄は{skipped}件スキップしました。")
-                removed_candidates = int(mapping.get("candidate_removed") or 0)
-                if removed_candidates:
-                    st.caption(f"YouTube候補一覧から取込済み候補を{removed_candidates}件外しました。")
+                show_candidate_import_cleanup(mapping)
+                if int(mapping.get("candidate_removed") or 0):
                     refreshed_message = refresh_outsource_sheet_if_possible()
                     if refreshed_message:
                         st.caption(refreshed_message)
                 st.caption(
                     f"判別した項目: email={mapping['email'] or '-'} / "
                     f"channel={mapping['channel'] or '-'} / memo={mapping['memo'] or '-'} / "
+                    f"取り込まない={mapping.get('discard') or '-'} / "
                     f"候補ID={mapping.get('candidate_id') or '-'}"
                 )
             except Exception as exc:
