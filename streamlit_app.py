@@ -2616,7 +2616,7 @@ def openai_api_key() -> str:
 
 
 def openai_model() -> str:
-    return get_nested_secret("openai", "model") or read_secret("OPENAI_MODEL") or "gpt-5.2"
+    return get_nested_secret("openai", "model") or read_secret("OPENAI_MODEL") or "gpt-5.5"
 
 
 def ai_scenario_schema() -> dict:
@@ -6296,7 +6296,7 @@ def main() -> None:
             if not openai_api_key():
                 st.warning("AI生成を使うには、Streamlit SecretsにOpenAI APIキーを追加してください。")
                 st.code(
-                    '[openai]\napi_key = "sk-..."\nmodel = "gpt-5.2"',
+                    '[openai]\napi_key = "sk-..."\nmodel = "gpt-5.5"',
                     language="toml",
                 )
                 st.caption("貼る場所はSecretsの一番上です。[auth]や[google]の下には入れないでください。")
