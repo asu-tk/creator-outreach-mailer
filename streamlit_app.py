@@ -6568,9 +6568,16 @@ def main() -> None:
                     )
                 else:
                     st.write("通常配信用のテンプレートはありません。シナリオに含まれるテンプレートは「シナリオごとの成績」で確認してください。")
-        with st.expander("AIシナリオ作成", expanded=False):
+        ai_generated_pending = isinstance(st.session_state.get("ai_generated_scenario"), dict) and bool(
+            st.session_state.get("ai_generated_scenario")
+        )
+        ai_scenario_notice = st.session_state.pop("ai_scenario_notice", "")
+        with st.expander("AIシナリオ作成", expanded=bool(ai_generated_pending or ai_scenario_notice)):
             st.caption("商品写真、ASP紹介文、ペルソナ情報からステップ配信用の下書きを作ります。生成後に件名・本文を確認してから保存できます。")
             st.caption(f"生成ボタンを押した時だけOpenAI APIを呼びます。使用モデル: {openai_model()}")
+            if ai_scenario_notice:
+                st.success(ai_scenario_notice)
+            st.info("AIで作成しただけでは登録されません。生成結果を確認して、最後に「この内容でテンプレートとシナリオに保存」を押すと保存されます。")
             if not openai_api_key():
                 st.warning("AI生成を使うには、Streamlit SecretsにOpenAI APIキーを追加してください。")
                 st.code(
@@ -6669,7 +6676,7 @@ def main() -> None:
                         ).hexdigest()[:10]
                         st.session_state["ai_generated_scenario"] = generated_scenario
                         st.session_state["ai_generated_scenario_token"] = scenario_digest
-                        st.success("AIシナリオ案を作成しました。下の内容を確認してから保存してください。")
+                        st.session_state["ai_scenario_notice"] = "AIシナリオ案を作成しました。下の内容を確認してから保存してください。"
                         st.rerun()
                     except Exception as exc:
                         st.error(str(exc))
@@ -6688,6 +6695,7 @@ def main() -> None:
                     st.session_state["ai_generated_scenario_token"] = ai_token
                 st.divider()
                 st.markdown("**生成結果**")
+                st.warning("この生成結果はまだ保存されていません。内容を確認して、下の保存ボタンを押してください。")
                 summary_cols = st.columns(3)
                 summary_cols[0].metric("作成通数", len(generated_steps))
                 summary_cols[1].metric("推奨間隔", f"{int(generated_scenario.get('recommended_send_gap_days') or 0)}日")
@@ -6794,12 +6802,15 @@ def main() -> None:
                     else:
                         for template_name, subject, body in zip(edited_template_names, edited_subjects, edited_bodies):
                             save_campaign_template(template_name, subject, body)
-                        save_scenario(edited_scenario_name, edited_template_names)
-                        st.session_state.pop("ai_generated_scenario", None)
-                        st.session_state.pop("ai_generated_scenario_token", None)
-                        st.session_state["scenario_editor_select"] = edited_scenario_name
-                        st.success(f"シナリオ「{edited_scenario_name}」を保存しました。")
-                        st.rerun()
+                        saved_scenario_id = save_scenario(edited_scenario_name, edited_template_names)
+                        if not saved_scenario_id:
+                            st.error("シナリオを保存できませんでした。シナリオ名とテンプレート名を確認してください。")
+                        else:
+                            st.session_state.pop("ai_generated_scenario", None)
+                            st.session_state.pop("ai_generated_scenario_token", None)
+                            st.session_state["scenario_editor_select"] = edited_scenario_name
+                            st.session_state["ai_scenario_notice"] = f"シナリオ「{edited_scenario_name}」を保存しました。下のシナリオ設定に追加されています。"
+                            st.rerun()
                 if clear_ai_col.button(
                     "生成結果を閉じる",
                     key=f"clear_ai_generated_scenario_{ai_token}",
