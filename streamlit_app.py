@@ -1147,6 +1147,30 @@ def pending_outsource_candidates(candidates: pd.DataFrame, existing_frame: pd.Da
     return candidates[pending_mask].copy(), already_count
 
 
+def outsource_candidate_row_key(row: object) -> str:
+    candidate_id = normalize_sheet_id_value(getattr(row, "id", ""))
+    channel_id = str(getattr(row, "channel_id", "") or "").strip()
+    return f"{candidate_id}\t{channel_id}"
+
+
+def outsource_candidate_keys(candidates: pd.DataFrame) -> list[str]:
+    if candidates.empty:
+        return []
+    return [outsource_candidate_row_key(row) for row in candidates.itertuples()]
+
+
+def outsource_candidates_signature(candidates: pd.DataFrame) -> str:
+    return hashlib.sha1("\n".join(outsource_candidate_keys(candidates)).encode("utf-8")).hexdigest()
+
+
+def filter_outsource_candidates_by_keys(candidates: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
+    if candidates.empty:
+        return candidates.copy()
+    key_set = set(keys)
+    mask = [outsource_candidate_row_key(row) in key_set for row in candidates.itertuples()]
+    return candidates[mask].copy()
+
+
 def read_google_sheet_url_with_service_account(url: str) -> pd.DataFrame:
     token = google_service_account_token(["https://www.googleapis.com/auth/spreadsheets.readonly"])
     spreadsheet_id = extract_google_file_id(url, "spreadsheets")
@@ -5521,6 +5545,13 @@ def main() -> None:
                         else:
                             st.info(f"新しく追加できる候補はありません。反映済みの候補: {already_count}件")
                         st.session_state["last_outsource_sheet_url"] = spreadsheet_url
+                        st.session_state["outsource_reflection_snapshot"] = {
+                            "url": spreadsheet_url,
+                            "signature": outsource_candidates_signature(candidates),
+                            "pending_keys": [],
+                            "reflected_count": len(candidates),
+                            "checked_at": now_iso(),
+                        }
                     except Exception as exc:
                         st.warning(f"URLは保存しましたが、シートへの反映はできませんでした: {exc}")
                 elif not ready_for_sheet:
@@ -5544,29 +5575,60 @@ def main() -> None:
             open_url_col.link_button("登録したGoogleシートを開く", active_outsource_url, use_container_width=True)
         else:
             open_url_col.button("登録したGoogleシートを開く", key="open_empty_outsource_sheet_url", use_container_width=True, disabled=True)
-        if st.button("Googleシート接続を確認", key="check_outsource_sheet_connection", use_container_width=True):
-            try:
-                save_setting("OUTSOURCE_SPREADSHEET_URL", active_outsource_url)
-                st.success(check_outsource_spreadsheet_connection(active_outsource_url))
-            except Exception as exc:
-                st.error(f"接続できませんでした: {exc}")
-        sync_notice = st.session_state.pop("outsource_sync_notice", "")
-        if sync_notice:
-            st.success(sync_notice)
         sync_blockers = []
         if not active_outsource_url.startswith("http"):
             sync_blockers.append("外注用GoogleスプレッドシートURLが保存されていません。")
         if not ready_for_sheet:
             sync_blockers.append(sheet_ready_message or "サービスアカウント設定を確認してください。")
+
+        candidates_signature = outsource_candidates_signature(candidates)
         sync_candidates = candidates
         reflected_count = 0
+        reflected_checked_at = ""
         reflected_check_error = ""
-        if not sync_blockers and not candidates.empty:
+        reflection_snapshot = st.session_state.get("outsource_reflection_snapshot", {})
+        if (
+            isinstance(reflection_snapshot, dict)
+            and reflection_snapshot.get("url") == active_outsource_url
+            and reflection_snapshot.get("signature") == candidates_signature
+        ):
+            sync_candidates = filter_outsource_candidates_by_keys(
+                candidates,
+                list(reflection_snapshot.get("pending_keys") or []),
+            )
+            reflected_count = int(reflection_snapshot.get("reflected_count") or 0)
+            reflected_checked_at = str(reflection_snapshot.get("checked_at") or "")
+
+        check_col, refresh_col = st.columns(2)
+        if check_col.button("Googleシート接続を確認", key="check_outsource_sheet_connection", use_container_width=True):
+            try:
+                save_setting("OUTSOURCE_SPREADSHEET_URL", active_outsource_url)
+                st.success(check_outsource_spreadsheet_connection(active_outsource_url))
+            except Exception as exc:
+                st.error(f"接続できませんでした: {exc}")
+        if refresh_col.button(
+            "反映状態を更新",
+            key="refresh_outsource_reflection_status",
+            use_container_width=True,
+            disabled=bool(sync_blockers) or candidates.empty,
+        ):
             try:
                 existing_outsource_frame = read_google_sheet_url_with_service_account(active_outsource_url)
-                sync_candidates, reflected_count = pending_outsource_candidates(candidates, existing_outsource_frame)
+                refreshed_candidates, refreshed_count = pending_outsource_candidates(candidates, existing_outsource_frame)
+                st.session_state["outsource_reflection_snapshot"] = {
+                    "url": active_outsource_url,
+                    "signature": candidates_signature,
+                    "pending_keys": outsource_candidate_keys(refreshed_candidates),
+                    "reflected_count": refreshed_count,
+                    "checked_at": now_iso(),
+                }
+                st.session_state["outsource_sync_notice"] = "登録済みシートの反映状態を更新しました。"
+                st.rerun()
             except Exception as exc:
                 reflected_check_error = str(exc)
+        sync_notice = st.session_state.pop("outsource_sync_notice", "")
+        if sync_notice:
+            st.success(sync_notice)
         if sync_blockers:
             st.warning("候補一覧を反映できない理由: " + " / ".join(sync_blockers))
         elif reflected_check_error:
@@ -5576,6 +5638,8 @@ def main() -> None:
             )
         elif candidates.empty:
             st.caption("反映できる候補は0件です。押すとGoogleシートに見出しだけ作ります。")
+        elif not reflected_checked_at:
+            st.caption(f"YouTube候補: {len(candidates)}件。登録済みシートとの差分確認は「反映状態を更新」を押した時だけ行います。")
         elif sync_candidates.empty:
             st.caption(f"新しく反映できる候補は0件です（登録済みシートに反映済み: {reflected_count}件）。")
         else:
@@ -5585,6 +5649,13 @@ def main() -> None:
             try:
                 spreadsheet_url, exported_count, already_count = append_new_outsource_candidates(candidates)
                 st.session_state["last_outsource_sheet_url"] = spreadsheet_url
+                st.session_state["outsource_reflection_snapshot"] = {
+                    "url": spreadsheet_url,
+                    "signature": candidates_signature,
+                    "pending_keys": [],
+                    "reflected_count": len(candidates),
+                    "checked_at": now_iso(),
+                }
                 if exported_count:
                     st.session_state["outsource_sync_notice"] = (
                         f"新規候補{exported_count}件をGoogleシートへ追加しました。"
@@ -5633,6 +5704,7 @@ def main() -> None:
             save_setting("OUTSOURCE_SPREADSHEET_URL", target_outsource_url)
             try:
                 added, skipped, mapping, source_type = import_contacts_google_url(target_outsource_url)
+                st.session_state.pop("outsource_reflection_snapshot", None)
                 st.success(f"{source_type}から{added}件を宛先一覧へ取り込みました。重複や空欄は{skipped}件スキップしました。")
                 removed_candidates = int(mapping.get("candidate_removed") or 0)
                 if removed_candidates:
