@@ -6588,13 +6588,30 @@ def main() -> None:
         if "test_email_input" not in st.session_state:
             st.session_state["test_email_input"] = get_setting("TEST_EMAIL_ADDRESS", "")
         with st.expander("テスト送信", expanded=False):
+            saved_test_email = get_setting("TEST_EMAIL_ADDRESS", "")
+            if saved_test_email:
+                st.caption(f"保存済み: {mask_email_address(saved_test_email)}")
+            test_email_notice = st.session_state.pop("test_email_notice", "")
+            test_email_error = st.session_state.pop("test_email_error", "")
+            if test_email_notice:
+                st.success(test_email_notice)
+            if test_email_error:
+                st.error(test_email_error)
             show_test_email = st.checkbox("テストメールアドレスを表示する", key="show_test_email_address")
-            test_email_address = st.text_input(
+            test_email_input_col, test_email_save_col = st.columns([2.3, 0.7])
+            test_email_address = test_email_input_col.text_input(
                 "テストメールアドレス",
                 key="test_email_input",
                 type="default" if show_test_email else "password",
                 placeholder="自分の確認用メールアドレス",
             ).strip()
+            if test_email_save_col.button("保存", key="save_test_email_address", use_container_width=True):
+                if not looks_like_email_address(test_email_address):
+                    st.session_state["test_email_error"] = "テストメールアドレスを正しく入力してください。"
+                else:
+                    save_setting("TEST_EMAIL_ADDRESS", test_email_address)
+                    st.session_state["test_email_notice"] = f"{mask_email_address(test_email_address)} を保存しました。"
+                st.rerun()
             st.caption(
                 "本番の宛先には送りません。送信対象の先頭1件を差し込み例として使い、"
                 "ここに入力したテストメールアドレスへ1通だけ送ります。"
