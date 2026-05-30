@@ -4930,7 +4930,7 @@ def sent_count_for_unsubscribe_scope(scope: str, scope_key: str) -> int:
 
 def unsubscribe_events_display_frame(events: pd.DataFrame) -> pd.DataFrame:
     if events.empty:
-        return pd.DataFrame(columns=["_event_id", "停止日時", "停止種類", "停止対象", "メールアドレス", "チャンネル", "停止理由", "内部キー"])
+        return pd.DataFrame(columns=["_event_id", "停止日時", "停止種類", "停止対象", "メールアドレス", "チャンネル", "停止理由"])
     campaign_names = campaign_display_name_map()
     display = events.copy()
     display["_event_id"] = display["id"].astype(int)
@@ -4946,8 +4946,7 @@ def unsubscribe_events_display_frame(events: pd.DataFrame) -> pd.DataFrame:
         display["youtube_channel_id"],
     ).replace("", "-")
     display["停止理由"] = "配信停止URLクリック"
-    display["内部キー"] = display["scope_key"].where(display["scope_key"].astype(str).str.strip() != "", display["campaign_key"]).replace("", "-")
-    return display[["_event_id", "停止日時", "停止種類", "停止対象", "メールアドレス", "チャンネル", "停止理由", "内部キー"]]
+    return display[["_event_id", "停止日時", "停止種類", "停止対象", "メールアドレス", "チャンネル", "停止理由"]]
 
 
 def unsubscribe_events_summary_frame(events: pd.DataFrame) -> pd.DataFrame:
@@ -6985,34 +6984,29 @@ def main() -> None:
                     ).any(axis=1)
                     filtered_unsubscribes = filtered_unsubscribes[mask]
                 st.caption(f"{len(filtered_unsubscribes)}件を表示しています。")
-                st.dataframe(
-                    filtered_unsubscribes.drop(columns=["_event_id"], errors="ignore").head(300),
-                    use_container_width=True,
-                    hide_index=True,
-                )
                 if not filtered_unsubscribes.empty:
-                    st.divider()
-                    st.caption(
-                        "誤って配信停止した記録だけを削除できます。"
-                        "削除しても宛先一覧へ自動追加はしません。宛先一覧に残っている場合だけ、その停止範囲の送信対象に戻ります。"
-                    )
-                    delete_options = [int(value) for value in filtered_unsubscribes["_event_id"].head(300).tolist()]
-                    label_by_id = {
-                        int(row["_event_id"]): (
-                            f"{row['停止日時']} / {row['停止種類']} / {row['停止対象']} / "
-                            f"{row['メールアドレス']} / {row['チャンネル']}"
-                        )
-                        for _, row in filtered_unsubscribes.head(300).iterrows()
-                    }
-                    selected_unsubscribe_delete_id = st.selectbox(
-                        "削除する配信停止記録",
-                        options=delete_options,
-                        format_func=lambda event_id: label_by_id.get(int(event_id), str(event_id)),
-                        key="delete_unsubscribe_event_select",
-                    )
-                    if st.button("選択した配信停止を削除", key="request_delete_unsubscribe_event", use_container_width=True):
-                        st.session_state["confirm_delete_unsubscribe_event_id"] = int(selected_unsubscribe_delete_id)
-                        st.rerun()
+                    st.caption("誤って配信停止した記録は、表の右端から削除できます。宛先一覧へ自動追加はしません。")
+                    visible_unsubscribes = filtered_unsubscribes.head(120)
+                    if len(filtered_unsubscribes) > len(visible_unsubscribes):
+                        st.caption("表示が多い場合は、検索でメールアドレスや停止対象を絞り込んでください。")
+                    header = st.columns([1.5, 1.0, 1.8, 1.7, 1.5, 1.2, 0.8])
+                    headers = ["停止日時", "種類", "停止対象", "メールアドレス", "チャンネル", "理由", "操作"]
+                    for column, label in zip(header, headers):
+                        column.markdown(f"**{label}**")
+                    for _, row in visible_unsubscribes.iterrows():
+                        event_id = int(row["_event_id"])
+                        columns = st.columns([1.5, 1.0, 1.8, 1.7, 1.5, 1.2, 0.8])
+                        columns[0].write(row["停止日時"])
+                        columns[1].write(row["停止種類"])
+                        columns[2].write(row["停止対象"])
+                        columns[3].write(row["メールアドレス"])
+                        columns[4].write(row["チャンネル"])
+                        columns[5].write(row["停止理由"])
+                        if columns[6].button("削除", key=f"request_delete_unsubscribe_event_{event_id}", use_container_width=True):
+                            st.session_state["confirm_delete_unsubscribe_event_id"] = event_id
+                            st.rerun()
+                else:
+                    st.write("検索条件に合う配信停止記録はありません。")
 
                 pending_delete_unsubscribe_id = int(st.session_state.get("confirm_delete_unsubscribe_event_id") or 0)
                 if pending_delete_unsubscribe_id:
