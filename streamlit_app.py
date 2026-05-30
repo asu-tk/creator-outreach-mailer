@@ -1079,6 +1079,74 @@ def google_values_to_frame(values: list[list]) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=header).fillna("")
 
 
+def normalize_sheet_id_value(value: object) -> str:
+    text = str(value or "").strip()
+    if re.fullmatch(r"\d+(?:\.0+)?", text):
+        return str(int(float(text)))
+    return text
+
+
+def outsource_sheet_existing_keys(frame: pd.DataFrame) -> tuple[set[str], set[str]]:
+    if frame.empty:
+        return set(), set()
+    candidate_id_column = find_column(
+        frame,
+        {
+            "候補id",
+            "候補ID",
+            "候補ID（編集しない）",
+            "候補id編集しない",
+            "候補ID編集しない",
+        },
+    )
+    channel_id_column = find_column(
+        frame,
+        {
+            "channel_id",
+            "channelid",
+            "youtube_channel_id",
+            "youtubechannelid",
+            "チャンネルid",
+            "チャンネルID",
+            "チャンネルID（編集しない）",
+            "チャンネルID編集しない",
+        },
+    )
+    candidate_ids = set()
+    channel_ids = set()
+    if candidate_id_column:
+        candidate_ids = {
+            normalized
+            for normalized in frame[candidate_id_column].map(normalize_sheet_id_value)
+            if normalized
+        }
+    if channel_id_column:
+        channel_ids = {
+            str(value or "").strip()
+            for value in frame[channel_id_column].fillna("")
+            if str(value or "").strip()
+        }
+    return candidate_ids, channel_ids
+
+
+def pending_outsource_candidates(candidates: pd.DataFrame, existing_frame: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    if candidates.empty or existing_frame.empty:
+        return candidates.copy(), 0
+    candidate_ids, channel_ids = outsource_sheet_existing_keys(existing_frame)
+    if not candidate_ids and not channel_ids:
+        return candidates.copy(), 0
+    pending_mask = []
+    already_count = 0
+    for row in candidates.itertuples():
+        candidate_id = normalize_sheet_id_value(getattr(row, "id", ""))
+        channel_id = str(getattr(row, "channel_id", "") or "").strip()
+        already_exists = bool((candidate_id and candidate_id in candidate_ids) or (channel_id and channel_id in channel_ids))
+        pending_mask.append(not already_exists)
+        if already_exists:
+            already_count += 1
+    return candidates[pending_mask].copy(), already_count
+
+
 def read_google_sheet_url_with_service_account(url: str) -> pd.DataFrame:
     token = google_service_account_token(["https://www.googleapis.com/auth/spreadsheets.readonly"])
     spreadsheet_id = extract_google_file_id(url, "spreadsheets")
@@ -1114,35 +1182,18 @@ def read_google_sheet_url_with_service_account(url: str) -> pd.DataFrame:
     return google_values_to_frame(result.get("values", []))
 
 
-def update_outsource_spreadsheet(candidates: pd.DataFrame, share_with_link: bool = False) -> tuple[str, int]:
-    ready, message = google_sheet_write_ready()
-    if not ready:
-        raise ValueError(message)
-    token = google_service_account_token(
-        [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive.file",
-        ]
+def read_outsource_sheet_values(token: str, spreadsheet_id: str) -> list[list]:
+    range_name = urllib.parse.quote(google_sheet_range(OUTSOURCE_SHEET_NAME), safe="")
+    result = google_api_request(
+        "GET",
+        f"https://sheets.googleapis.com/v4/spreadsheets/{urllib.parse.quote(spreadsheet_id, safe='')}/values/{range_name}",
+        token,
     )
-    spreadsheet_id, spreadsheet_url = get_or_create_outsource_spreadsheet(token)
-    preferred_gid = extract_google_sheet_gid(spreadsheet_url)
-    sheet_id = get_outsource_sheet_id(token, spreadsheet_id, preferred_gid)
+    return result.get("values", [])
+
+
+def format_outsource_sheet(token: str, spreadsheet_id: str, sheet_id: int) -> None:
     encoded_id = urllib.parse.quote(spreadsheet_id, safe="")
-    encoded_range = urllib.parse.quote(google_sheet_range(OUTSOURCE_SHEET_NAME), safe="")
-    google_api_request(
-        "POST",
-        f"https://sheets.googleapis.com/v4/spreadsheets/{encoded_id}/values/{encoded_range}:clear",
-        token,
-        {},
-    )
-    values = outsource_sheet_values(candidates)
-    update_range = urllib.parse.quote(google_sheet_range(OUTSOURCE_SHEET_NAME, "A1"), safe="")
-    google_api_request(
-        "PUT",
-        f"https://sheets.googleapis.com/v4/spreadsheets/{encoded_id}/values/{update_range}?valueInputOption=RAW",
-        token,
-        {"values": values},
-    )
     google_api_request(
         "POST",
         f"https://sheets.googleapis.com/v4/spreadsheets/{encoded_id}:batchUpdate",
@@ -1187,6 +1238,38 @@ def update_outsource_spreadsheet(candidates: pd.DataFrame, share_with_link: bool
             ]
         },
     )
+
+
+def update_outsource_spreadsheet(candidates: pd.DataFrame, share_with_link: bool = False) -> tuple[str, int]:
+    ready, message = google_sheet_write_ready()
+    if not ready:
+        raise ValueError(message)
+    token = google_service_account_token(
+        [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive.file",
+        ]
+    )
+    spreadsheet_id, spreadsheet_url = get_or_create_outsource_spreadsheet(token)
+    preferred_gid = extract_google_sheet_gid(spreadsheet_url)
+    sheet_id = get_outsource_sheet_id(token, spreadsheet_id, preferred_gid)
+    encoded_id = urllib.parse.quote(spreadsheet_id, safe="")
+    encoded_range = urllib.parse.quote(google_sheet_range(OUTSOURCE_SHEET_NAME), safe="")
+    google_api_request(
+        "POST",
+        f"https://sheets.googleapis.com/v4/spreadsheets/{encoded_id}/values/{encoded_range}:clear",
+        token,
+        {},
+    )
+    values = outsource_sheet_values(candidates)
+    update_range = urllib.parse.quote(google_sheet_range(OUTSOURCE_SHEET_NAME, "A1"), safe="")
+    google_api_request(
+        "PUT",
+        f"https://sheets.googleapis.com/v4/spreadsheets/{encoded_id}/values/{update_range}?valueInputOption=RAW",
+        token,
+        {"values": values},
+    )
+    format_outsource_sheet(token, spreadsheet_id, sheet_id)
     if share_with_link:
         google_api_request(
             "POST",
@@ -1195,6 +1278,45 @@ def update_outsource_spreadsheet(candidates: pd.DataFrame, share_with_link: bool
             {"type": "anyone", "role": "writer"},
         )
     return spreadsheet_url, max(0, len(values) - 1)
+
+
+def append_new_outsource_candidates(candidates: pd.DataFrame) -> tuple[str, int, int]:
+    ready, message = google_sheet_write_ready()
+    if not ready:
+        raise ValueError(message)
+    token = google_service_account_token(
+        [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive.file",
+        ]
+    )
+    spreadsheet_id, spreadsheet_url = get_or_create_outsource_spreadsheet(token)
+    preferred_gid = extract_google_sheet_gid(spreadsheet_url)
+    sheet_id = get_outsource_sheet_id(token, spreadsheet_id, preferred_gid)
+    existing_values = read_outsource_sheet_values(token, spreadsheet_id)
+    existing_frame = google_values_to_frame(existing_values)
+    new_candidates, already_count = pending_outsource_candidates(candidates, existing_frame)
+    if new_candidates.empty:
+        format_outsource_sheet(token, spreadsheet_id, sheet_id)
+        return spreadsheet_url, 0, already_count
+
+    values = outsource_sheet_values(new_candidates)
+    encoded_id = urllib.parse.quote(spreadsheet_id, safe="")
+    if not existing_values or not any(str(value).strip() for value in existing_values[0]):
+        write_values = values
+        start_cell = "A1"
+    else:
+        write_values = values[1:]
+        start_cell = f"A{len(existing_values) + 1}"
+    update_range = urllib.parse.quote(google_sheet_range(OUTSOURCE_SHEET_NAME, start_cell), safe="")
+    google_api_request(
+        "PUT",
+        f"https://sheets.googleapis.com/v4/spreadsheets/{encoded_id}/values/{update_range}?valueInputOption=RAW",
+        token,
+        {"values": write_values},
+    )
+    format_outsource_sheet(token, spreadsheet_id, sheet_id)
+    return spreadsheet_url, len(new_candidates), already_count
 
 
 def check_outsource_spreadsheet_connection(url: str) -> str:
@@ -5390,8 +5512,14 @@ def main() -> None:
                 st.success("外注用GoogleシートURLを保存しました。")
                 if ready_for_sheet and not candidates.empty:
                     try:
-                        spreadsheet_url, exported_count = update_outsource_spreadsheet(candidates, False)
-                        st.success(f"候補{exported_count}件をGoogleシートへ反映しました。")
+                        spreadsheet_url, exported_count, already_count = append_new_outsource_candidates(candidates)
+                        if exported_count:
+                            st.success(
+                                f"新規候補{exported_count}件をGoogleシートへ追加しました。"
+                                f"反映済みの候補は{already_count}件スキップしました。"
+                            )
+                        else:
+                            st.info(f"新しく追加できる候補はありません。反映済みの候補: {already_count}件")
                         st.session_state["last_outsource_sheet_url"] = spreadsheet_url
                     except Exception as exc:
                         st.warning(f"URLは保存しましたが、シートへの反映はできませんでした: {exc}")
@@ -5422,23 +5550,51 @@ def main() -> None:
                 st.success(check_outsource_spreadsheet_connection(active_outsource_url))
             except Exception as exc:
                 st.error(f"接続できませんでした: {exc}")
+        sync_notice = st.session_state.pop("outsource_sync_notice", "")
+        if sync_notice:
+            st.success(sync_notice)
         sync_blockers = []
         if not active_outsource_url.startswith("http"):
             sync_blockers.append("外注用GoogleスプレッドシートURLが保存されていません。")
         if not ready_for_sheet:
             sync_blockers.append(sheet_ready_message or "サービスアカウント設定を確認してください。")
+        sync_candidates = candidates
+        reflected_count = 0
+        reflected_check_error = ""
+        if not sync_blockers and not candidates.empty:
+            try:
+                existing_outsource_frame = read_google_sheet_url_with_service_account(active_outsource_url)
+                sync_candidates, reflected_count = pending_outsource_candidates(candidates, existing_outsource_frame)
+            except Exception as exc:
+                reflected_check_error = str(exc)
         if sync_blockers:
             st.warning("候補一覧を反映できない理由: " + " / ".join(sync_blockers))
+        elif reflected_check_error:
+            st.warning(
+                "登録済みシートの反映済み確認に失敗したため、候補全件を確認対象として表示しています: "
+                + reflected_check_error
+            )
         elif candidates.empty:
             st.caption("反映できる候補は0件です。押すとGoogleシートに見出しだけ作ります。")
+        elif sync_candidates.empty:
+            st.caption(f"新しく反映できる候補は0件です（登録済みシートに反映済み: {reflected_count}件）。")
         else:
-            st.caption(f"反映できる候補: {len(candidates)}件")
+            st.caption(f"新しく反映できる候補: {len(sync_candidates)}件（登録済みシートに反映済み: {reflected_count}件）")
         if st.button("候補一覧を登録済みシートへ反映", key="sync_outsource_sheet", use_container_width=True):
             save_setting("OUTSOURCE_SPREADSHEET_URL", active_outsource_url)
             try:
-                spreadsheet_url, exported_count = update_outsource_spreadsheet(candidates, False)
+                spreadsheet_url, exported_count, already_count = append_new_outsource_candidates(candidates)
                 st.session_state["last_outsource_sheet_url"] = spreadsheet_url
-                st.success(f"候補{exported_count}件をGoogleシートへ反映しました。外注さんにはメールアドレス欄だけ入力してもらってください。")
+                if exported_count:
+                    st.session_state["outsource_sync_notice"] = (
+                        f"新規候補{exported_count}件をGoogleシートへ追加しました。"
+                        f"反映済みの候補は{already_count}件スキップしました。"
+                    )
+                else:
+                    st.session_state["outsource_sync_notice"] = (
+                        f"新しく反映できる候補はありません。登録済みシートに反映済み: {already_count}件"
+                    )
+                st.rerun()
             except Exception as exc:
                 if sync_blockers:
                     st.error("反映できませんでした: " + " / ".join(sync_blockers))
@@ -5447,7 +5603,7 @@ def main() -> None:
         st.caption("列名はアプリが用意します。外注さんにはメールアドレス欄と必要ならメモだけ入力してもらってください。")
 
         with st.expander("CSV / Excelで作る場合の予備ダウンロード"):
-            outsource_frame = candidates_outsource_frame(candidates)
+            outsource_frame = candidates_outsource_frame(sync_candidates)
             export_name = datetime.now(APP_TIMEZONE).strftime("youtube_candidates_outsource_%Y%m%d_%H%M")
             download_csv_col, download_xlsx_col = st.columns(2)
             download_csv_col.download_button(
@@ -5456,7 +5612,7 @@ def main() -> None:
                 file_name=f"{export_name}.csv",
                 mime="text/csv",
                 use_container_width=True,
-                disabled=candidates.empty,
+                disabled=sync_candidates.empty,
             )
             download_xlsx_col.download_button(
                 "外注用Excelをダウンロード",
@@ -5464,7 +5620,7 @@ def main() -> None:
                 file_name=f"{export_name}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 use_container_width=True,
-                disabled=candidates.empty,
+                disabled=sync_candidates.empty,
             )
 
         if st.button(
