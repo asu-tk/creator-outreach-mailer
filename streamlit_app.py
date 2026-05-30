@@ -701,6 +701,52 @@ def render_login_status_bar() -> None:
         spacer_col.empty()
 
 
+def inject_mail_preview_styles() -> None:
+    st.markdown(
+        """
+        <style>
+        .mail-readonly-block {
+            margin-top: 0.5rem;
+        }
+        .mail-readonly-label {
+            color: #334155;
+            font-size: 0.9rem;
+            font-weight: 600;
+            margin: 0 0 0.35rem;
+        }
+        .mail-readonly-body {
+            width: 100%;
+            box-sizing: border-box;
+            border: 1px solid #CBD5E1;
+            border-radius: 8px;
+            background: #FFFFFF;
+            color: #0F172A;
+            line-height: 1.75;
+            font-size: 0.96rem;
+            padding: 16px 18px;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_readonly_mail_body(label: str, text: str, min_height: int = 380) -> None:
+    safe_label = html.escape(str(label or "本文"))
+    safe_text = html.escape(str(text or "").strip()).replace("\n", "<br>") or "-"
+    st.markdown(
+        f"""
+        <div class="mail-readonly-block">
+            <div class="mail-readonly-label">{safe_label}</div>
+            <div class="mail-readonly-body" style="min-height: {int(min_height)}px;">{safe_text}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def inject_loading_indicator() -> None:
     components.html(
         """
@@ -5436,6 +5482,7 @@ def render_outsource_import_history_panel() -> None:
 def main() -> None:
     st.set_page_config(page_title="Creator Outreach Mailer", layout="wide")
     inject_loading_indicator()
+    inject_mail_preview_styles()
     init_db()
 
     if not require_login():
@@ -5463,7 +5510,7 @@ def main() -> None:
         "日本では広告宣伝メールは原則オプトインです。"
     )
 
-    left, right = st.columns([0.9, 1.4], gap="large")
+    left, right = st.columns([0.75, 1.75], gap="large")
 
     with left:
         settings_panel()
@@ -5923,7 +5970,7 @@ def main() -> None:
                     with st.expander("このステップで送る内容を確認", expanded=False):
                         st.text_input("配信名", value=effective_campaign_name, disabled=True, key="scenario_effective_campaign_name")
                         st.text_input("件名", value=effective_subject_template, disabled=True, key="scenario_effective_subject")
-                        st.text_area("本文", value=effective_body_template, height=220, disabled=True, key="scenario_effective_body")
+                        render_readonly_mail_body("本文", effective_body_template, min_height=460)
         else:
             st.caption("通常配信では、配信名ごとに送信済み・送信待ちを判定します。")
             campaign_name = st.text_input("配信名", key="campaign_name_input")
@@ -6192,7 +6239,7 @@ def main() -> None:
                     f"{preview_contact['channel'] or '-'} / {preview_contact['email']}"
                 )
                 st.text_input("プレビュー件名", value=preview_subject, disabled=True)
-                st.text_area("プレビュー本文", value=preview_body, height=260, disabled=True)
+                render_readonly_mail_body("プレビュー本文", preview_body, min_height=520)
 
         with st.expander("送信前の最終確認", expanded=False):
             account = active_smtp_account()
