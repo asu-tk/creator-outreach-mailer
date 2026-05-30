@@ -74,6 +74,7 @@ AI_OPENAI_TIMEOUT_SECONDS = 75
 AI_IMAGE_MAX_BYTES = 8 * 1024 * 1024
 STREAMLIT_SEND_QUEUE_BATCH_SIZE = 1
 STREAMLIT_SEND_QUEUE_MIN_INTERVAL_SECONDS = 25
+STREAMLIT_SEND_QUEUE_STALE_SENDING_SECONDS = 10 * 60
 UNSUBSCRIBE_SCOPE_GLOBAL = "global"
 UNSUBSCRIBE_SCOPE_SCENARIO = "scenario"
 UNSUBSCRIBE_SCOPE_CAMPAIGN = "campaign"
@@ -178,6 +179,18 @@ ${channel}のように継続して発信されている場合、すでにある�
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def parse_utc_datetime(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except ValueError:
+        return None
 
 
 def format_jst_datetime(value: str) -> str:
@@ -4519,6 +4532,26 @@ def claim_send_queue_row(row_id: str) -> dict:
     return {}
 
 
+def recover_stale_sending_queue_rows(user_email: str) -> int:
+    if not user_email:
+        return 0
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=STREAMLIT_SEND_QUEUE_STALE_SENDING_SECONDS)
+    query_email = urllib.parse.quote(user_email, safe="")
+    cutoff_value = urllib.parse.quote(cutoff.isoformat(timespec="seconds"), safe="")
+    recovered = supabase_request(
+        "PATCH",
+        (
+            "send_queue"
+            f"?user_email=eq.{query_email}"
+            "&status=eq.sending"
+            f"&updated_at=lt.{cutoff_value}"
+        ),
+        {"status": "pending", "error": "", "updated_at": now_iso()},
+        prefer="return=representation",
+    )
+    return len(recovered) if isinstance(recovered, list) else 0
+
+
 def update_local_queued_send_result(item: dict, status: str, error: str, sent_at: str) -> None:
     contact_id = item.get("contact_local_id")
     campaign_key_value = str(item.get("campaign_key") or "")
@@ -4552,7 +4585,7 @@ def update_local_queued_send_result(item: dict, status: str, error: str, sent_at
     )
 
 
-def process_due_send_queue_from_streamlit() -> dict[str, int | bool]:
+def process_due_send_queue_from_streamlit(force: bool = False) -> dict[str, int | bool]:
     result: dict[str, int | bool] = {"checked": False, "processed": 0, "failed": 0}
     if not supabase_configured():
         return result
@@ -4562,12 +4595,15 @@ def process_due_send_queue_from_streamlit() -> dict[str, int | bool]:
 
     now_epoch = time.time()
     last_checked = float(st.session_state.get("_send_queue_last_checked_at", 0) or 0)
-    if now_epoch - last_checked < STREAMLIT_SEND_QUEUE_MIN_INTERVAL_SECONDS:
+    if not force and now_epoch - last_checked < STREAMLIT_SEND_QUEUE_MIN_INTERVAL_SECONDS:
         return result
     st.session_state["_send_queue_last_checked_at"] = now_epoch
     result["checked"] = True
 
     try:
+        recovered_count = recover_stale_sending_queue_rows(user_email)
+        if recovered_count:
+            print(f"[send queue] recovered stale sending rows count={recovered_count}", flush=True)
         query_email = urllib.parse.quote(user_email, safe="")
         now_value = urllib.parse.quote(datetime.now(timezone.utc).isoformat(timespec="seconds"), safe="")
         due_rows = supabase_request(
@@ -5276,6 +5312,8 @@ def fetch_send_job_queue_summary(job_id: str) -> dict[str, object]:
         "first_queue_status": "",
         "first_queue_at": "",
         "next_pending_at": "",
+        "sending_count": 0,
+        "stale_sending_count": 0,
         "overdue_pending": False,
     }
     if not supabase_configured() or not str(job_id or "").strip():
@@ -5298,6 +5336,19 @@ def fetch_send_job_queue_summary(job_id: str) -> dict[str, object]:
         if isinstance(next_rows, list) and next_rows:
             summary["next_pending_at"] = str(next_rows[0].get("scheduled_at") or "")
 
+        sending_rows = supabase_request(
+            "GET",
+            f"send_queue?job_id=eq.{query_job_id}&status=eq.sending&select=updated_at",
+        )
+        if isinstance(sending_rows, list):
+            cutoff = datetime.now(timezone.utc) - timedelta(seconds=STREAMLIT_SEND_QUEUE_STALE_SENDING_SECONDS)
+            summary["sending_count"] = len(sending_rows)
+            summary["stale_sending_count"] = sum(
+                1
+                for row in sending_rows
+                if (parse_utc_datetime(str(row.get("updated_at") or "")) or datetime.now(timezone.utc)) < cutoff
+            )
+
         now_value = urllib.parse.quote(datetime.now(timezone.utc).isoformat(timespec="seconds"), safe="")
         overdue_rows = supabase_request(
             "GET",
@@ -5309,6 +5360,8 @@ def fetch_send_job_queue_summary(job_id: str) -> dict[str, object]:
         summary["first_queue_status"] = ""
         summary["first_queue_at"] = ""
         summary["next_pending_at"] = ""
+        summary["sending_count"] = 0
+        summary["stale_sending_count"] = 0
         summary["overdue_pending"] = False
     return summary
 
@@ -6694,6 +6747,11 @@ def main() -> None:
     else:
         st.warning("SMTP未設定: 送信操作は記録のみのテストモードです")
 
+    send_booking_notice = st.session_state.pop("send_booking_notice", "")
+    if send_booking_notice:
+        st.success(send_booking_notice)
+        st.caption("送信予約の作成後、進捗確認と送信処理をすぐ開始できるように画面を更新しました。")
+
     st.info(
         "営業メールは、送信先の国や地域のルールに従ってください。"
         "日本では広告宣伝メールは原則オプトインです。"
@@ -7707,6 +7765,7 @@ def main() -> None:
             with st.expander(f"シナリオ・送信予約の進捗（稼働中{len(active_jobs)}件）", expanded=bool(active_jobs)):
                 refresh_col, note_col = st.columns([1.0, 2.4])
                 if refresh_col.button("状態を更新", width="stretch"):
+                    process_due_send_queue_from_streamlit(force=True)
                     sync_send_queue_results()
                     st.rerun()
                 note_col.caption("送信予約の進捗は30秒ごとに自動更新されます。この画面を開いている間は、予定時刻を過ぎた送信待ちも1通ずつ処理します。")
@@ -7774,6 +7833,8 @@ def main() -> None:
                         queue_summary = job_queue_summaries.get(job_id, {})
                         has_queue = bool(queue_summary.get("has_queue"))
                         next_pending_at = str(queue_summary.get("next_pending_at") or "")
+                        sending_count = int(queue_summary.get("sending_count") or 0)
+                        stale_sending_count = int(queue_summary.get("stale_sending_count") or 0)
                         overdue_pending = bool(queue_summary.get("overdue_pending"))
                         campaign_name_value = str(job.get("campaign_name") or "名称未設定")
                         progress_percent = send_job_progress_percent(job)
@@ -7788,13 +7849,16 @@ def main() -> None:
                                 st.warning("送信キューはありますが、次の送信待ちが見つかりません。処理中のまま止まっている可能性があります。")
                         if overdue_pending:
                             st.warning("予定時刻を過ぎた送信待ちがあります。この画面を開いている間は、アプリ側でも1通ずつ処理します。")
+                        if stale_sending_count:
+                            st.warning("送信処理中のまま止まった予約があります。「状態を更新」を押すと復旧して再開します。")
                         st.progress(progress_ratio)
-                        progress_cols = st.columns([1.0, 1.0, 1.0, 1.0, 1.2])
+                        progress_cols = st.columns([1.0, 1.0, 1.0, 1.0, 1.0, 1.2])
                         progress_cols[0].metric("進捗", f"{progress_percent:.1f}%")
                         progress_cols[1].metric("予約数", f"{send_job_count(job, 'total_count'):,}通")
                         progress_cols[2].metric("送信済み", f"{send_job_count(job, 'sent_count'):,}通")
                         progress_cols[3].metric("失敗", f"{send_job_count(job, 'failed_count'):,}通")
-                        progress_cols[4].metric("状態", send_job_status_label(str(job.get("status") or "")))
+                        progress_cols[4].metric("処理中", f"{sending_count:,}通")
+                        progress_cols[5].metric("状態", send_job_status_label(str(job.get("status") or "")))
                     if len(active_jobs) > 8:
                         st.caption(f"ほか{len(active_jobs) - 8}件の稼働中シナリオは下の一覧で確認できます。")
                 else:
@@ -7820,6 +7884,12 @@ def main() -> None:
                     jobs_display["overdue_pending"] = jobs_display["id"].apply(
                         lambda value: "あり" if bool(job_queue_summaries.get(str(value), {}).get("overdue_pending")) else "なし"
                     )
+                    jobs_display["sending_count"] = jobs_display["id"].apply(
+                        lambda value: int(job_queue_summaries.get(str(value), {}).get("sending_count") or 0)
+                    )
+                    jobs_display["stale_sending_count"] = jobs_display["id"].apply(
+                        lambda value: int(job_queue_summaries.get(str(value), {}).get("stale_sending_count") or 0)
+                    )
                     st.dataframe(
                         jobs_display[
                             [
@@ -7832,6 +7902,8 @@ def main() -> None:
                                 "success_percent",
                                 "status",
                                 "queue_state",
+                                "sending_count",
+                                "stale_sending_count",
                                 "created_at_jst",
                                 "next_pending_at",
                                 "overdue_pending",
@@ -7847,6 +7919,8 @@ def main() -> None:
                                 "success_percent": "送信成功率",
                                 "status": "状態",
                                 "queue_state": "送信キュー",
+                                "sending_count": "処理中",
+                                "stale_sending_count": "停止中",
                                 "created_at_jst": "作成日時",
                                 "next_pending_at": "次の送信予定",
                                 "overdue_pending": "予定時刻超過",
@@ -8094,8 +8168,9 @@ def main() -> None:
                             unsubscribe_scope_label,
                         )
                     if ok:
-                        st.success(message)
-                        st.caption("この画面を開いている間は、予定時刻を過ぎた送信待ちを30秒ごとに1通ずつ処理します。")
+                        st.session_state["send_booking_notice"] = message
+                        st.session_state["_send_queue_last_checked_at"] = 0
+                        st.rerun()
                     else:
                         st.error(message)
                 else:

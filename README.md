@@ -95,7 +95,7 @@ Streamlit CloudのSecretsに以下を設定します。
 
 ```toml
 [auth]
-redirect_uri = "https://your-app-name.streamlit.app/oauth2callback"
+redirect_uri = "https://your-app-name.streamlit.app/"
 cookie_secret = "long-random-secret"
 
 [auth.google]
@@ -107,10 +107,25 @@ server_metadata_url = "https://accounts.google.com/.well-known/openid-configurat
 ローカルで試す場合の `redirect_uri` は以下です。
 
 ```toml
-redirect_uri = "http://localhost:8501/oauth2callback"
+redirect_uri = "http://localhost:8501/"
 ```
 
 Google Cloud Console側のOAuthクライアントにも、同じリダイレクトURLを登録してください。
+
+## 送信予約が進まない時
+
+送信予約は、Supabaseの `send_queue` に保存され、予定時刻を過ぎたものから送信されます。
+
+Streamlit画面を開いている間は、アプリ側が約30秒ごとに1通ずつ処理します。タブを閉じても送信を続けたい場合は、Supabase Edge Function `process-send-queue` をデプロイし、定期実行から呼び出してください。
+
+シナリオ全体予約で止まったように見える場合は、アプリの「シナリオ・送信予約の進捗」で以下を確認します。
+
+- `次の送信予定`: 次に送る予定時刻です。未来時刻なら、その時刻まで送信されません。
+- `予定時刻超過`: 予定時刻を過ぎた送信待ちがあります。画面を開いている間、または「状態を更新」で処理が進みます。
+- `処理中`: いま送信処理に入っている件数です。
+- `停止中`: 送信処理中のまま10分以上止まった件数です。「状態を更新」を押すと復旧して再開します。
+
+本番で反映する時は、GitHub / Streamlit Cloudへ `streamlit_app.py` を反映し、Supabase Edge Functionを使っている場合は `supabase/functions/process-send-queue/index.ts` も再デプロイしてください。
 
 ## YouTube API使用量メーター
 
