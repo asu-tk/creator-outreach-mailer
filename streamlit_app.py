@@ -4648,7 +4648,10 @@ def unsubscribe_events_display_frame(events: pd.DataFrame) -> pd.DataFrame:
         axis=1,
     )
     display["メールアドレス"] = display["contact_email"].replace("", "-")
-    display["チャンネル"] = display["channel"].replace("", display["youtube_channel_id"]).replace("", "-")
+    display["チャンネル"] = display["channel"].where(
+        display["channel"].astype(str).str.strip() != "",
+        display["youtube_channel_id"],
+    ).replace("", "-")
     display["詳細"] = display["campaign_key"].replace("", "-")
     return display[["停止日時", "停止範囲", "メールアドレス", "チャンネル", "詳細"]]
 
