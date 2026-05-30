@@ -1374,7 +1374,7 @@ def discard_column_index(values: list[list]) -> int:
 
 def add_outsource_discard_column(values: list[list]) -> list[list]:
     if not values:
-        return values
+        return [OUTSOURCE_SHEET_COLUMNS]
     existing_discard_index = discard_column_index(values)
     if existing_discard_index >= 0:
         normalized = [list(row) for row in values]
@@ -5851,16 +5851,20 @@ def main() -> None:
             st.session_state["last_outsource_sheet_url"] = cleaned_outsource_url
             if cleaned_outsource_url:
                 st.success("外注用GoogleシートURLを保存しました。")
-                if ready_for_sheet and not candidates.empty:
+                if ready_for_sheet:
                     try:
-                        spreadsheet_url, exported_count, already_count = append_new_outsource_candidates(candidates)
-                        if exported_count:
-                            st.success(
-                                f"新規候補{exported_count}件をGoogleシートへ追加しました。"
-                                f"反映済みの候補は{already_count}件スキップしました。"
-                            )
+                        if candidates.empty:
+                            spreadsheet_url = repair_outsource_spreadsheet_columns(cleaned_outsource_url)
+                            st.success("Googleシートの列を準備しました。")
                         else:
-                            st.info(f"新しく追加できる候補はありません。反映済みの候補: {already_count}件")
+                            spreadsheet_url, exported_count, already_count = append_new_outsource_candidates(candidates)
+                            if exported_count:
+                                st.success(
+                                    f"新規候補{exported_count}件をGoogleシートへ追加しました。"
+                                    f"反映済みの候補は{already_count}件スキップしました。"
+                                )
+                            else:
+                                st.info(f"新しく追加できる候補はありません。反映済みの候補: {already_count}件")
                         st.session_state["last_outsource_sheet_url"] = spreadsheet_url
                         st.session_state["outsource_reflection_snapshot"] = {
                             "url": spreadsheet_url,
@@ -5916,27 +5920,13 @@ def main() -> None:
             reflected_count = int(reflection_snapshot.get("reflected_count") or 0)
             reflected_checked_at = str(reflection_snapshot.get("checked_at") or "")
 
-        check_col, repair_col, refresh_col = st.columns(3)
+        check_col, refresh_col = st.columns(2)
         if check_col.button("Googleシート接続を確認", key="check_outsource_sheet_connection", use_container_width=True):
             try:
                 save_setting("OUTSOURCE_SPREADSHEET_URL", active_outsource_url)
                 st.success(check_outsource_spreadsheet_connection(active_outsource_url))
             except Exception as exc:
                 st.error(f"接続できませんでした: {exc}")
-        if repair_col.button(
-            "シートに削除チェック欄を作る",
-            key="repair_outsource_sheet_columns",
-            use_container_width=True,
-            disabled=bool(sync_blockers),
-        ):
-            try:
-                spreadsheet_url = repair_outsource_spreadsheet_columns(active_outsource_url)
-                st.session_state["last_outsource_sheet_url"] = spreadsheet_url
-                st.session_state.pop("outsource_reflection_snapshot", None)
-                st.session_state["outsource_sync_notice"] = "Googleシートに「候補から削除」チェック欄を作りました。"
-                st.rerun()
-            except Exception as exc:
-                st.error(f"チェック欄を作れませんでした: {exc}")
         if refresh_col.button(
             "反映状態を更新",
             key="refresh_outsource_reflection_status",
