@@ -3788,24 +3788,29 @@ def next_window_start(moment: datetime, window_start: datetime_time) -> datetime
     return datetime.combine(moment.date() + timedelta(days=1), window_start, APP_TIMEZONE)
 
 
-def build_send_schedule(
+def align_to_send_window(moment: datetime, window_start: datetime_time, window_end: datetime_time) -> datetime:
+    cursor = moment.astimezone(APP_TIMEZONE)
+    day_start = datetime.combine(cursor.date(), window_start, APP_TIMEZONE)
+    day_end = datetime.combine(cursor.date(), window_end, APP_TIMEZONE)
+    if cursor < day_start:
+        return day_start
+    if cursor >= day_end:
+        return next_window_start(cursor, window_start)
+    return cursor
+
+
+def build_send_schedule_from(
     send_count: int,
     delay_seconds: int,
     window_start: datetime_time,
     window_end: datetime_time,
+    start_after: datetime | None = None,
 ) -> list[datetime]:
     if send_count <= 0 or window_end <= window_start:
         return []
 
     scheduled_times = []
-    cursor = datetime.now(APP_TIMEZONE)
-    today_start = datetime.combine(cursor.date(), window_start, APP_TIMEZONE)
-    today_end = datetime.combine(cursor.date(), window_end, APP_TIMEZONE)
-
-    if cursor < today_start:
-        cursor = today_start
-    elif cursor >= today_end:
-        cursor = next_window_start(cursor, window_start)
+    cursor = align_to_send_window(start_after or datetime.now(APP_TIMEZONE), window_start, window_end)
 
     for _ in range(send_count):
         day_end = datetime.combine(cursor.date(), window_end, APP_TIMEZONE)
@@ -3815,6 +3820,56 @@ def build_send_schedule(
         cursor = cursor + timedelta(seconds=int(delay_seconds))
 
     return scheduled_times
+
+
+def build_send_schedule(
+    send_count: int,
+    delay_seconds: int,
+    window_start: datetime_time,
+    window_end: datetime_time,
+) -> list[datetime]:
+    return build_send_schedule_from(send_count, delay_seconds, window_start, window_end)
+
+
+def build_scenario_send_schedules(
+    recipient_count: int,
+    step_count: int,
+    delay_seconds: int,
+    window_start: datetime_time,
+    window_end: datetime_time,
+    step_gap_days: int,
+) -> list[list[datetime]]:
+    schedules: list[list[datetime]] = []
+    if recipient_count <= 0 or step_count <= 0 or window_end <= window_start:
+        return schedules
+
+    start_after: datetime | None = datetime.now(APP_TIMEZONE)
+    gap_days = max(1, int(step_gap_days))
+    for _ in range(step_count):
+        step_schedule = build_send_schedule_from(
+            recipient_count,
+            delay_seconds,
+            window_start,
+            window_end,
+            start_after,
+        )
+        if len(step_schedule) != recipient_count:
+            return []
+        schedules.append(step_schedule)
+        start_after = step_schedule[-1].astimezone(APP_TIMEZONE) + timedelta(days=gap_days)
+    return schedules
+
+
+def flatten_schedules(schedules: list[list[datetime]]) -> list[datetime]:
+    return [scheduled_at for schedule in schedules for scheduled_at in schedule]
+
+
+def schedule_calendar_days(schedule: list[datetime]) -> int:
+    if not schedule:
+        return 0
+    first_day = schedule[0].astimezone(APP_TIMEZONE).date()
+    last_day = schedule[-1].astimezone(APP_TIMEZONE).date()
+    return max(1, (last_day - first_day).days + 1)
 
 
 def send_window_seconds(window_start: datetime_time, window_end: datetime_time) -> int:
@@ -3911,6 +3966,32 @@ def send_email(to_email: str, subject: str, body: str) -> tuple[bool, str]:
         return False, friendly_smtp_error(str(exc))
 
 
+def post_send_queue_rows(queue_rows: list[dict]) -> None:
+    chunk_size = 100
+    for index in range(0, len(queue_rows), chunk_size):
+        supabase_request(
+            "POST",
+            "send_queue",
+            queue_rows[index : index + chunk_size],
+            prefer="return=minimal",
+        )
+
+
+def insert_queued_send_rows(send_rows: list[tuple]) -> None:
+    if not send_rows:
+        return
+    with sqlite3.connect(DB_PATH) as db:
+        db.executemany(
+            """
+            insert into sends(user_id, contact_id, campaign_key, send_job_id, subject, status, error, sent_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            send_rows,
+        )
+        db.commit()
+    mark_app_state_dirty()
+
+
 def create_send_job(
     campaign_name: str,
     campaign_key_value: str,
@@ -3991,13 +4072,160 @@ def create_send_job(
             }
         )
     if queue_rows:
-        supabase_request("POST", "send_queue", queue_rows, prefer="return=representation")
-    for row in queue_rows:
-        execute(
-            "insert into sends(user_id, contact_id, campaign_key, send_job_id, subject, status, error, sent_at) values (?, ?, ?, ?, ?, ?, ?, ?)",
-            (current_user_id(), row["contact_local_id"], campaign_key_value, str(job_id), row["subject"], "queued", "", now_iso()),
-        )
+        post_send_queue_rows(queue_rows)
+    queued_at = now_iso()
+    insert_queued_send_rows(
+        [
+            (
+                current_user_id(),
+                row["contact_local_id"],
+                campaign_key_value,
+                str(job_id),
+                row["subject"],
+                "queued",
+                "",
+                queued_at,
+            )
+            for row in queue_rows
+        ]
+    )
     return True, f"{len(queue_rows)}件の送信予約を作成しました"
+
+
+def create_scenario_full_send_job(
+    scenario: sqlite3.Row,
+    scenario_steps: list[sqlite3.Row],
+    contacts: list[sqlite3.Row],
+    delay_seconds: int,
+    window_start: datetime_time,
+    window_end: datetime_time,
+    step_gap_days: int,
+) -> tuple[bool, str]:
+    if not supabase_configured():
+        return False, "送信予約にはSupabase設定が必要です"
+    if not smtp_configured():
+        return False, "送信元メール設定が未完了です"
+    smtp_ok, smtp_message = check_smtp_login()
+    if not smtp_ok:
+        return False, smtp_message
+    if not contacts:
+        return False, "送信できる宛先がありません"
+    if not scenario_steps:
+        return False, "このシナリオにはステップがありません"
+
+    scenario_name = str(scenario["name"] or "").strip()
+    prepared_steps: list[dict] = []
+    for step in scenario_steps:
+        template_name = str(step["template_name"] or "").strip()
+        template = get_campaign_template(template_name)
+        if not template:
+            return False, f"{step['step_number']}通目のテンプレート「{template_name}」が見つかりません。"
+        prepared_steps.append(
+            {
+                "step_number": int(step["step_number"]),
+                "template_name": template_name,
+                "campaign_key": scenario_step_campaign_key(int(scenario["id"]), int(step["step_number"])),
+                "campaign_name": scenario_step_campaign_name(
+                    scenario_name,
+                    int(step["step_number"]),
+                    template_name,
+                ),
+                "subject": str(template["subject"] or ""),
+                "body": str(template["body"] or ""),
+            }
+        )
+
+    step_schedules = build_scenario_send_schedules(
+        len(contacts),
+        len(prepared_steps),
+        int(delay_seconds),
+        window_start,
+        window_end,
+        int(step_gap_days),
+    )
+    if len(step_schedules) != len(prepared_steps):
+        return False, "送信可能時間帯の設定を確認してください。終了時刻は開始時刻より後にしてください。"
+
+    account = active_smtp_account()
+    user_email = current_user_profile()["email"].strip().lower() or current_user_id()
+    total_count = len(contacts) * len(prepared_steps)
+    job_payload = {
+        "user_email": user_email,
+        "campaign_key": campaign_key(f"scenario-full:{int(scenario['id'])}"),
+        "campaign_name": f"{scenario_name}｜シナリオ全体",
+        "subject_template": prepared_steps[0]["subject"],
+        "body_template": ensure_unsubscribe_link_template(prepared_steps[0]["body"]),
+        "sender_label": str(account.get("label") or ""),
+        "sender_name": str(account.get("sender_name") or ""),
+        "sender_email": str(account.get("sender_email") or ""),
+        "smtp_host": str(account.get("smtp_host") or ""),
+        "smtp_port": int(str(account.get("smtp_port") or "587")),
+        "smtp_ssl": int(account.get("smtp_ssl") or 0) == 1,
+        "smtp_pass": str(account.get("smtp_pass") or ""),
+        "delay_seconds": int(delay_seconds),
+        "total_count": total_count,
+        "status": "queued",
+        "updated_at": now_iso(),
+    }
+    created_job = supabase_request("POST", "send_jobs", job_payload, prefer="return=representation")
+    if not isinstance(created_job, list) or not created_job:
+        return False, "送信予約の作成に失敗しました"
+    job_id = str(created_job[0]["id"])
+
+    queue_rows: list[dict] = []
+    local_rows: list[tuple] = []
+    queued_at = now_iso()
+    for contact in contacts:
+        register_unsubscribe_token(contact, user_email)
+
+    for step_index, step in enumerate(prepared_steps):
+        for contact_index, contact in enumerate(contacts):
+            unsubscribe_url = build_unsubscribe_url(
+                contact,
+                UNSUBSCRIBE_SCOPE_SCENARIO,
+                scenario_name,
+                scenario_name,
+            )
+            unsubscribe_all_url = build_global_unsubscribe_url(contact)
+            subject = render_template(step["subject"], contact, unsubscribe_url)
+            body = render_template(
+                ensure_unsubscribe_link_template(step["body"]),
+                contact,
+                unsubscribe_url,
+                unsubscribe_all_url,
+            )
+            queue_rows.append(
+                {
+                    "job_id": job_id,
+                    "user_email": user_email,
+                    "campaign_key": step["campaign_key"],
+                    "contact_local_id": int(contact["id"]),
+                    "contact_email": contact["email"],
+                    "contact_name": contact["name"],
+                    "contact_channel": contact["channel"],
+                    "subject": subject,
+                    "body": body,
+                    "status": "pending",
+                    "scheduled_at": step_schedules[step_index][contact_index].isoformat(),
+                }
+            )
+            local_rows.append(
+                (
+                    current_user_id(),
+                    int(contact["id"]),
+                    step["campaign_key"],
+                    job_id,
+                    subject,
+                    "queued",
+                    "",
+                    queued_at,
+                )
+            )
+
+    if queue_rows:
+        post_send_queue_rows(queue_rows)
+    insert_queued_send_rows(local_rows)
+    return True, f"{len(contacts)}件の宛先に、{len(prepared_steps)}ステップ分（合計{total_count}通）の送信予約を作成しました"
 
 
 def sync_send_queue_results() -> None:
@@ -6719,6 +6947,10 @@ def main() -> None:
         prerequisite_campaign_keys: list[str] = []
         later_step_campaign_keys: list[str] = []
         scenario_context = ""
+        scenario_full_auto = False
+        scenario_full_steps: list[sqlite3.Row] = []
+        scenario_step_gap_days = 1
+        send_scenario = None
         if send_mode == "シナリオ配信":
             scenario_labels = [scenario["name"] for scenario in scenarios_for_send]
             scenario_label = st.selectbox("送信するシナリオ", scenario_labels, key="send_scenario_select")
@@ -6728,10 +6960,22 @@ def main() -> None:
                 if not send_steps:
                     st.warning("このシナリオにはステップがありません。シナリオ設定でテンプレートを割り当ててください。")
                 else:
+                    scenario_delivery_mode = st.radio(
+                        "シナリオの予約範囲",
+                        ["今回のステップだけ予約", "シナリオ全体を最後まで予約"],
+                        horizontal=True,
+                        key="scenario_delivery_mode",
+                    )
+                    scenario_full_auto = scenario_delivery_mode == "シナリオ全体を最後まで予約"
+                    scenario_full_steps = send_steps if scenario_full_auto else []
                     step_labels = [f"{step['step_number']}通目: {step['template_name']}" for step in send_steps]
-                    selected_step_label = st.selectbox("今回送るステップ", step_labels, key="send_scenario_step_select")
-                    selected_step_index = step_labels.index(selected_step_label)
-                    selected_step = send_steps[selected_step_index]
+                    if scenario_full_auto:
+                        selected_step_index = 0
+                        selected_step = send_steps[0]
+                    else:
+                        selected_step_label = st.selectbox("今回送るステップ", step_labels, key="send_scenario_step_select")
+                        selected_step_index = step_labels.index(selected_step_label)
+                        selected_step = send_steps[selected_step_index]
                     selected_template_for_step = get_campaign_template(selected_step["template_name"])
                     prerequisite_campaign_keys = [
                         scenario_step_campaign_key(int(send_scenario["id"]), int(step["step_number"]))
@@ -6756,17 +7000,41 @@ def main() -> None:
                     if selected_template_for_step:
                         effective_subject_template = selected_template_for_step["subject"]
                         effective_body_template = selected_template_for_step["body"]
-                    scenario_context = (
-                        f"シナリオ「{send_scenario['name']}」の{selected_step['step_number']}通目です。"
-                        f"{'前のステップを送信済みの宛先だけが対象です。' if prerequisite_campaign_keys else '1通目なので前のステップ条件はありません。'}"
-                        "後ろのステップをすでに送っている宛先は、戻り送信を防ぐため対象外にします。"
-                    )
+                    if scenario_full_auto:
+                        scenario_context = (
+                            f"シナリオ「{send_scenario['name']}」を1通目から最後までまとめて予約します。"
+                            "各ステップは、前ステップの全予約が終わってから次に進むため、1日の送信目標はシナリオ全体で守られます。"
+                            "同じ宛先へ同じ日に複数ステップは送りません。"
+                        )
+                    else:
+                        scenario_context = (
+                            f"シナリオ「{send_scenario['name']}」の{selected_step['step_number']}通目です。"
+                            f"{'前のステップを送信済みの宛先だけが対象です。' if prerequisite_campaign_keys else '1通目なので前のステップ条件はありません。'}"
+                            "後ろのステップをすでに送っている宛先は、戻り送信を防ぐため対象外にします。"
+                        )
                     st.info(scenario_context)
-                    st.caption(f"このステップで使うテンプレート: {selected_step['template_name']}")
-                    with st.expander("このステップで送る内容を確認", expanded=False):
-                        st.text_input("配信名", value=effective_campaign_name, disabled=True, key="scenario_effective_campaign_name")
-                        st.text_input("件名", value=effective_subject_template, disabled=True, key="scenario_effective_subject")
-                        render_readonly_mail_body("本文", effective_body_template, min_height=460)
+                    if scenario_full_auto:
+                        st.caption(f"予約するステップ数: {len(send_steps)}通")
+                        with st.expander("シナリオ全体で送る内容を確認", expanded=False):
+                            for step in send_steps:
+                                template = get_campaign_template(step["template_name"])
+                                st.markdown(f"**{step['step_number']}通目: {step['template_name']}**")
+                                if template:
+                                    st.text_input(
+                                        "件名",
+                                        value=str(template["subject"] or ""),
+                                        disabled=True,
+                                        key=f"scenario_full_subject_{send_scenario['id']}_{step['step_number']}",
+                                    )
+                                    render_readonly_mail_body("本文", str(template["body"] or ""), min_height=320)
+                                else:
+                                    st.warning("このステップのテンプレートが見つかりません。")
+                    else:
+                        st.caption(f"このステップで使うテンプレート: {selected_step['template_name']}")
+                        with st.expander("このステップで送る内容を確認", expanded=False):
+                            st.text_input("配信名", value=effective_campaign_name, disabled=True, key="scenario_effective_campaign_name")
+                            st.text_input("件名", value=effective_subject_template, disabled=True, key="scenario_effective_subject")
+                            render_readonly_mail_body("本文", effective_body_template, min_height=460)
         else:
             st.caption("通常配信では、配信名ごとに送信済み・送信待ちを判定します。")
             campaign_name = st.text_input("配信名", key="campaign_name_input")
@@ -6846,19 +7114,33 @@ def main() -> None:
         if int(daily_capacity) > 800:
             st.warning("1日の送信数が多めです。最初は500〜600件くらいから始め、失敗や迷惑メール判定が増えないか確認するのがおすすめです。")
 
+        if scenario_full_auto:
+            scenario_step_gap_days = st.number_input(
+                "次のステップまで空ける日数",
+                min_value=1,
+                max_value=30,
+                value=3,
+                step=1,
+                key="scenario_full_step_gap_days",
+            )
+            st.caption(
+                "シナリオ全体予約では、1ステップ目を予約し終えてから指定日数を空け、次のステップを予約します。"
+                "1日の目標送信数は全ステップ合計で守ります。"
+            )
+
         reserve_all_remaining = st.checkbox(
-            "この配信の未送信をすべて予約する",
+            "このシナリオの未送信宛先をすべて予約する" if scenario_full_auto else "この配信の未送信をすべて予約する",
             value=False,
             disabled=int(estimated_remaining_count) <= 0,
             key="reserve_all_remaining_contacts",
         )
         if reserve_all_remaining:
             send_limit = max(1, int(estimated_remaining_count))
-            st.caption(f"今回予約する総件数: {send_limit:,}件")
+            st.caption(f"今回予約する宛先数: {send_limit:,}件")
         else:
             default_send_limit = max(1, min(int(estimated_remaining_count) if int(estimated_remaining_count) > 0 else 500, 500))
             send_limit = st.number_input(
-                "今回予約する総件数",
+                "今回予約する宛先数" if scenario_full_auto else "今回予約する総件数",
                 min_value=1,
                 max_value=10000,
                 value=default_send_limit,
@@ -6866,13 +7148,32 @@ def main() -> None:
                 key="send_limit_input",
             )
 
+        scenario_booking_step_count = len(scenario_full_steps) if scenario_full_auto else 1
         estimated_planned_count = min(int(send_limit), int(estimated_remaining_count))
-        estimated_days = estimate_send_days(estimated_planned_count, int(daily_capacity))
-        if estimated_planned_count > 0 and estimated_days > 0:
-            st.caption(
-                f"この予約は、約{estimated_days}日で送信完了する見込みです"
-                f"（予約 {estimated_planned_count:,}件 / 1日 約{int(daily_capacity):,}件）。"
+        estimated_message_count = estimated_planned_count * max(1, int(scenario_booking_step_count))
+        if scenario_full_auto:
+            estimated_schedules = build_scenario_send_schedules(
+                estimated_planned_count,
+                scenario_booking_step_count,
+                int(delay),
+                send_window_start,
+                send_window_end,
+                int(scenario_step_gap_days),
             )
+            estimated_flat_schedule = flatten_schedules(estimated_schedules)
+            estimated_days = schedule_calendar_days(estimated_flat_schedule)
+            if estimated_planned_count > 0 and estimated_days > 0:
+                st.caption(
+                    f"この予約は、約{estimated_days}日でシナリオ全体が完了する見込みです"
+                    f"（宛先 {estimated_planned_count:,}件 × {scenario_booking_step_count}ステップ = 合計 {estimated_message_count:,}通 / 1日 約{int(daily_capacity):,}通）。"
+                )
+        else:
+            estimated_days = estimate_send_days(estimated_planned_count, int(daily_capacity))
+            if estimated_planned_count > 0 and estimated_days > 0:
+                st.caption(
+                    f"この予約は、約{estimated_days}日で送信完了する見込みです"
+                    f"（予約 {estimated_planned_count:,}件 / 1日 約{int(daily_capacity):,}件）。"
+                )
         confirmed = st.checkbox("送信対象が許諾済み、または法的に送信可能な宛先であることを確認しました")
 
         target_count = rows(
@@ -6937,35 +7238,52 @@ def main() -> None:
         )
         metric_cols = st.columns(4)
         metric_cols[0].metric("送信対象", f"{target_count}件")
-        metric_cols[1].metric("この配信を送信済み", f"{already_sent_count}件")
+        metric_cols[1].metric("1通目を送信済み" if scenario_full_auto else "この配信を送信済み", f"{already_sent_count}件")
         metric_cols[2].metric("送信待ち", f"{queued_count}件")
-        metric_cols[3].metric("この配信の未送信", f"{remaining_count}件")
+        metric_cols[3].metric("予約できる宛先" if scenario_full_auto else "この配信の未送信", f"{remaining_count}件")
         if prerequisite_waiting_count:
             st.warning(f"前のステップが未送信のため、{prerequisite_waiting_count}件は今回の対象から外れています。")
         if later_step_excluded_count:
             st.warning(f"後ろのステップを送信済み、または送信待ちのため、{later_step_excluded_count}件は今回の対象から外れています。")
         planned_count = min(int(send_limit), int(remaining_count))
-        preview_schedule = build_send_schedule(
-            planned_count,
-            int(delay),
-            send_window_start,
-            send_window_end,
-        )
+        scenario_preview_schedules: list[list[datetime]] = []
+        if scenario_full_auto:
+            scenario_preview_schedules = build_scenario_send_schedules(
+                planned_count,
+                scenario_booking_step_count,
+                int(delay),
+                send_window_start,
+                send_window_end,
+                int(scenario_step_gap_days),
+            )
+            preview_schedule = flatten_schedules(scenario_preview_schedules)
+        else:
+            preview_schedule = build_send_schedule(
+                planned_count,
+                int(delay),
+                send_window_start,
+                send_window_end,
+            )
+        planned_message_count = planned_count * max(1, int(scenario_booking_step_count))
         if planned_count > 0 and preview_schedule:
             first_time = format_local_datetime(preview_schedule[0])
             last_time = format_local_datetime(preview_schedule[-1])
             total_minutes = max(1, int((preview_schedule[-1] - preview_schedule[0]).total_seconds() // 60) + 1)
-            plan_days = estimate_send_days(int(planned_count), int(daily_capacity))
+            plan_days = schedule_calendar_days(preview_schedule) if scenario_full_auto else estimate_send_days(int(planned_count), int(daily_capacity))
             day_label = f" / 約{plan_days}日分" if plan_days else ""
+            planned_label = f"{planned_count}件 × {scenario_booking_step_count}ステップ = {planned_message_count}通" if scenario_full_auto else f"{planned_count}件"
             st.info(
-                f"送信予定: {planned_count}件 / 開始予定 {first_time} / 完了予定 {last_time} / "
+                f"送信予定: {planned_label} / 開始予定 {first_time} / 完了予定 {last_time} / "
                 f"所要目安 約{total_minutes:,}分{day_label}"
             )
         elif planned_count > 0:
             st.warning("送信可能時間帯の設定を確認してください。終了時刻は開始時刻より後にしてください。")
         if remaining_count == 0 and target_count > 0:
             st.success("この配信名では、現在の送信対象すべてが送信済み、または送信待ちです。")
-        st.caption("同じ配信名ですでに送った宛先、または送信待ちの宛先は自動で除外します。送信対象は、未送信の宛先を優先し、その後は最終送信日時が古い順に選ばれます。")
+        if scenario_full_auto:
+            st.caption("シナリオ全体予約では、1通目を送信済み・送信待ちの宛先、または後続ステップをすでに送っている宛先は除外します。")
+        else:
+            st.caption("同じ配信名ですでに送った宛先、または送信待ちの宛先は自動で除外します。送信対象は、未送信の宛先を優先し、その後は最終送信日時が古い順に選ばれます。")
 
         preview_contacts = fetch_next_send_contacts(
             current_campaign_key,
@@ -7002,8 +7320,8 @@ def main() -> None:
         safety_messages = safety_check_messages(
             effective_subject_template,
             effective_body_template,
-            int(send_limit),
-            int(planned_count),
+            int(planned_message_count),
+            int(planned_message_count),
             bool(preview_contacts),
             int(daily_capacity),
         )
@@ -7034,6 +7352,8 @@ def main() -> None:
                     f"送信対象の先頭1件で確認しています: "
                     f"{preview_contact['channel'] or '-'} / {preview_contact['email']}"
                 )
+                if scenario_full_auto:
+                    st.caption("プレビューは1通目の内容です。2通目以降は「シナリオ全体で送る内容を確認」で確認できます。")
                 st.text_input("プレビュー件名", value=preview_subject, disabled=True)
                 render_readonly_mail_body("プレビュー本文", preview_body, min_height=520)
 
@@ -7047,30 +7367,46 @@ def main() -> None:
                 start_label = format_local_datetime(preview_schedule[0])
                 finish_label = format_local_datetime(preview_schedule[-1])
                 duration_minutes = max(1, int((preview_schedule[-1] - preview_schedule[0]).total_seconds() // 60) + 1)
-                duration_days = estimate_send_days(int(planned_count), int(daily_capacity))
+                duration_days = schedule_calendar_days(preview_schedule) if scenario_full_auto else estimate_send_days(int(planned_count), int(daily_capacity))
                 duration_label = f"約{duration_minutes:,}分"
                 if duration_days:
                     duration_label += f" / 約{duration_days}日"
 
             confirm_cols = st.columns(3)
-            confirm_cols[0].metric("今回送信予約する件数", f"{planned_count}件")
+            confirm_cols[0].metric("今回送信予約する件数", f"{planned_message_count}通" if scenario_full_auto else f"{planned_count}件")
             confirm_cols[1].metric("送信間隔", f"{format_delay_seconds(int(delay))}に1通")
             confirm_cols[2].metric("完了予定", finish_label)
 
-            detail_frame = pd.DataFrame(
-                [
-                    {"確認項目": "配信名", "内容": effective_campaign_name.strip() or "-"},
-                    {"確認項目": "送信元", "内容": sender_label},
-                    {"確認項目": "件名", "内容": effective_subject_template.strip() or "-"},
-                    {"確認項目": "送信してよい時間", "内容": f"{send_window_start:%H:%M} から {send_window_end:%H:%M} まで"},
-                    {"確認項目": "1日の送信目安", "内容": f"約{int(daily_capacity):,}件"},
-                    {"確認項目": "開始予定", "内容": start_label},
-                    {"確認項目": "所要時間の目安", "内容": duration_label},
-                    {"確認項目": "この配信の送信済み", "内容": f"{already_sent_count}件"},
-                    {"確認項目": "この配信の送信待ち", "内容": f"{queued_count}件"},
-                    {"確認項目": "この配信の未送信", "内容": f"{remaining_count}件"},
-                ]
-            )
+            detail_rows = [
+                {"確認項目": "配信名", "内容": f"{send_scenario['name']}｜シナリオ全体" if scenario_full_auto and send_scenario else effective_campaign_name.strip() or "-"},
+                {"確認項目": "送信元", "内容": sender_label},
+                {"確認項目": "件名", "内容": "各ステップの件名を使用" if scenario_full_auto else effective_subject_template.strip() or "-"},
+                {"確認項目": "送信してよい時間", "内容": f"{send_window_start:%H:%M} から {send_window_end:%H:%M} まで"},
+                {"確認項目": "1日の送信目安", "内容": f"約{int(daily_capacity):,}通"},
+                {"確認項目": "開始予定", "内容": start_label},
+                {"確認項目": "所要時間の目安", "内容": duration_label},
+            ]
+            if scenario_full_auto:
+                detail_rows.extend(
+                    [
+                        {"確認項目": "予約宛先数", "内容": f"{planned_count}件"},
+                        {"確認項目": "ステップ数", "内容": f"{scenario_booking_step_count}通"},
+                        {"確認項目": "予約メール総数", "内容": f"{planned_message_count}通"},
+                        {"確認項目": "次のステップまで", "内容": f"{int(scenario_step_gap_days)}日空ける"},
+                        {"確認項目": "1通目を送信済み", "内容": f"{already_sent_count}件"},
+                        {"確認項目": "1通目の送信待ち", "内容": f"{queued_count}件"},
+                        {"確認項目": "予約できる宛先", "内容": f"{remaining_count}件"},
+                    ]
+                )
+            else:
+                detail_rows.extend(
+                    [
+                        {"確認項目": "この配信の送信済み", "内容": f"{already_sent_count}件"},
+                        {"確認項目": "この配信の送信待ち", "内容": f"{queued_count}件"},
+                        {"確認項目": "この配信の未送信", "内容": f"{remaining_count}件"},
+                    ]
+                )
+            detail_frame = pd.DataFrame(detail_rows)
             st.dataframe(detail_frame, use_container_width=True, hide_index=True)
 
             if confirmation_contacts:
@@ -7354,7 +7690,11 @@ def main() -> None:
                 disabled=not test_email_address,
             )
         with send_button:
-            run_all = st.button("指定件数を送信予約", type="primary", use_container_width=True)
+            run_all = st.button(
+                "シナリオ全体を送信予約" if scenario_full_auto else "指定件数を送信予約",
+                type="primary",
+                use_container_width=True,
+            )
         st.info("送信予約を作成すると、送信処理はサーバー側で進みます。予約後はこのタブを閉じても、パソコンの電源を切っても、設定した間隔で送信が続きます。進捗は「最近の送信予約」で確認できます。すべて完了すると、ログイン中のGoogleメールアドレスに完了メールが届きます。")
 
         if run_test or run_all:
@@ -7371,6 +7711,8 @@ def main() -> None:
                 preflight_errors.append("送信前の確認にチェックしてください。これは、送信対象が許諾済み、または法的に送信可能な宛先であることを確認するためのチェックです。")
             if run_all and not final_confirmed:
                 preflight_errors.append("送信前の最終確認にチェックしてください。")
+            if run_all and scenario_full_auto and (not send_scenario or not scenario_full_steps):
+                preflight_errors.append("シナリオ全体予約に使うステップがありません。シナリオ設定を確認してください。")
             if preflight_errors:
                 st.error("送信前に直す項目があります。\n\n" + "\n".join(f"- {error}" for error in preflight_errors))
             else:
@@ -7389,19 +7731,30 @@ def main() -> None:
                 if not contacts:
                     st.error("送信できる宛先がありません。宛先一覧、送信済み状況、配信名を確認してください。")
                 elif run_all:
-                    ok, message = create_send_job(
-                        effective_campaign_name,
-                        current_campaign_key,
-                        effective_subject_template,
-                        effective_body_template,
-                        contacts,
-                        int(delay),
-                        send_window_start,
-                        send_window_end,
-                        unsubscribe_scope,
-                        unsubscribe_scope_key,
-                        unsubscribe_scope_label,
-                    )
+                    if scenario_full_auto and send_scenario:
+                        ok, message = create_scenario_full_send_job(
+                            send_scenario,
+                            scenario_full_steps,
+                            contacts,
+                            int(delay),
+                            send_window_start,
+                            send_window_end,
+                            int(scenario_step_gap_days),
+                        )
+                    else:
+                        ok, message = create_send_job(
+                            effective_campaign_name,
+                            current_campaign_key,
+                            effective_subject_template,
+                            effective_body_template,
+                            contacts,
+                            int(delay),
+                            send_window_start,
+                            send_window_end,
+                            unsubscribe_scope,
+                            unsubscribe_scope_key,
+                            unsubscribe_scope_label,
+                        )
                     if ok:
                         st.success(message)
                         st.caption("送信予約はサーバー側で処理されます。タブやPCを閉じても、定期実行が有効なら送信が続きます。")
