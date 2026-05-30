@@ -67,6 +67,9 @@ GOOGLE_SHEET_WRITE_DISABLED_MESSAGE = (
 OUTSOURCE_MIN_UNIT_PRICE_YEN = 10
 OUTSOURCE_MAX_UNIT_PRICE_YEN = 300
 OUTSOURCE_DEFAULT_UNIT_PRICE_YEN = 50
+AI_SCENARIO_EXPECTED_SECONDS = 120
+AI_SCENARIO_STALE_SECONDS = 180
+AI_IMAGE_MAX_BYTES = 8 * 1024 * 1024
 UNSUBSCRIBE_SCOPE_GLOBAL = "global"
 UNSUBSCRIBE_SCOPE_SCENARIO = "scenario"
 UNSUBSCRIBE_SCOPE_CAMPAIGN = "campaign"
@@ -2615,7 +2618,10 @@ def openai_api_key() -> str:
 
 
 def openai_model() -> str:
-    return get_nested_secret("openai", "model") or read_secret("OPENAI_MODEL") or "gpt-5.5"
+    model = (get_nested_secret("openai", "model") or read_secret("OPENAI_MODEL") or "gpt-5-mini").strip()
+    if model == "gpt-5.5":
+        return "gpt-5-mini"
+    return model
 
 
 def set_ai_scenario_status(status: str, message: str = "", detail: str = "") -> None:
@@ -2642,6 +2648,74 @@ def log_ai_scenario_event(event: str, detail: str = "") -> None:
     safe_detail = re.sub(r"\s+", " ", str(detail or "")).strip()[:300]
     suffix = f" {safe_detail}" if safe_detail else ""
     print(f"[AI scenario] {event}{suffix}", flush=True)
+
+
+def ai_scenario_status_age_seconds(status_record: dict) -> int:
+    try:
+        created_at = datetime.fromisoformat(str(status_record.get("at") or ""))
+    except Exception:
+        return 0
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=APP_TIMEZONE)
+    elapsed = datetime.now(APP_TIMEZONE) - created_at.astimezone(APP_TIMEZONE)
+    return max(0, int(elapsed.total_seconds()))
+
+
+def format_elapsed_seconds(seconds: int) -> str:
+    clean_seconds = max(0, int(seconds))
+    minutes, remaining_seconds = divmod(clean_seconds, 60)
+    if minutes:
+        return f"{minutes}分{remaining_seconds:02d}秒"
+    return f"{remaining_seconds}秒"
+
+
+def refresh_stale_ai_scenario_status() -> None:
+    status_record = st.session_state.get("ai_scenario_last_status")
+    if not isinstance(status_record, dict):
+        return
+    if str(status_record.get("status") or "") != "running":
+        return
+    elapsed_seconds = ai_scenario_status_age_seconds(status_record)
+    if elapsed_seconds < AI_SCENARIO_STALE_SECONDS:
+        return
+    set_ai_scenario_status(
+        "failed",
+        "AI生成が長時間終わらなかったため、停止扱いにしました。もう一度お試しください。",
+        f"OpenAI APIの応答が{format_elapsed_seconds(elapsed_seconds)}返りませんでした。画像URLを外す、通数を減らす、または少し時間を置いて再実行してください。",
+    )
+    log_ai_scenario_event("stale-timeout", f"elapsed={elapsed_seconds}s")
+
+
+def render_ai_scenario_status(status_record: dict | None) -> None:
+    if not isinstance(status_record, dict):
+        return
+    status_value = str(status_record.get("status") or "").strip()
+    if not status_value or status_value == "idle":
+        return
+    status_at = format_jst_datetime(str(status_record.get("at") or "")) or "-"
+    status_message = str(status_record.get("message") or "").strip()
+    status_detail = str(status_record.get("detail") or "").strip()
+    if status_value == "running":
+        elapsed_seconds = ai_scenario_status_age_seconds(status_record)
+        progress_value = min(95, max(10, int((elapsed_seconds / AI_SCENARIO_EXPECTED_SECONDS) * 85) + 10))
+        st.info(
+            "AIでシナリオ案を作成しています。"
+            f"\n\n経過: {format_elapsed_seconds(elapsed_seconds)} / 目安: 30秒〜2分"
+            "\n\n2分を超える場合は、画像URLの読み込みやOpenAI API側の混雑で長引いている可能性があります。"
+        )
+        st.progress(progress_value, text="生成中です。画面を閉じずにお待ちください。")
+        return
+    status_text = f"AI生成状態: {ai_scenario_status_label(status_value)}（{status_at}）"
+    if status_message:
+        status_text = f"{status_text}\n\n{status_message}"
+    if status_value == "failed":
+        st.error(status_text)
+        if status_detail:
+            st.caption(f"理由: {status_detail[:500]}")
+    elif status_value == "generated":
+        st.warning(status_text)
+    elif status_value == "saved":
+        st.success(status_text)
 
 
 def ai_scenario_schema() -> dict:
@@ -2708,23 +2782,51 @@ def uploaded_image_to_data_url(uploaded_file) -> str:
         return ""
     mime_type = str(getattr(uploaded_file, "type", "") or "image/png")
     raw = uploaded_file.getvalue()
-    if len(raw) > 8 * 1024 * 1024:
+    if len(raw) > AI_IMAGE_MAX_BYTES:
         raise RuntimeError("商品写真は8MB以下の画像にしてください。")
     encoded = base64.b64encode(raw).decode("ascii")
     return f"data:{mime_type};base64,{encoded}"
 
 
-def ai_input_image_reference(uploaded_file, image_url: str) -> str:
-    uploaded_image = uploaded_image_to_data_url(uploaded_file)
-    if uploaded_image:
-        return uploaded_image
+def image_url_to_data_url(image_url: str) -> str:
     clean_url = str(image_url or "").strip()
     if not clean_url:
         return ""
     parsed_url = urllib.parse.urlparse(clean_url)
     if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
         raise RuntimeError("商品写真URLは https://... の形式で入力してください。")
-    return clean_url
+    request = urllib.request.Request(
+        clean_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 CreatorOutreachMailer/1.0",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            content_type = str(response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            raw = response.read(AI_IMAGE_MAX_BYTES + 1)
+    except urllib.error.URLError as exc:
+        raise RuntimeError("商品写真URLを読み込めませんでした。画像をアップロードするか、写真なしで再度お試しください。") from exc
+    if len(raw) > AI_IMAGE_MAX_BYTES:
+        raise RuntimeError("商品写真URLの画像が大きすぎます。8MB以下の画像をアップロードしてください。")
+    if not content_type.startswith("image/"):
+        suffix = Path(parsed_url.path).suffix.lower()
+        content_type = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".webp": "image/webp",
+        }.get(suffix, "image/png")
+    encoded = base64.b64encode(raw).decode("ascii")
+    return f"data:{content_type};base64,{encoded}"
+
+
+def ai_input_image_reference(uploaded_file, image_url: str) -> str:
+    uploaded_image = uploaded_image_to_data_url(uploaded_file)
+    if uploaded_image:
+        return uploaded_image
+    return image_url_to_data_url(image_url)
 
 
 def friendly_openai_error(detail: str, status_code: int = 0) -> str:
@@ -2822,6 +2924,8 @@ ASP紹介文・ペルソナ・訴求情報:
         },
         "max_output_tokens": 9000,
     }
+    if openai_model().startswith("gpt-5"):
+        payload["reasoning"] = {"effort": "minimal"}
     request = urllib.request.Request(
         "https://api.openai.com/v1/responses",
         data=json.dumps(payload).encode("utf-8"),
@@ -6597,6 +6701,7 @@ def main() -> None:
             st.session_state.get("ai_generated_scenario")
         )
         ai_scenario_notice = st.session_state.pop("ai_scenario_notice", "")
+        refresh_stale_ai_scenario_status()
         ai_scenario_last_status = st.session_state.get("ai_scenario_last_status")
         ai_scenario_status_value = ""
         if isinstance(ai_scenario_last_status, dict):
@@ -6610,29 +6715,10 @@ def main() -> None:
             if ai_scenario_notice:
                 st.success(ai_scenario_notice)
             st.info("AIで作成しただけでは登録されません。生成結果を確認して、最後に「この内容でテンプレートとシナリオに保存」を押すと保存されます。")
-            ai_scenario_last_status = st.session_state.get("ai_scenario_last_status")
-            if isinstance(ai_scenario_last_status, dict):
-                status_value = str(ai_scenario_last_status.get("status") or "").strip()
-                status_at = format_jst_datetime(str(ai_scenario_last_status.get("at") or "")) or "-"
-                status_message = str(ai_scenario_last_status.get("message") or "").strip()
-                status_detail = str(ai_scenario_last_status.get("detail") or "").strip()
-                status_text = f"直近のAI生成: {ai_scenario_status_label(status_value)}（{status_at}）"
-                if status_message:
-                    status_text = f"{status_text}\n\n{status_message}"
-                if status_value == "failed":
-                    st.error(status_text)
-                    if status_detail:
-                        st.caption(f"理由: {status_detail[:500]}")
-                elif status_value == "generated":
-                    st.warning(status_text)
-                elif status_value == "saved":
-                    st.success(status_text)
-                elif status_value == "running":
-                    st.info(status_text)
             if not openai_api_key():
                 st.warning("AI生成を使うには、Streamlit SecretsにOpenAI APIキーを追加してください。")
                 st.code(
-                    '[openai]\napi_key = "sk-..."\nmodel = "gpt-5.5"',
+                    '[openai]\napi_key = "sk-..."\nmodel = "gpt-5-mini"',
                     language="toml",
                 )
                 st.caption("貼る場所はSecretsの一番上です。[auth]や[google]の下には入れないでください。")
@@ -6697,27 +6783,47 @@ def main() -> None:
                 key="ai_scenario_persona_info",
             )
             generate_disabled = not bool(openai_api_key())
-            if st.button(
+            recent_ai_running = (
+                isinstance(ai_scenario_last_status, dict)
+                and ai_scenario_status_value == "running"
+                and ai_scenario_status_age_seconds(ai_scenario_last_status) < AI_SCENARIO_STALE_SECONDS
+            )
+            generate_clicked = st.button(
                 "AIでシナリオ案を作成",
                 key="generate_ai_scenario_button",
                 width="stretch",
-                disabled=generate_disabled,
-            ):
+                disabled=generate_disabled or recent_ai_running,
+            )
+            ai_status_slot = st.empty()
+            if generate_clicked:
                 if not ai_requested_scenario_name.strip():
                     set_ai_scenario_status("failed", "AI生成を開始できませんでした。", "シナリオ名を入力してください。")
-                    st.error("シナリオ名を入力してください。")
+                    with ai_status_slot.container():
+                        render_ai_scenario_status(st.session_state.get("ai_scenario_last_status"))
                 elif not ai_product_name.strip():
                     set_ai_scenario_status("failed", "AI生成を開始できませんでした。", "商品名を入力してください。")
-                    st.error("商品名を入力してください。")
+                    with ai_status_slot.container():
+                        render_ai_scenario_status(st.session_state.get("ai_scenario_last_status"))
                 elif not ai_product_info.strip():
                     set_ai_scenario_status("failed", "AI生成を開始できませんでした。", "商品説明・ASP紹介文を入力してください。")
-                    st.error("商品説明・ASP紹介文を入力してください。")
+                    with ai_status_slot.container():
+                        render_ai_scenario_status(st.session_state.get("ai_scenario_last_status"))
                 else:
                     try:
-                        set_ai_scenario_status("running", "AIシナリオを生成中です。画面の読み込みが終わるまでお待ちください。")
+                        set_ai_scenario_status("running", "AIシナリオを生成中です。ボタンのすぐ下に進み具合を表示しています。")
+                        with ai_status_slot.container():
+                            render_ai_scenario_status(st.session_state.get("ai_scenario_last_status"))
                         log_ai_scenario_event(
                             "started",
                             f"model={openai_model()} steps={int(ai_step_count)} image={'yes' if ai_product_image or ai_product_image_url.strip() else 'no'}",
+                        )
+                        image_reference = ai_input_image_reference(ai_product_image, ai_product_image_url)
+                        with ai_status_slot.container():
+                            st.info("入力内容と商品写真を確認しました。AIにシナリオ作成を依頼しています。")
+                            st.progress(35, text="AIへ依頼中です。通常30秒〜2分ほどかかります。")
+                        log_ai_scenario_event(
+                            "requesting-openai",
+                            f"model={openai_model()} steps={int(ai_step_count)} image={'yes' if image_reference else 'no'}",
                         )
                         with st.spinner("AIがシナリオ案を作成しています..."):
                             generated_scenario = generate_ai_scenario(
@@ -6728,7 +6834,7 @@ def main() -> None:
                                 ai_persona_info,
                                 ai_tone,
                                 int(ai_step_count),
-                                ai_input_image_reference(ai_product_image, ai_product_image_url),
+                                image_reference,
                             )
                         generated_step_count = len(generated_scenario.get("steps") or [])
                         scenario_digest = hashlib.sha1(
@@ -6747,7 +6853,11 @@ def main() -> None:
                         error_message = str(exc)
                         set_ai_scenario_status("failed", "AIシナリオ作成に失敗しました。理由を確認してください。", error_message)
                         log_ai_scenario_event("failed", error_message)
-                        st.error(error_message)
+                        with ai_status_slot.container():
+                            render_ai_scenario_status(st.session_state.get("ai_scenario_last_status"))
+            else:
+                with ai_status_slot.container():
+                    render_ai_scenario_status(st.session_state.get("ai_scenario_last_status"))
 
             generated_scenario = st.session_state.get("ai_generated_scenario")
             if isinstance(generated_scenario, dict) and generated_scenario:
