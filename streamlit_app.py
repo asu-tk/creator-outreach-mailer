@@ -2738,6 +2738,17 @@ def scope_display_label(scope: str, scope_key: str, scope_label: str = "") -> st
     return clean_label or "-"
 
 
+def unsubscribe_scope_kind_label(scope: str) -> str:
+    clean_scope = str(scope or "").strip()
+    if clean_scope == UNSUBSCRIBE_SCOPE_GLOBAL:
+        return "すべて停止"
+    if clean_scope == UNSUBSCRIBE_SCOPE_SCENARIO:
+        return "シナリオ停止"
+    if clean_scope == UNSUBSCRIBE_SCOPE_CAMPAIGN:
+        return "配信停止"
+    return "不明"
+
+
 def campaign_keys_for_unsubscribe_scope(scope: str, scope_key: str) -> list[str]:
     clean_scope = str(scope or "").strip()
     clean_key = str(scope_key or "").strip()
@@ -4553,21 +4564,26 @@ def fetch_send_history(limit: int = 500) -> pd.DataFrame:
         )
 
 
-def prepare_send_history_display(frame: pd.DataFrame) -> pd.DataFrame:
-    if frame.empty:
-        return frame
-    template_name_by_key = {
-        campaign_key(template["name"]): template["name"]
+def campaign_display_name_map() -> dict[str, str]:
+    name_by_key = {
+        campaign_key(str(template["name"] or "")): str(template["name"] or "")
         for template in fetch_campaign_templates()
     }
     for scenario in fetch_scenarios():
         for step in fetch_scenario_steps(int(scenario["id"])):
             step_key = scenario_step_campaign_key(int(scenario["id"]), int(step["step_number"]))
-            template_name_by_key[step_key] = scenario_step_campaign_name(
+            name_by_key[step_key] = scenario_step_campaign_name(
                 str(scenario["name"] or ""),
                 int(step["step_number"]),
                 str(step["template_name"] or ""),
             )
+    return name_by_key
+
+
+def prepare_send_history_display(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    template_name_by_key = campaign_display_name_map()
     display = frame.copy().fillna("")
     display["日時"] = display["sent_at"].apply(format_jst_datetime)
     display["状態"] = display["status"].apply(send_status_label)
@@ -4755,13 +4771,62 @@ def fetch_unsubscribe_events(limit: int = 500) -> pd.DataFrame:
         ).fillna("")
 
 
+def unsubscribe_scope_target_label(
+    scope: str,
+    scope_key: str,
+    scope_label: str = "",
+    campaign_names: dict[str, str] | None = None,
+) -> str:
+    clean_scope = str(scope or "").strip()
+    clean_key = str(scope_key or "").strip()
+    clean_label = str(scope_label or "").strip()
+    campaign_names = campaign_names or {}
+    if clean_scope == UNSUBSCRIBE_SCOPE_GLOBAL:
+        return "すべての案内"
+    if clean_scope == UNSUBSCRIBE_SCOPE_SCENARIO:
+        return clean_label or clean_key or "-"
+    if clean_scope == UNSUBSCRIBE_SCOPE_CAMPAIGN:
+        if clean_label and clean_label != "この配信":
+            return clean_label
+        return campaign_names.get(clean_key, clean_key or "-")
+    return clean_label or clean_key or "-"
+
+
+def sent_count_for_unsubscribe_scope(scope: str, scope_key: str) -> int:
+    clean_scope = str(scope or "").strip()
+    clean_key = str(scope_key or "").strip()
+    if clean_scope == UNSUBSCRIBE_SCOPE_GLOBAL:
+        result = rows(
+            "select count(*) as count from sends where user_id = ? and status = 'sent'",
+            (current_user_id(),),
+        )[0]
+        return int(result["count"] or 0)
+    campaign_keys = campaign_keys_for_unsubscribe_scope(clean_scope, clean_key)
+    if not campaign_keys:
+        return 0
+    placeholders = ",".join(["?"] * len(campaign_keys))
+    result = rows(
+        f"""
+        select count(*) as count
+        from sends
+        where user_id = ?
+          and status = 'sent'
+          and campaign_key in ({placeholders})
+        """,
+        (current_user_id(), *campaign_keys),
+    )[0]
+    return int(result["count"] or 0)
+
+
 def unsubscribe_events_display_frame(events: pd.DataFrame) -> pd.DataFrame:
     if events.empty:
-        return pd.DataFrame(columns=["停止日時", "停止範囲", "メールアドレス", "チャンネル", "詳細"])
+        return pd.DataFrame(columns=["停止日時", "停止種類", "停止対象", "メールアドレス", "チャンネル", "停止理由", "内部キー"])
+    campaign_names = campaign_display_name_map()
     display = events.copy()
     display["停止日時"] = display["unsubscribed_at"].apply(format_jst_datetime)
-    display["停止範囲"] = display.apply(
-        lambda row: scope_display_label(row["scope"], row["scope_key"], row["scope_label"]),
+    display["停止種類"] = display["scope"].apply(unsubscribe_scope_kind_label)
+    display["停止対象"] = display.apply(
+        lambda row: unsubscribe_scope_target_label(row["scope"], row["scope_key"], row["scope_label"], campaign_names),
         axis=1,
     )
     display["メールアドレス"] = display["contact_email"].replace("", "-")
@@ -4769,8 +4834,39 @@ def unsubscribe_events_display_frame(events: pd.DataFrame) -> pd.DataFrame:
         display["channel"].astype(str).str.strip() != "",
         display["youtube_channel_id"],
     ).replace("", "-")
-    display["詳細"] = display["campaign_key"].replace("", "-")
-    return display[["停止日時", "停止範囲", "メールアドレス", "チャンネル", "詳細"]]
+    display["停止理由"] = "配信停止URLクリック"
+    display["内部キー"] = display["scope_key"].where(display["scope_key"].astype(str).str.strip() != "", display["campaign_key"]).replace("", "-")
+    return display[["停止日時", "停止種類", "停止対象", "メールアドレス", "チャンネル", "停止理由", "内部キー"]]
+
+
+def unsubscribe_events_summary_frame(events: pd.DataFrame) -> pd.DataFrame:
+    if events.empty:
+        return pd.DataFrame(columns=["停止種類", "停止対象", "配信停止", "送信成功", "停止率", "最新停止日時"])
+    campaign_names = campaign_display_name_map()
+    prepared = events.copy().fillna("")
+    prepared["停止種類"] = prepared["scope"].apply(unsubscribe_scope_kind_label)
+    prepared["停止対象"] = prepared.apply(
+        lambda row: unsubscribe_scope_target_label(row["scope"], row["scope_key"], row["scope_label"], campaign_names),
+        axis=1,
+    )
+    records = []
+    for (_, _), group in prepared.groupby(["停止種類", "停止対象"], dropna=False):
+        first = group.iloc[0]
+        stopped_count = int(len(group))
+        sent_count = sent_count_for_unsubscribe_scope(str(first["scope"]), str(first["scope_key"]))
+        stop_rate = f"{(stopped_count / sent_count * 100):.1f}%" if sent_count else "-"
+        latest = str(group["unsubscribed_at"].max() or "")
+        records.append(
+            {
+                "停止種類": str(first["停止種類"]),
+                "停止対象": str(first["停止対象"]),
+                "配信停止": stopped_count,
+                "送信成功": sent_count,
+                "停止率": stop_rate,
+                "最新停止日時": format_jst_datetime(latest) if latest else "-",
+            }
+        )
+    return pd.DataFrame(records).sort_values(["配信停止", "停止対象"], ascending=[False, True])
 
 
 def add_contact(
@@ -6734,21 +6830,76 @@ def main() -> None:
     if not unsubscribe_events.empty:
         with st.expander(f"配信停止管理（{len(unsubscribe_events)}件）"):
             st.caption(
-                "配信停止は宛先自体を消さず、停止範囲だけを記録します。"
-                "全体停止はすべての案内を止め、シナリオ停止はそのシナリオだけ止めます。"
+                "配信停止は宛先自体を消さず、どの範囲で停止されたかを記録します。"
+                "停止種類と停止対象を見ると、どのシナリオ・どの配信で止まったかを確認できます。"
             )
             display_unsubscribes = unsubscribe_events_display_frame(unsubscribe_events)
-            unsubscribe_search = st.text_input(
-                "配信停止を検索",
-                placeholder="メールアドレス、チャンネル、停止範囲で検索",
-                key="unsubscribe_events_search",
-            ).strip().lower()
-            if unsubscribe_search:
-                mask = display_unsubscribes.fillna("").astype(str).apply(
-                    lambda column: column.str.lower().str.contains(unsubscribe_search, regex=False)
-                ).any(axis=1)
-                display_unsubscribes = display_unsubscribes[mask]
-            st.dataframe(display_unsubscribes.head(200), use_container_width=True, hide_index=True)
+            unsubscribe_summary = unsubscribe_events_summary_frame(unsubscribe_events)
+            stop_counts = display_unsubscribes["停止種類"].value_counts()
+            metric_cols = st.columns(4)
+            metric_cols[0].metric("配信停止合計", f"{len(display_unsubscribes)}件")
+            metric_cols[1].metric("すべて停止", f"{int(stop_counts.get('すべて停止', 0))}件")
+            metric_cols[2].metric("シナリオ停止", f"{int(stop_counts.get('シナリオ停止', 0))}件")
+            metric_cols[3].metric("配信停止", f"{int(stop_counts.get('配信停止', 0))}件")
+
+            analysis_tab, history_tab, download_tab = st.tabs(["分析", "停止履歴", "ダウンロード"])
+            with analysis_tab:
+                st.caption("停止対象ごとの件数と停止率です。停止率は、その対象の送信成功数に対する配信停止件数で計算しています。")
+                st.dataframe(unsubscribe_summary, use_container_width=True, hide_index=True)
+            with history_tab:
+                filter_cols = st.columns([1.2, 2.0])
+                unsubscribe_type = filter_cols[0].selectbox(
+                    "停止種類",
+                    ["すべて", "すべて停止", "シナリオ停止", "配信停止"],
+                    key="unsubscribe_events_type_filter",
+                )
+                unsubscribe_search = filter_cols[1].text_input(
+                    "配信停止を検索",
+                    placeholder="メールアドレス、チャンネル、停止対象で検索",
+                    key="unsubscribe_events_search",
+                ).strip().lower()
+                filtered_unsubscribes = display_unsubscribes.copy()
+                if unsubscribe_type != "すべて":
+                    filtered_unsubscribes = filtered_unsubscribes[filtered_unsubscribes["停止種類"] == unsubscribe_type]
+                if unsubscribe_search:
+                    mask = filtered_unsubscribes.fillna("").astype(str).apply(
+                        lambda column: column.str.lower().str.contains(unsubscribe_search, regex=False)
+                    ).any(axis=1)
+                    filtered_unsubscribes = filtered_unsubscribes[mask]
+                st.caption(f"{len(filtered_unsubscribes)}件を表示しています。")
+                st.dataframe(filtered_unsubscribes.head(300), use_container_width=True, hide_index=True)
+            with download_tab:
+                export_name = datetime.now(APP_TIMEZONE).strftime("unsubscribe_analytics_%Y%m%d_%H%M")
+                csv_col, xlsx_col = st.columns(2)
+                csv_col.download_button(
+                    "配信停止履歴をCSVでダウンロード",
+                    data=display_unsubscribes.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"{export_name}_history.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+                xlsx_col.download_button(
+                    "配信停止履歴をExcelでダウンロード",
+                    data=dataframe_to_xlsx(display_unsubscribes, sheet_name="配信停止履歴"),
+                    file_name=f"{export_name}_history.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+                summary_csv_col, summary_xlsx_col = st.columns(2)
+                summary_csv_col.download_button(
+                    "配信停止分析をCSVでダウンロード",
+                    data=unsubscribe_summary.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"{export_name}_summary.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                )
+                summary_xlsx_col.download_button(
+                    "配信停止分析をExcelでダウンロード",
+                    data=dataframe_to_xlsx(unsubscribe_summary, sheet_name="配信停止分析"),
+                    file_name=f"{export_name}_summary.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
 
     blocked_targets = fetch_blocked_targets()
     if not blocked_targets.empty:
