@@ -191,6 +191,18 @@ def format_jst_datetime(value: str) -> str:
         return value
 
 
+def format_jst_datetime_compact(value: str) -> str:
+    if not value:
+        return "-"
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(APP_TIMEZONE).strftime("%Y-%m-%d %H:%M（日本時間）")
+    except ValueError:
+        return value
+
+
 def today_key() -> str:
     return datetime.now(APP_TIMEZONE).strftime("%Y-%m-%d")
 
@@ -4043,7 +4055,7 @@ def mask_email_address(value: str) -> str:
 
 
 def format_local_datetime(value: datetime) -> str:
-    return value.astimezone(APP_TIMEZONE).strftime("%Y-%m-%d %H:%M")
+    return value.astimezone(APP_TIMEZONE).strftime("%Y-%m-%d %H:%M（日本時間）")
 
 
 def send_email(to_email: str, subject: str, body: str) -> tuple[bool, str]:
@@ -4986,6 +4998,34 @@ def fetch_recent_send_jobs(limit: int = 20) -> list[dict]:
         return result if isinstance(result, list) else []
     except Exception:
         return []
+
+
+def fetch_send_job_queue_summary(job_id: str) -> dict[str, object]:
+    summary: dict[str, object] = {
+        "next_pending_at": "",
+        "overdue_pending": False,
+    }
+    if not supabase_configured() or not str(job_id or "").strip():
+        return summary
+    try:
+        query_job_id = urllib.parse.quote(str(job_id), safe="")
+        next_rows = supabase_request(
+            "GET",
+            f"send_queue?job_id=eq.{query_job_id}&status=eq.pending&select=scheduled_at&order=scheduled_at.asc&limit=1",
+        )
+        if isinstance(next_rows, list) and next_rows:
+            summary["next_pending_at"] = str(next_rows[0].get("scheduled_at") or "")
+
+        now_value = urllib.parse.quote(datetime.now(timezone.utc).isoformat(timespec="seconds"), safe="")
+        overdue_rows = supabase_request(
+            "GET",
+            f"send_queue?job_id=eq.{query_job_id}&status=eq.pending&scheduled_at=lte.{now_value}&select=scheduled_at&order=scheduled_at.asc&limit=1",
+        )
+        summary["overdue_pending"] = bool(isinstance(overdue_rows, list) and overdue_rows)
+    except Exception:
+        summary["next_pending_at"] = ""
+        summary["overdue_pending"] = False
+    return summary
 
 
 def prerequisite_sql(prerequisite_keys: list[str], contact_alias: str = "c") -> tuple[str, list[str]]:
@@ -7306,6 +7346,7 @@ def main() -> None:
         if send_window_end <= send_window_start:
             st.warning("メールを送ってよい時間は、「この時間まで」を「この時間から」より後にしてください。")
         st.caption("この時間帯の外では送信しません。時間を超えた分は、翌日の「この時間から」に自動で持ち越します。")
+        st.caption(f"時刻は日本時間（東京）で扱います。現在の日本時間: {datetime.now(APP_TIMEZONE).strftime('%Y-%m-%d %H:%M')}")
 
         send_pace_mode = st.radio(
             "送信ペース",
@@ -7676,6 +7717,11 @@ def main() -> None:
         recent_jobs = fetch_recent_send_jobs(limit=20)
         if recent_jobs:
             active_jobs = [job for job in recent_jobs if is_active_send_job(job)]
+            job_queue_summaries = {
+                str(job.get("id") or ""): fetch_send_job_queue_summary(str(job.get("id") or ""))
+                for job in recent_jobs
+                if str(job.get("id") or "")
+            }
             with st.expander(f"シナリオ・送信予約の進捗（稼働中{len(active_jobs)}件）", expanded=bool(active_jobs)):
                 refresh_col, note_col = st.columns([1.0, 2.4])
                 if refresh_col.button("状態を更新", width="stretch"):
@@ -7742,10 +7788,18 @@ def main() -> None:
 
                     st.markdown("**稼働中のシナリオ**")
                     for job in active_jobs[:8]:
+                        job_id = str(job.get("id") or "")
+                        queue_summary = job_queue_summaries.get(job_id, {})
+                        next_pending_at = str(queue_summary.get("next_pending_at") or "")
+                        overdue_pending = bool(queue_summary.get("overdue_pending"))
                         campaign_name_value = str(job.get("campaign_name") or "名称未設定")
                         progress_percent = send_job_progress_percent(job)
                         progress_ratio = min(1.0, max(0.0, progress_percent / 100))
                         st.write(f"**{campaign_name_value}**")
+                        if next_pending_at:
+                            st.caption(f"次の送信予定: {format_jst_datetime_compact(next_pending_at)}")
+                        if overdue_pending:
+                            st.warning("予定時刻を過ぎた送信待ちがあります。数分待っても進まない場合は、サーバー側の定期送信処理を確認してください。")
                         st.progress(progress_ratio)
                         progress_cols = st.columns([1.0, 1.0, 1.0, 1.0, 1.2])
                         progress_cols[0].metric("進捗", f"{progress_percent:.1f}%")
@@ -7766,6 +7820,15 @@ def main() -> None:
                     jobs_display["success_percent"] = jobs_display.apply(lambda row: f"{send_job_success_percent(row):.1f}%", axis=1)
                     jobs_display["processed_count"] = jobs_display.apply(send_job_processed_count, axis=1)
                     jobs_display["status"] = jobs_display["status"].apply(send_job_status_label)
+                    jobs_display["created_at_jst"] = jobs_display["created_at"].apply(format_jst_datetime_compact)
+                    jobs_display["next_pending_at"] = jobs_display["id"].apply(
+                        lambda value: format_jst_datetime_compact(
+                            str(job_queue_summaries.get(str(value), {}).get("next_pending_at") or "")
+                        )
+                    )
+                    jobs_display["overdue_pending"] = jobs_display["id"].apply(
+                        lambda value: "あり" if bool(job_queue_summaries.get(str(value), {}).get("overdue_pending")) else "なし"
+                    )
                     st.dataframe(
                         jobs_display[
                             [
@@ -7777,7 +7840,9 @@ def main() -> None:
                                 "progress_percent",
                                 "success_percent",
                                 "status",
-                                "created_at",
+                                "created_at_jst",
+                                "next_pending_at",
+                                "overdue_pending",
                             ]
                         ].rename(
                             columns={
@@ -7789,7 +7854,9 @@ def main() -> None:
                                 "progress_percent": "進捗",
                                 "success_percent": "送信成功率",
                                 "status": "状態",
-                                "created_at": "作成日時",
+                                "created_at_jst": "作成日時",
+                                "next_pending_at": "次の送信予定",
+                                "overdue_pending": "予定時刻超過",
                             }
                         ),
                         width="stretch",
