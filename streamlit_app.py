@@ -5334,8 +5334,8 @@ def main() -> None:
         service_account_email = google_service_account_email()
         if service_account_email:
             st.caption(f"このGoogleシートを {service_account_email} に編集者として共有すると、アプリが候補一覧を書き込めます。")
-        elif not ready_for_sheet:
-            st.info("空のGoogleシートへ自動で候補を書き込むには、アプリ用のサービスアカウント設定が必要です。設定が済むまではURLからの読み込みだけ使えます。")
+        if not ready_for_sheet:
+            st.info(sheet_ready_message or "空のGoogleシートへ自動で候補を書き込むには、アプリ用のサービスアカウント設定が必要です。")
         save_url_col, open_url_col = st.columns(2)
         if save_url_col.button("このURLを保存", key="save_outsource_sheet_url", use_container_width=True):
             cleaned_outsource_url = registered_outsource_url.strip()
@@ -5362,7 +5362,18 @@ def main() -> None:
             open_url_col.link_button("登録したGoogleシートを開く", active_outsource_url, use_container_width=True)
         else:
             open_url_col.button("登録したGoogleシートを開く", key="open_empty_outsource_sheet_url", use_container_width=True, disabled=True)
-        sync_disabled = not (active_outsource_url.startswith("http") and ready_for_sheet and not candidates.empty)
+        sync_blockers = []
+        if not active_outsource_url.startswith("http"):
+            sync_blockers.append("外注用GoogleスプレッドシートURLが保存されていません。")
+        if not ready_for_sheet:
+            sync_blockers.append(sheet_ready_message or "サービスアカウント設定を確認してください。")
+        if candidates.empty:
+            sync_blockers.append("YouTube候補一覧に反映する候補がありません。")
+        if sync_blockers:
+            st.warning("候補一覧を反映できない理由: " + " / ".join(sync_blockers))
+        else:
+            st.caption(f"反映できる候補: {len(candidates)}件")
+        sync_disabled = bool(sync_blockers)
         if st.button("候補一覧を登録済みシートへ反映", key="sync_outsource_sheet", use_container_width=True, disabled=sync_disabled):
             save_setting("OUTSOURCE_SPREADSHEET_URL", active_outsource_url)
             try:
