@@ -4294,14 +4294,43 @@ def send_job_status_label(status: str) -> str:
     }.get(str(status or "").lower(), str(status or "不明"))
 
 
-def is_cancelable_send_job(job: dict) -> bool:
+def send_job_count(job: dict, key: str) -> int:
+    try:
+        return max(0, int(job.get(key) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def send_job_processed_count(job: dict) -> int:
+    total_count = send_job_count(job, "total_count")
+    processed_count = send_job_count(job, "sent_count") + send_job_count(job, "failed_count")
+    return min(total_count, processed_count) if total_count else processed_count
+
+
+def send_job_progress_percent(job: dict) -> float:
+    total_count = send_job_count(job, "total_count")
+    if total_count <= 0:
+        return 0.0
+    return min(100.0, round(send_job_processed_count(job) / total_count * 100, 1))
+
+
+def send_job_success_percent(job: dict) -> float:
+    total_count = send_job_count(job, "total_count")
+    if total_count <= 0:
+        return 0.0
+    return min(100.0, round(send_job_count(job, "sent_count") / total_count * 100, 1))
+
+
+def is_active_send_job(job: dict) -> bool:
     status = str(job.get("status") or "").lower()
     if status in {"canceled", "cancelled", "completed", "done", "failed"}:
         return False
-    total_count = int(job.get("total_count") or 0)
-    sent_count = int(job.get("sent_count") or 0)
-    failed_count = int(job.get("failed_count") or 0)
-    return total_count <= 0 or sent_count + failed_count < total_count
+    total_count = send_job_count(job, "total_count")
+    return total_count <= 0 or send_job_processed_count(job) < total_count
+
+
+def is_cancelable_send_job(job: dict) -> bool:
+    return is_active_send_job(job)
 
 
 def delete_local_queued_sends_for_job(send_job_id: str, queue_rows: list[dict]) -> int:
@@ -4827,7 +4856,7 @@ def sync_unsubscribes_from_supabase() -> None:
         return
 
 
-def fetch_recent_send_jobs() -> list[dict]:
+def fetch_recent_send_jobs(limit: int = 20) -> list[dict]:
     if not supabase_configured():
         return []
     user_email = current_user_profile()["email"].strip().lower()
@@ -4835,9 +4864,10 @@ def fetch_recent_send_jobs() -> list[dict]:
         return []
     try:
         query_email = urllib.parse.quote(user_email, safe="")
+        limit_value = max(1, min(50, int(limit or 20)))
         result = supabase_request(
             "GET",
-            f"send_jobs?user_email=eq.{query_email}&select=id,campaign_key,campaign_name,total_count,sent_count,failed_count,status,created_at&order=created_at.desc&limit=5",
+            f"send_jobs?user_email=eq.{query_email}&select=id,campaign_key,campaign_name,total_count,sent_count,failed_count,status,created_at&order=created_at.desc&limit={limit_value}",
         )
         return result if isinstance(result, list) else []
     except Exception:
@@ -7448,14 +7478,15 @@ def main() -> None:
                 st.warning("今回送信予約できる宛先がありません。")
             final_confirmed = st.checkbox("上の送信内容・件数・送信元・時間帯を確認しました", key="final_send_confirmed")
 
-        recent_jobs = fetch_recent_send_jobs()
+        recent_jobs = fetch_recent_send_jobs(limit=20)
         if recent_jobs:
-            with st.expander("最近の送信予約"):
+            active_jobs = [job for job in recent_jobs if is_active_send_job(job)]
+            with st.expander(f"シナリオ・送信予約の進捗（稼働中{len(active_jobs)}件）", expanded=bool(active_jobs)):
                 refresh_col, note_col = st.columns([1.0, 2.4])
                 if refresh_col.button("状態を更新", use_container_width=True):
                     sync_send_queue_results()
                     st.rerun()
-                note_col.caption("送信予約の進捗は30秒ごとに自動更新されます。")
+                note_col.caption("送信予約の進捗は30秒ごとに自動更新されます。複数シナリオを予約した場合もここでまとめて確認できます。")
                 cancel_notice = st.session_state.pop("send_job_cancel_notice", "")
                 cancel_error = st.session_state.pop("send_job_cancel_error", "")
                 if cancel_notice:
@@ -7499,19 +7530,69 @@ def main() -> None:
                     st_autorefresh(interval=30_000, key="send_jobs_autorefresh")
                 else:
                     st.caption("自動更新部品の反映後は、30秒ごとに進捗が更新されます。")
+
+                if active_jobs:
+                    active_total = sum(send_job_count(job, "total_count") for job in active_jobs)
+                    active_sent = sum(send_job_count(job, "sent_count") for job in active_jobs)
+                    active_failed = sum(send_job_count(job, "failed_count") for job in active_jobs)
+                    active_processed = sum(send_job_processed_count(job) for job in active_jobs)
+                    active_progress = min(100.0, round(active_processed / active_total * 100, 1)) if active_total else 0.0
+                    st.caption("メールアドレス単位のログではなく、シナリオ単位の進み具合を表示しています。")
+                    summary_cols = st.columns(5)
+                    summary_cols[0].metric("稼働中シナリオ", f"{len(active_jobs)}件")
+                    summary_cols[1].metric("予約総数", f"{active_total:,}通")
+                    summary_cols[2].metric("送信済み", f"{active_sent:,}通")
+                    summary_cols[3].metric("失敗", f"{active_failed:,}通")
+                    summary_cols[4].metric("全体進捗", f"{active_progress:.1f}%")
+
+                    st.markdown("**稼働中のシナリオ**")
+                    for job in active_jobs[:8]:
+                        campaign_name_value = str(job.get("campaign_name") or "名称未設定")
+                        progress_percent = send_job_progress_percent(job)
+                        progress_ratio = min(1.0, max(0.0, progress_percent / 100))
+                        st.write(f"**{campaign_name_value}**")
+                        st.progress(progress_ratio)
+                        progress_cols = st.columns([1.0, 1.0, 1.0, 1.0, 1.2])
+                        progress_cols[0].metric("進捗", f"{progress_percent:.1f}%")
+                        progress_cols[1].metric("予約数", f"{send_job_count(job, 'total_count'):,}通")
+                        progress_cols[2].metric("送信済み", f"{send_job_count(job, 'sent_count'):,}通")
+                        progress_cols[3].metric("失敗", f"{send_job_count(job, 'failed_count'):,}通")
+                        progress_cols[4].metric("状態", send_job_status_label(str(job.get("status") or "")))
+                    if len(active_jobs) > 8:
+                        st.caption(f"ほか{len(active_jobs) - 8}件の稼働中シナリオは下の一覧で確認できます。")
+                else:
+                    st.info("現在稼働中のシナリオはありません。過去の予約は下の一覧で確認できます。")
+
+                st.caption("複数のシナリオを同時に予約できます。予約が重なった場合は、サーバー側の送信キューで予定時刻の古いものから順に処理されます。")
                 jobs_frame = pd.DataFrame(recent_jobs)
                 if not jobs_frame.empty:
                     jobs_display = jobs_frame.copy()
+                    jobs_display["progress_percent"] = jobs_display.apply(lambda row: f"{send_job_progress_percent(row):.1f}%", axis=1)
+                    jobs_display["success_percent"] = jobs_display.apply(lambda row: f"{send_job_success_percent(row):.1f}%", axis=1)
+                    jobs_display["processed_count"] = jobs_display.apply(send_job_processed_count, axis=1)
                     jobs_display["status"] = jobs_display["status"].apply(send_job_status_label)
                     st.dataframe(
                         jobs_display[
-                            ["campaign_name", "total_count", "sent_count", "failed_count", "status", "created_at"]
+                            [
+                                "campaign_name",
+                                "total_count",
+                                "processed_count",
+                                "sent_count",
+                                "failed_count",
+                                "progress_percent",
+                                "success_percent",
+                                "status",
+                                "created_at",
+                            ]
                         ].rename(
                             columns={
                                 "campaign_name": "配信名",
                                 "total_count": "予約数",
+                                "processed_count": "処理済み",
                                 "sent_count": "送信済み",
                                 "failed_count": "失敗",
+                                "progress_percent": "進捗",
+                                "success_percent": "送信成功率",
                                 "status": "状態",
                                 "created_at": "作成日時",
                             }
@@ -7524,17 +7605,18 @@ def main() -> None:
                 if cancelable_jobs:
                     st.caption("送信待ちの予約は取り消せます。取消した宛先は、未送信の状態に戻ります。すでに送信済みの宛先は戻せません。")
                     pending_cancel_job_id = str(st.session_state.get("confirm_cancel_send_job_id", ""))
-                    header = st.columns([2.0, 1.0, 1.0, 1.0, 1.1])
-                    for column, label in zip(header, ["配信名", "予約数", "送信済み", "状態", "操作"]):
+                    header = st.columns([2.0, 0.9, 0.9, 0.9, 1.0, 1.1])
+                    for column, label in zip(header, ["配信名", "予約数", "送信済み", "進捗", "状態", "操作"]):
                         column.markdown(f"**{label}**")
                     for job in cancelable_jobs:
                         job_id = str(job.get("id") or "")
-                        columns = st.columns([2.0, 1.0, 1.0, 1.0, 1.1])
+                        columns = st.columns([2.0, 0.9, 0.9, 0.9, 1.0, 1.1])
                         columns[0].write(job.get("campaign_name") or "-")
-                        columns[1].write(f"{int(job.get('total_count') or 0)}件")
-                        columns[2].write(f"{int(job.get('sent_count') or 0)}件")
-                        columns[3].write(send_job_status_label(str(job.get("status") or "")))
-                        if columns[4].button("予約を取消", key=f"request_cancel_send_job_{job_id}", use_container_width=True):
+                        columns[1].write(f"{send_job_count(job, 'total_count'):,}件")
+                        columns[2].write(f"{send_job_count(job, 'sent_count'):,}件")
+                        columns[3].write(f"{send_job_progress_percent(job):.1f}%")
+                        columns[4].write(send_job_status_label(str(job.get("status") or "")))
+                        if columns[5].button("予約を取消", key=f"request_cancel_send_job_{job_id}", use_container_width=True):
                             st.session_state["confirm_cancel_send_job_id"] = job_id
                             st.rerun()
 
@@ -7592,10 +7674,11 @@ def main() -> None:
                         st.rerun()
 
         send_history = fetch_send_history()
-        with st.expander(f"送信ログ履歴（最新{len(send_history)}件）", expanded=False):
+        with st.expander(f"詳細送信ログ（メールアドレスを含む・最新{len(send_history)}件）", expanded=False):
             if send_history.empty:
                 st.write("まだ送信ログがありません。")
             else:
+                st.caption("通常は上のシナリオ進捗だけ見れば大丈夫です。メールアドレス単位の確認や失敗調査が必要な時だけ開いてください。")
                 history_metrics = st.columns(4)
                 history_metrics[0].metric("送信済み", f"{int((send_history['status'] == 'sent').sum())}件")
                 history_metrics[1].metric("送信待ち", f"{int((send_history['status'] == 'queued').sum())}件")
