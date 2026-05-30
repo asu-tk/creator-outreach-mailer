@@ -9,6 +9,8 @@ const NOTIFY_SMTP_SSL = (Deno.env.get("NOTIFY_SMTP_SSL") ?? "false").toLowerCase
 const NOTIFY_SMTP_USER = Deno.env.get("NOTIFY_SMTP_USER") ?? "";
 const NOTIFY_SMTP_PASS = Deno.env.get("NOTIFY_SMTP_PASS") ?? "";
 const NOTIFY_MAIL_FROM = Deno.env.get("NOTIFY_MAIL_FROM") ?? NOTIFY_SMTP_USER;
+const UNSUBSCRIBE_REASON_PREFIX = "配信停止:";
+const UNSUBSCRIBE_REASON_GLOBAL = "配信停止:global";
 
 function jsonResponse(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -118,18 +120,42 @@ async function hasUnsubscribeToken(item: Record<string, unknown>) {
   return false;
 }
 
-async function isBlockedTarget(item: Record<string, unknown>) {
+async function blockedTargetReasons(item: Record<string, unknown>) {
   const userEmail = String(item.user_email ?? "").trim().toLowerCase();
   const contactEmail = String(item.contact_email ?? "").trim().toLowerCase();
-  if (!userEmail || !contactEmail) return false;
+  if (!userEmail || !contactEmail) return [];
   const rows = await supabaseRequest(
-    `blocked_targets?user_email=eq.${encodeFilter(userEmail)}&email=eq.${encodeFilter(contactEmail)}&select=id&limit=1`,
+    `blocked_targets?user_email=eq.${encodeFilter(userEmail)}&email=eq.${encodeFilter(contactEmail)}&select=reason`,
   );
-  return Array.isArray(rows) && rows.length > 0;
+  return Array.isArray(rows) ? rows.map((row: { reason?: string }) => String(row.reason ?? "")) : [];
 }
 
-async function isUnsubscribed(item: Record<string, unknown>) {
-  return (await hasUnsubscribeToken(item)) || (await isBlockedTarget(item));
+function campaignUnsubscribeReason(item: Record<string, unknown>) {
+  return `${UNSUBSCRIBE_REASON_PREFIX}campaign:${String(item.campaign_key ?? "").trim()}`;
+}
+
+function scenarioKeyFromJob(job: Record<string, unknown>) {
+  const campaignName = String(job.campaign_name ?? "").trim();
+  if (!campaignName.includes("｜")) return "";
+  return campaignName.split("｜")[0].trim();
+}
+
+function scenarioUnsubscribeReason(job: Record<string, unknown>) {
+  const scenarioKey = scenarioKeyFromJob(job);
+  return scenarioKey ? `${UNSUBSCRIBE_REASON_PREFIX}scenario:${scenarioKey}` : "";
+}
+
+async function isUnsubscribed(item: Record<string, unknown>, job: Record<string, unknown>) {
+  if (await hasUnsubscribeToken(item)) return true;
+
+  const reasons = await blockedTargetReasons(item);
+  const campaignReason = campaignUnsubscribeReason(item);
+  const scenarioReason = scenarioUnsubscribeReason(job);
+  return reasons.some((reason) => {
+    if (!reason || reason === "配信停止URL" || reason === UNSUBSCRIBE_REASON_GLOBAL) return true;
+    if (!reason.startsWith(UNSUBSCRIBE_REASON_PREFIX)) return true;
+    return reason === campaignReason || Boolean(scenarioReason && reason === scenarioReason);
+  });
 }
 
 async function sendCompletionNotice(job: Record<string, unknown>, sent: number, failed: number) {
@@ -210,7 +236,7 @@ Deno.serve(async (req: Request) => {
     const job = jobs[0];
 
     try {
-      if (await isUnsubscribed(item)) {
+      if (await isUnsubscribed(item, job)) {
         await deleteQueue(item.id);
       } else {
         const transporter = createTransporter(job);
