@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import secrets
+import socket
 import smtplib
 import sqlite3
 import time
@@ -67,8 +68,9 @@ GOOGLE_SHEET_WRITE_DISABLED_MESSAGE = (
 OUTSOURCE_MIN_UNIT_PRICE_YEN = 10
 OUTSOURCE_MAX_UNIT_PRICE_YEN = 300
 OUTSOURCE_DEFAULT_UNIT_PRICE_YEN = 50
-AI_SCENARIO_EXPECTED_SECONDS = 120
-AI_SCENARIO_STALE_SECONDS = 180
+AI_SCENARIO_EXPECTED_SECONDS = 75
+AI_SCENARIO_STALE_SECONDS = 90
+AI_OPENAI_TIMEOUT_SECONDS = 75
 AI_IMAGE_MAX_BYTES = 8 * 1024 * 1024
 UNSUBSCRIBE_SCOPE_GLOBAL = "global"
 UNSUBSCRIBE_SCOPE_SCENARIO = "scenario"
@@ -2618,9 +2620,9 @@ def openai_api_key() -> str:
 
 
 def openai_model() -> str:
-    model = (get_nested_secret("openai", "model") or read_secret("OPENAI_MODEL") or "gpt-5-mini").strip()
-    if model == "gpt-5.5":
-        return "gpt-5-mini"
+    model = (get_nested_secret("openai", "model") or read_secret("OPENAI_MODEL") or "gpt-4.1-mini").strip()
+    if model in {"gpt-5.5", "gpt-5-mini"}:
+        return "gpt-4.1-mini"
     return model
 
 
@@ -2680,8 +2682,8 @@ def refresh_stale_ai_scenario_status() -> None:
         return
     set_ai_scenario_status(
         "failed",
-        "AI生成が長時間終わらなかったため、停止扱いにしました。もう一度お試しください。",
-        f"OpenAI APIの応答が{format_elapsed_seconds(elapsed_seconds)}返りませんでした。写真を外す、通数を減らす、または少し時間を置いて再実行してください。",
+        "前回のAI生成がサーバーから戻らなかったため、停止扱いにしました。もう一度お試しください。",
+        f"OpenAI APIの応答が{format_elapsed_seconds(elapsed_seconds)}返りませんでした。通数を減らす、入力文を短くする、または少し時間を置いて再実行してください。",
     )
     log_ai_scenario_event("stale-timeout", f"elapsed={elapsed_seconds}s")
 
@@ -2700,8 +2702,8 @@ def render_ai_scenario_status(status_record: dict | None) -> None:
         progress_value = min(95, max(10, int((elapsed_seconds / AI_SCENARIO_EXPECTED_SECONDS) * 85) + 10))
         st.info(
             "AIでシナリオ案を作成しています。"
-            f"\n\n経過: {format_elapsed_seconds(elapsed_seconds)} / 目安: 30秒〜2分"
-            "\n\n2分を超える場合は、写真の処理やOpenAI API側の混雑で長引いている可能性があります。"
+            f"\n\n経過: {format_elapsed_seconds(elapsed_seconds)} / 目安: 30秒〜75秒"
+            "\n\n75秒を超える場合は、OpenAI API側の混雑や入力文量の多さで戻っていない可能性があります。"
         )
         st.progress(progress_value, text="生成中です。画面を閉じずにお待ちください。")
         return
@@ -2823,7 +2825,9 @@ def generate_ai_scenario(
     if not api_key:
         raise RuntimeError("OpenAI APIキーが未設定です。Streamlit Secretsの[openai] api_keyに追加してください。")
 
+    model = openai_model()
     clean_step_count = max(1, min(10, int(step_count)))
+    max_output_tokens = min(6500, 1800 + clean_step_count * 600)
     instructions = (
         "あなたは日本語のB2Bアウトリーチメールとステップ配信シナリオの設計者です。"
         "商品情報、ASPの紹介文、ペルソナ情報、必要に応じて商品画像を読み取り、"
@@ -2864,6 +2868,7 @@ ASP紹介文・ペルソナ・訴求情報:
 - template_nameは各ステップで重複しない名前にする
 - subjectは自然な日本語で、釣りすぎない
 - bodyは1通ごとに目的が違う内容にする
+- bodyは1通あたり500文字以内で、短く読みやすくする
 - 1通目は突然の連絡として自然に入る
 - 後続メールは前回連絡への補足として自然につなげる
 - 相手がYouTubeチャンネル運営者である前提で書く
@@ -2874,7 +2879,7 @@ ASP紹介文・ペルソナ・訴求情報:
         content.append({"type": "input_image", "image_url": image_reference, "detail": "auto"})
 
     payload = {
-        "model": openai_model(),
+        "model": model,
         "instructions": instructions,
         "input": [{"role": "user", "content": content}],
         "text": {
@@ -2885,9 +2890,9 @@ ASP紹介文・ペルソナ・訴求情報:
                 "strict": True,
             }
         },
-        "max_output_tokens": 9000,
+        "max_output_tokens": max_output_tokens,
     }
-    if openai_model().startswith("gpt-5"):
+    if model.startswith("gpt-5"):
         payload["reasoning"] = {"effort": "minimal"}
     request = urllib.request.Request(
         "https://api.openai.com/v1/responses",
@@ -2899,12 +2904,23 @@ ASP紹介文・ペルソナ・訴求情報:
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=90) as response:
+        with urllib.request.urlopen(request, timeout=AI_OPENAI_TIMEOUT_SECONDS) as response:
             result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(friendly_openai_error(detail, exc.code)) from exc
+    except (TimeoutError, socket.timeout) as exc:
+        raise RuntimeError(
+            f"OpenAI APIから{AI_OPENAI_TIMEOUT_SECONDS}秒以内に応答が返りませんでした。"
+            "通数を減らす、入力文を短くする、または少し時間を置いて再度お試しください。"
+        ) from exc
     except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", "")
+        if isinstance(reason, (TimeoutError, socket.timeout)) or "timed out" in str(reason).lower():
+            raise RuntimeError(
+                f"OpenAI APIから{AI_OPENAI_TIMEOUT_SECONDS}秒以内に応答が返りませんでした。"
+                "通数を減らす、入力文を短くする、または少し時間を置いて再度お試しください。"
+            ) from exc
         raise RuntimeError(f"OpenAI APIに接続できませんでした: {exc.reason}") from exc
 
     output_text = extract_openai_output_text(result)
@@ -6681,7 +6697,7 @@ def main() -> None:
             if not openai_api_key():
                 st.warning("AI生成を使うには、Streamlit SecretsにOpenAI APIキーを追加してください。")
                 st.code(
-                    '[openai]\napi_key = "sk-..."\nmodel = "gpt-5-mini"',
+                    '[openai]\napi_key = "sk-..."\nmodel = "gpt-4.1-mini"',
                     language="toml",
                 )
                 st.caption("貼る場所はSecretsの一番上です。[auth]や[google]の下には入れないでください。")
@@ -6775,8 +6791,11 @@ def main() -> None:
                         )
                         image_reference = ai_input_image_reference(ai_product_image)
                         with ai_status_slot.container():
-                            st.info("入力内容と商品写真を確認しました。AIにシナリオ作成を依頼しています。")
-                            st.progress(35, text="AIへ依頼中です。通常30秒〜2分ほどかかります。")
+                            if image_reference:
+                                st.info("入力内容と商品写真を確認しました。AIにシナリオ作成を依頼しています。")
+                            else:
+                                st.info("入力内容を確認しました。写真なしでAIにシナリオ作成を依頼しています。")
+                            st.progress(35, text="AIへ依頼中です。通常30秒〜75秒ほどかかります。")
                         log_ai_scenario_event(
                             "requesting-openai",
                             f"model={openai_model()} steps={int(ai_step_count)} image={'yes' if image_reference else 'no'}",
