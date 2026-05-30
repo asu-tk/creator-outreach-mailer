@@ -8,6 +8,7 @@ import sqlite3
 import time
 import json
 import hashlib
+import html
 import math
 from io import BytesIO
 import urllib.error
@@ -63,6 +64,9 @@ OUTSOURCE_SHEET_COLUMNS = [
 GOOGLE_SHEET_WRITE_DISABLED_MESSAGE = (
     "外注用GoogleシートはURL登録方式で運用しています。"
 )
+OUTSOURCE_MIN_UNIT_PRICE_YEN = 10
+OUTSOURCE_MAX_UNIT_PRICE_YEN = 300
+OUTSOURCE_DEFAULT_UNIT_PRICE_YEN = 50
 
 YOUTUBE_VIDEO_CATEGORIES = {
     "エンターテイメント": "24",
@@ -878,6 +882,23 @@ def init_db() -> None:
                 created_at text not null
             );
 
+            create table if not exists outsource_imports (
+                id integer primary key autoincrement,
+                user_id text not null default 'local-user',
+                source_url text not null default '',
+                source_type text not null default '',
+                imported_count integer not null default 0,
+                skipped_count integer not null default 0,
+                candidate_removed_count integer not null default 0,
+                candidate_discarded_count integer not null default 0,
+                worker_name text not null default '',
+                unit_price_yen integer not null default 50,
+                receipt_note text not null default '',
+                payment_status text not null default '未払い',
+                receipt_issued_at text not null default '',
+                created_at text not null
+            );
+
             create table if not exists youtube_api_usage (
                 user_id text not null default 'local-user',
                 usage_date text not null,
@@ -955,13 +976,31 @@ def init_db() -> None:
                     added_memo_column = True
         if added_memo_column:
             db.execute("update contacts set memo = name where memo = '' and name != ''")
-        for table in ["sends", "settings", "youtube_candidates", "youtube_api_usage", "blocked_targets", "campaign_templates", "smtp_accounts", "unsubscribe_events", "scenarios", "scenario_steps"]:
+        for table in ["sends", "settings", "youtube_candidates", "outsource_imports", "youtube_api_usage", "blocked_targets", "campaign_templates", "smtp_accounts", "unsubscribe_events", "scenarios", "scenario_steps"]:
             table_columns = [row[1] for row in db.execute(f"pragma table_info({table})").fetchall()]
             if "user_id" not in table_columns:
                 db.execute(f"alter table {table} add column user_id text not null default 'local-user'")
         candidate_columns = [row[1] for row in db.execute("pragma table_info(youtube_candidates)").fetchall()]
         if "email" not in candidate_columns:
             db.execute("alter table youtube_candidates add column email text not null default ''")
+        outsource_import_columns = [row[1] for row in db.execute("pragma table_info(outsource_imports)").fetchall()]
+        outsource_import_migrations = {
+            "source_url": "alter table outsource_imports add column source_url text not null default ''",
+            "source_type": "alter table outsource_imports add column source_type text not null default ''",
+            "imported_count": "alter table outsource_imports add column imported_count integer not null default 0",
+            "skipped_count": "alter table outsource_imports add column skipped_count integer not null default 0",
+            "candidate_removed_count": "alter table outsource_imports add column candidate_removed_count integer not null default 0",
+            "candidate_discarded_count": "alter table outsource_imports add column candidate_discarded_count integer not null default 0",
+            "worker_name": "alter table outsource_imports add column worker_name text not null default ''",
+            "unit_price_yen": "alter table outsource_imports add column unit_price_yen integer not null default 50",
+            "receipt_note": "alter table outsource_imports add column receipt_note text not null default ''",
+            "payment_status": "alter table outsource_imports add column payment_status text not null default '未払い'",
+            "receipt_issued_at": "alter table outsource_imports add column receipt_issued_at text not null default ''",
+            "created_at": "alter table outsource_imports add column created_at text not null default ''",
+        }
+        for column, statement in outsource_import_migrations.items():
+            if column not in outsource_import_columns:
+                db.execute(statement)
         sends_columns = [row[1] for row in db.execute("pragma table_info(sends)").fetchall()]
         if "campaign_key" not in sends_columns:
             db.execute("alter table sends add column campaign_key text not null default ''")
@@ -1674,12 +1713,287 @@ def execute(query: str, params: tuple = ()) -> None:
     mark_app_state_dirty()
 
 
+def normalize_outsource_unit_price(value: object) -> int:
+    try:
+        price = int(value)
+    except (TypeError, ValueError):
+        price = OUTSOURCE_DEFAULT_UNIT_PRICE_YEN
+    return min(OUTSOURCE_MAX_UNIT_PRICE_YEN, max(OUTSOURCE_MIN_UNIT_PRICE_YEN, price))
+
+
+def outsource_payment_amount(imported_count: object, unit_price_yen: object) -> int:
+    try:
+        count = max(0, int(imported_count))
+    except (TypeError, ValueError):
+        count = 0
+    return count * normalize_outsource_unit_price(unit_price_yen)
+
+
+def save_outsource_import_history(
+    source_url: str,
+    source_type: str,
+    imported_count: int,
+    skipped_count: int,
+    mapping: dict[str, str | None],
+) -> int:
+    worker_name = get_setting("OUTSOURCE_DEFAULT_WORKER_NAME")
+    unit_price_yen = normalize_outsource_unit_price(
+        get_setting("OUTSOURCE_DEFAULT_UNIT_PRICE_YEN", str(OUTSOURCE_DEFAULT_UNIT_PRICE_YEN))
+    )
+    candidate_removed_count = int(mapping.get("candidate_removed") or 0)
+    candidate_discarded_count = int(mapping.get("candidate_discarded") or 0)
+    with sqlite3.connect(DB_PATH) as db:
+        cursor = db.execute(
+            """
+            insert into outsource_imports
+            (
+                user_id, source_url, source_type, imported_count, skipped_count,
+                candidate_removed_count, candidate_discarded_count, worker_name,
+                unit_price_yen, receipt_note, payment_status, receipt_issued_at, created_at
+            )
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, '', '未払い', '', ?)
+            """,
+            (
+                current_user_id(),
+                source_url.strip(),
+                source_type.strip(),
+                int(imported_count),
+                int(skipped_count),
+                candidate_removed_count,
+                candidate_discarded_count,
+                worker_name,
+                unit_price_yen,
+                now_iso(),
+            ),
+        )
+        db.commit()
+        history_id = int(cursor.lastrowid)
+    mark_app_state_dirty()
+    return history_id
+
+
+def fetch_outsource_import_history(limit: int = 100) -> pd.DataFrame:
+    with sqlite3.connect(DB_PATH) as db:
+        return pd.read_sql_query(
+            """
+            select
+                id,
+                source_url,
+                source_type,
+                imported_count,
+                skipped_count,
+                candidate_removed_count,
+                candidate_discarded_count,
+                worker_name,
+                unit_price_yen,
+                receipt_note,
+                payment_status,
+                receipt_issued_at,
+                created_at
+            from outsource_imports
+            where user_id = ?
+            order by id desc
+            limit ?
+            """,
+            db,
+            params=(current_user_id(), int(limit)),
+        ).fillna("")
+
+
+def update_outsource_import_receipt(
+    import_id: int,
+    worker_name: str,
+    unit_price_yen: int,
+    receipt_note: str,
+    payment_status: str,
+    receipt_issued_at: str,
+) -> None:
+    with sqlite3.connect(DB_PATH) as db:
+        db.execute(
+            """
+            update outsource_imports
+            set worker_name = ?,
+                unit_price_yen = ?,
+                receipt_note = ?,
+                payment_status = ?,
+                receipt_issued_at = ?
+            where user_id = ? and id = ?
+            """,
+            (
+                worker_name.strip(),
+                normalize_outsource_unit_price(unit_price_yen),
+                receipt_note.strip(),
+                payment_status.strip() or "未払い",
+                receipt_issued_at.strip(),
+                current_user_id(),
+                int(import_id),
+            ),
+        )
+        db.commit()
+    mark_app_state_dirty()
+
+
+def outsource_import_history_display_frame(history: pd.DataFrame) -> pd.DataFrame:
+    if history.empty:
+        return pd.DataFrame(
+            columns=[
+                "取り込み日時",
+                "実取り込み件数",
+                "単価",
+                "金額",
+                "スキップ",
+                "候補から削除",
+                "支払い状態",
+                "外注さん",
+            ]
+        )
+    display = history.copy()
+    display["取り込み日時"] = display["created_at"].apply(format_jst_datetime)
+    display["実取り込み件数"] = display["imported_count"].astype(int)
+    display["単価"] = display["unit_price_yen"].apply(lambda value: f"{normalize_outsource_unit_price(value):,}円")
+    display["金額"] = display.apply(
+        lambda row: f"{outsource_payment_amount(row['imported_count'], row['unit_price_yen']):,}円",
+        axis=1,
+    )
+    display["スキップ"] = display["skipped_count"].astype(int)
+    display["候補から削除"] = display["candidate_discarded_count"].astype(int)
+    display["支払い状態"] = display["payment_status"].replace("", "未払い")
+    display["外注さん"] = display["worker_name"].replace("", "-")
+    return display[
+        [
+            "取り込み日時",
+            "実取り込み件数",
+            "単価",
+            "金額",
+            "スキップ",
+            "候補から削除",
+            "支払い状態",
+            "外注さん",
+        ]
+    ]
+
+
+def outsource_receipt_file_name(record_id: int, issue_date: date) -> str:
+    return f"outsource_receipt_OUT-{int(record_id):06d}_{issue_date.strftime('%Y%m%d')}.html"
+
+
+def build_outsource_receipt_html(
+    record: dict,
+    worker_name: str,
+    payer_name: str,
+    unit_price_yen: int,
+    issue_date: date,
+    receipt_note: str,
+    payment_status: str,
+) -> str:
+    record_id = int(record.get("id") or 0)
+    imported_count = int(record.get("imported_count") or 0)
+    skipped_count = int(record.get("skipped_count") or 0)
+    discarded_count = int(record.get("candidate_discarded_count") or 0)
+    normalized_unit_price = normalize_outsource_unit_price(unit_price_yen)
+    amount = outsource_payment_amount(imported_count, normalized_unit_price)
+    safe_worker_name = html.escape(worker_name.strip() or "外注担当者")
+    safe_payer_name = html.escape(payer_name.strip() or "ご担当者")
+    safe_note = html.escape(receipt_note.strip()).replace("\n", "<br>")
+    safe_source_url = html.escape(str(record.get("source_url") or ""))
+    safe_payment_status = html.escape(payment_status.strip() or "未払い")
+    imported_at = html.escape(format_jst_datetime(str(record.get("created_at") or "")))
+    issue_date_text = issue_date.strftime("%Y年%m月%d日")
+    receipt_no = f"OUT-{record_id:06d}"
+    return f"""<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>領収書 {receipt_no}</title>
+<style>
+body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: #111827;
+    margin: 40px;
+    line-height: 1.65;
+}}
+.page {{
+    max-width: 760px;
+    margin: 0 auto;
+}}
+h1 {{
+    text-align: center;
+    letter-spacing: 0;
+    margin: 0 0 28px;
+}}
+.meta {{
+    text-align: right;
+    color: #475569;
+    font-size: 14px;
+}}
+.amount {{
+    border: 2px solid #111827;
+    padding: 16px 20px;
+    font-size: 28px;
+    font-weight: 700;
+    margin: 24px 0;
+    text-align: center;
+}}
+table {{
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 18px;
+}}
+th, td {{
+    border: 1px solid #CBD5E1;
+    padding: 10px 12px;
+    text-align: left;
+    vertical-align: top;
+}}
+th {{
+    width: 34%;
+    background: #F8FAFC;
+}}
+.url {{
+    word-break: break-all;
+}}
+.note {{
+    margin-top: 20px;
+    color: #334155;
+}}
+@media print {{
+    body {{ margin: 18mm; }}
+}}
+</style>
+</head>
+<body>
+<div class="page">
+    <div class="meta">発行日: {issue_date_text}<br>No: {receipt_no}</div>
+    <h1>領収書</h1>
+    <p>{safe_payer_name} 様</p>
+    <p>下記の通り、外注メール収集作業の報酬として受領いたしました。</p>
+    <div class="amount">金額 ¥{amount:,}</div>
+    <table>
+        <tr><th>外注さん</th><td>{safe_worker_name}</td></tr>
+        <tr><th>対象作業</th><td>外注用Googleスプレッドシートから宛先一覧への取り込み</td></tr>
+        <tr><th>実取り込み件数</th><td>{imported_count:,}件</td></tr>
+        <tr><th>単価</th><td>1件あたり ¥{normalized_unit_price:,}</td></tr>
+        <tr><th>計算式</th><td>{imported_count:,}件 × ¥{normalized_unit_price:,} = ¥{amount:,}</td></tr>
+        <tr><th>取り込み日時</th><td>{imported_at}</td></tr>
+        <tr><th>スキップ件数</th><td>{skipped_count:,}件</td></tr>
+        <tr><th>候補から削除</th><td>{discarded_count:,}件</td></tr>
+        <tr><th>支払い状態</th><td>{safe_payment_status}</td></tr>
+        <tr><th>GoogleシートURL</th><td class="url">{safe_source_url}</td></tr>
+    </table>
+    <div class="note">{safe_note}</div>
+</div>
+</body>
+</html>
+"""
+
+
 APP_STATE_TABLES = [
     "contacts",
     "sends",
     "settings",
     "smtp_accounts",
     "youtube_candidates",
+    "outsource_imports",
     "youtube_api_usage",
     "blocked_targets",
     "campaign_templates",
@@ -1738,6 +2052,7 @@ def restore_local_app_state(state: dict) -> None:
         "settings",
         "smtp_accounts",
         "youtube_candidates",
+        "outsource_imports",
         "youtube_api_usage",
         "blocked_targets",
         "campaign_templates",
@@ -1750,6 +2065,7 @@ def restore_local_app_state(state: dict) -> None:
         "settings",
         "smtp_accounts",
         "youtube_candidates",
+        "outsource_imports",
         "youtube_api_usage",
         "blocked_targets",
         "campaign_templates",
@@ -4537,6 +4853,144 @@ def queue_google_contacts_url_import() -> None:
     st.session_state["google_contacts_url"] = ""
 
 
+def render_outsource_import_history_panel() -> None:
+    with st.expander("外注取り込み履歴 / 領収書", expanded=False):
+        history = fetch_outsource_import_history()
+        if history.empty:
+            st.caption("まだ外注用Googleシートから取り込んだ履歴はありません。")
+            return
+
+        display_history = outsource_import_history_display_frame(history)
+        st.dataframe(display_history, use_container_width=True, hide_index=True, height=240)
+        export_name = datetime.now(APP_TIMEZONE).strftime("outsource_import_history_%Y%m%d_%H%M")
+        history_csv_col, history_xlsx_col = st.columns(2)
+        history_csv_col.download_button(
+            "履歴CSVをダウンロード",
+            data=display_history.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"{export_name}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+        history_xlsx_col.download_button(
+            "履歴Excelをダウンロード",
+            data=dataframe_to_xlsx(display_history, "外注取り込み履歴"),
+            file_name=f"{export_name}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+        records = history.to_dict("records")
+        labels = [
+            f"No.{int(record.get('id') or 0):06d} / "
+            f"{format_jst_datetime(str(record.get('created_at') or ''))} / "
+            f"{int(record.get('imported_count') or 0):,}件"
+            for record in records
+        ]
+        selected_label = st.selectbox("領収書にする履歴", labels, key="outsource_receipt_history_select")
+        selected_record = records[labels.index(selected_label)]
+        record_id = int(selected_record.get("id") or 0)
+
+        default_worker_name = str(selected_record.get("worker_name") or get_setting("OUTSOURCE_DEFAULT_WORKER_NAME"))
+        default_payer_name = get_setting("OUTSOURCE_RECEIPT_PAYER_NAME") or current_user_profile().get("email", "")
+        default_unit_price = normalize_outsource_unit_price(
+            selected_record.get("unit_price_yen")
+            or get_setting("OUTSOURCE_DEFAULT_UNIT_PRICE_YEN", str(OUTSOURCE_DEFAULT_UNIT_PRICE_YEN))
+        )
+        default_issue_date = datetime.now(APP_TIMEZONE).date()
+        stored_issue_date = str(selected_record.get("receipt_issued_at") or "").strip()
+        if stored_issue_date:
+            try:
+                default_issue_date = date.fromisoformat(stored_issue_date[:10])
+            except ValueError:
+                default_issue_date = datetime.now(APP_TIMEZONE).date()
+
+        worker_col, payer_col = st.columns(2)
+        worker_name = worker_col.text_input(
+            "外注さん名",
+            value=default_worker_name,
+            key=f"outsource_receipt_worker_{record_id}",
+        )
+        payer_name = payer_col.text_input(
+            "宛名 / 支払者名",
+            value=default_payer_name,
+            key=f"outsource_receipt_payer_{record_id}",
+        )
+        unit_col, date_col, status_col = st.columns([1.0, 1.0, 1.0])
+        unit_price = unit_col.number_input(
+            "1件あたり単価",
+            min_value=OUTSOURCE_MIN_UNIT_PRICE_YEN,
+            max_value=OUTSOURCE_MAX_UNIT_PRICE_YEN,
+            value=default_unit_price,
+            step=10,
+            key=f"outsource_receipt_unit_price_{record_id}",
+        )
+        issue_date = date_col.date_input(
+            "領収書の日付",
+            value=default_issue_date,
+            key=f"outsource_receipt_issue_date_{record_id}",
+        )
+        status_options = ["未払い", "支払い済み"]
+        payment_status = str(selected_record.get("payment_status") or "未払い")
+        if payment_status not in status_options:
+            payment_status = "未払い"
+        payment_status = status_col.selectbox(
+            "支払い状態",
+            status_options,
+            index=status_options.index(payment_status),
+            key=f"outsource_receipt_payment_status_{record_id}",
+        )
+        receipt_note = st.text_area(
+            "領収書メモ",
+            value=str(selected_record.get("receipt_note") or ""),
+            placeholder="例: 5月分のメールアドレス収集作業",
+            key=f"outsource_receipt_note_{record_id}",
+        )
+
+        imported_count = int(selected_record.get("imported_count") or 0)
+        total_amount = outsource_payment_amount(imported_count, unit_price)
+        st.metric(
+            "領収書金額",
+            f"{total_amount:,}円",
+            f"{imported_count:,}件 × {int(unit_price):,}円",
+        )
+
+        receipt_html = build_outsource_receipt_html(
+            selected_record,
+            worker_name,
+            payer_name,
+            int(unit_price),
+            issue_date,
+            receipt_note,
+            payment_status,
+        )
+        save_receipt_col, download_receipt_col = st.columns(2)
+        if save_receipt_col.button(
+            "領収書情報を保存",
+            key=f"save_outsource_receipt_{record_id}",
+            use_container_width=True,
+        ):
+            save_setting("OUTSOURCE_DEFAULT_WORKER_NAME", worker_name.strip())
+            save_setting("OUTSOURCE_DEFAULT_UNIT_PRICE_YEN", str(int(unit_price)))
+            save_setting("OUTSOURCE_RECEIPT_PAYER_NAME", payer_name.strip())
+            update_outsource_import_receipt(
+                record_id,
+                worker_name,
+                int(unit_price),
+                receipt_note,
+                payment_status,
+                issue_date.isoformat(),
+            )
+            st.success("領収書情報を保存しました。")
+            st.rerun()
+        download_receipt_col.download_button(
+            "領収書HTMLをダウンロード",
+            data=receipt_html.encode("utf-8-sig"),
+            file_name=outsource_receipt_file_name(record_id, issue_date),
+            mime="text/html",
+            use_container_width=True,
+        )
+
+
 def main() -> None:
     st.set_page_config(page_title="Creator Outreach Mailer", layout="wide")
     inject_loading_indicator()
@@ -6063,8 +6517,18 @@ def main() -> None:
             save_setting("OUTSOURCE_SPREADSHEET_URL", target_outsource_url)
             try:
                 added, skipped, mapping, source_type = import_contacts_google_url(target_outsource_url)
+                history_id = save_outsource_import_history(
+                    target_outsource_url,
+                    source_type,
+                    added,
+                    skipped,
+                    mapping,
+                )
                 st.session_state.pop("outsource_reflection_snapshot", None)
-                st.success(f"{source_type}から{added}件を宛先一覧へ取り込みました。重複や空欄は{skipped}件スキップしました。")
+                st.success(
+                    f"{source_type}から{added}件を宛先一覧へ取り込みました。"
+                    f"重複や空欄は{skipped}件スキップしました。履歴No.{history_id:06d}に保存しました。"
+                )
                 show_candidate_import_cleanup(mapping)
                 if int(mapping.get("candidate_removed") or 0):
                     refreshed_message = refresh_outsource_sheet_if_possible()
@@ -6078,6 +6542,7 @@ def main() -> None:
                 )
             except Exception as exc:
                 st.error(str(exc))
+        render_outsource_import_history_panel()
 
     show_candidates_list = st.toggle("YouTube候補一覧を表示する", value=False, key="show_youtube_candidates_list")
     if not show_candidates_list:
