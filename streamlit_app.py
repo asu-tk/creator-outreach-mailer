@@ -2681,7 +2681,7 @@ def refresh_stale_ai_scenario_status() -> None:
     set_ai_scenario_status(
         "failed",
         "AI生成が長時間終わらなかったため、停止扱いにしました。もう一度お試しください。",
-        f"OpenAI APIの応答が{format_elapsed_seconds(elapsed_seconds)}返りませんでした。画像URLを外す、通数を減らす、または少し時間を置いて再実行してください。",
+        f"OpenAI APIの応答が{format_elapsed_seconds(elapsed_seconds)}返りませんでした。写真を外す、通数を減らす、または少し時間を置いて再実行してください。",
     )
     log_ai_scenario_event("stale-timeout", f"elapsed={elapsed_seconds}s")
 
@@ -2701,7 +2701,7 @@ def render_ai_scenario_status(status_record: dict | None) -> None:
         st.info(
             "AIでシナリオ案を作成しています。"
             f"\n\n経過: {format_elapsed_seconds(elapsed_seconds)} / 目安: 30秒〜2分"
-            "\n\n2分を超える場合は、画像URLの読み込みやOpenAI API側の混雑で長引いている可能性があります。"
+            "\n\n2分を超える場合は、写真の処理やOpenAI API側の混雑で長引いている可能性があります。"
         )
         st.progress(progress_value, text="生成中です。画面を閉じずにお待ちください。")
         return
@@ -2788,45 +2788,8 @@ def uploaded_image_to_data_url(uploaded_file) -> str:
     return f"data:{mime_type};base64,{encoded}"
 
 
-def image_url_to_data_url(image_url: str) -> str:
-    clean_url = str(image_url or "").strip()
-    if not clean_url:
-        return ""
-    parsed_url = urllib.parse.urlparse(clean_url)
-    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
-        raise RuntimeError("商品写真URLは https://... の形式で入力してください。")
-    request = urllib.request.Request(
-        clean_url,
-        headers={
-            "User-Agent": "Mozilla/5.0 CreatorOutreachMailer/1.0",
-        },
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=12) as response:
-            content_type = str(response.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-            raw = response.read(AI_IMAGE_MAX_BYTES + 1)
-    except urllib.error.URLError as exc:
-        raise RuntimeError("商品写真URLを読み込めませんでした。画像をアップロードするか、写真なしで再度お試しください。") from exc
-    if len(raw) > AI_IMAGE_MAX_BYTES:
-        raise RuntimeError("商品写真URLの画像が大きすぎます。8MB以下の画像をアップロードしてください。")
-    if not content_type.startswith("image/"):
-        suffix = Path(parsed_url.path).suffix.lower()
-        content_type = {
-            ".jpg": "image/jpeg",
-            ".jpeg": "image/jpeg",
-            ".png": "image/png",
-            ".webp": "image/webp",
-        }.get(suffix, "image/png")
-    encoded = base64.b64encode(raw).decode("ascii")
-    return f"data:{content_type};base64,{encoded}"
-
-
-def ai_input_image_reference(uploaded_file, image_url: str) -> str:
-    uploaded_image = uploaded_image_to_data_url(uploaded_file)
-    if uploaded_image:
-        return uploaded_image
-    return image_url_to_data_url(image_url)
+def ai_input_image_reference(uploaded_file) -> str:
+    return uploaded_image_to_data_url(uploaded_file)
 
 
 def friendly_openai_error(detail: str, status_code: int = 0) -> str:
@@ -6740,11 +6703,6 @@ def main() -> None:
                     placeholder="https://...",
                     key="ai_scenario_product_url",
                 )
-                ai_product_image_url = st.text_input(
-                    "商品写真URL（任意）",
-                    placeholder="https://.../image.jpg",
-                    key="ai_scenario_product_image_url",
-                )
                 ai_product_image = st.file_uploader(
                     "商品写真をアップロード（任意）",
                     type=["png", "jpg", "jpeg", "webp"],
@@ -6752,8 +6710,6 @@ def main() -> None:
                 )
                 if ai_product_image:
                     st.image(ai_product_image, caption="商品写真プレビュー", width=260)
-                elif ai_product_image_url.strip():
-                    st.caption("画像URLをAIに渡します。URL先が外部から見られない場合は、アップロードを使ってください。")
             with ai_input_right:
                 ai_step_count = st.number_input(
                     "作成する通数",
@@ -6815,9 +6771,9 @@ def main() -> None:
                             render_ai_scenario_status(st.session_state.get("ai_scenario_last_status"))
                         log_ai_scenario_event(
                             "started",
-                            f"model={openai_model()} steps={int(ai_step_count)} image={'yes' if ai_product_image or ai_product_image_url.strip() else 'no'}",
+                            f"model={openai_model()} steps={int(ai_step_count)} image={'yes' if ai_product_image else 'no'}",
                         )
-                        image_reference = ai_input_image_reference(ai_product_image, ai_product_image_url)
+                        image_reference = ai_input_image_reference(ai_product_image)
                         with ai_status_slot.container():
                             st.info("入力内容と商品写真を確認しました。AIにシナリオ作成を依頼しています。")
                             st.progress(35, text="AIへ依頼中です。通常30秒〜2分ほどかかります。")
