@@ -3134,6 +3134,37 @@ def set_contact_status(contact_id: int, contact_status: str) -> None:
     )
 
 
+class YouTubeApiNotFoundError(RuntimeError):
+    pass
+
+
+def youtube_api_error_message(status_code: int, detail: str) -> str:
+    message = detail.strip()
+    reason = ""
+    try:
+        payload = json.loads(detail)
+        error = payload.get("error", {})
+        message = str(error.get("message") or message)
+        errors = error.get("errors") or []
+        if errors:
+            reason = str(errors[0].get("reason") or "")
+        else:
+            reason = str(error.get("status") or "")
+    except Exception:
+        pass
+
+    if status_code == 404:
+        return (
+            "YouTube側で対象が見つかりませんでした。"
+            "カテゴリー検索の場合は、別カテゴリーまたはキーワード検索を試してください。"
+        )
+    if status_code == 403 and reason in {"quotaExceeded", "dailyLimitExceeded", "rateLimitExceeded"}:
+        return "YouTube APIの上限に達している可能性があります。時間を置くか、取得件数を減らしてください。"
+    if status_code == 400:
+        return "YouTube APIの検索条件が正しくありません。キーワードやカテゴリーを変えて再度試してください。"
+    return f"YouTube APIエラー: HTTP {status_code} {message[:220]}"
+
+
 def youtube_api_get(path: str, params: dict[str, str | int]) -> dict:
     api_key = get_secret("YOUTUBE_API_KEY", "")
     if not api_key:
@@ -3142,12 +3173,15 @@ def youtube_api_get(path: str, params: dict[str, str | int]) -> dict:
     url = f"https://www.googleapis.com/youtube/v3/{path}?{query}"
     try:
         with urllib.request.urlopen(url, timeout=30) as response:
-            import json
-
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"YouTube APIエラー: {exc.code} {detail[:300]}") from exc
+        message = youtube_api_error_message(exc.code, detail)
+        if exc.code == 404:
+            raise YouTubeApiNotFoundError(message) from exc
+        raise RuntimeError(message) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"YouTube APIに接続できませんでした: {exc.reason}") from exc
 
 
 def save_candidate(candidate: dict, keyword: str) -> bool:
@@ -3201,17 +3235,20 @@ def search_youtube_channels(
         checked_pages += 1
         if search_mode == "カテゴリー":
             units_used += 1
-            video_data = youtube_api_get(
-                "videos",
-                {
-                    "part": "snippet",
-                    "chart": "mostPopular",
-                    "regionCode": "JP",
-                    "videoCategoryId": category_id,
-                    "maxResults": min(50, max_results - found),
-                    "pageToken": page_token,
-                },
-            )
+            try:
+                video_data = youtube_api_get(
+                    "videos",
+                    {
+                        "part": "snippet",
+                        "chart": "mostPopular",
+                        "regionCode": "JP",
+                        "videoCategoryId": category_id,
+                        "maxResults": min(50, max_results - found),
+                        "pageToken": page_token,
+                    },
+                )
+            except YouTubeApiNotFoundError:
+                break
             keyword_filter = keyword.strip().lower()
             raw_channel_ids = []
             for item in video_data.get("items", []):
@@ -3238,10 +3275,13 @@ def search_youtube_channels(
                 "type": "channel",
                 "q": keyword,
             }
-            search_data = youtube_api_get(
-                "search",
-                search_params,
-            )
+            try:
+                search_data = youtube_api_get(
+                    "search",
+                    search_params,
+                )
+            except YouTubeApiNotFoundError:
+                break
             raw_channel_ids = [
                 item["snippet"]["channelId"]
                 for item in search_data.get("items", [])
@@ -3256,14 +3296,19 @@ def search_youtube_channels(
             break
 
         units_used += 1
-        channel_data = youtube_api_get(
-            "channels",
-            {
-                "part": "snippet,statistics",
-                "id": ",".join(channel_ids),
-                "maxResults": 50,
-            },
-        )
+        try:
+            channel_data = youtube_api_get(
+                "channels",
+                {
+                    "part": "snippet,statistics",
+                    "id": ",".join(channel_ids),
+                    "maxResults": 50,
+                },
+            )
+        except YouTubeApiNotFoundError:
+            if page_token:
+                continue
+            break
 
         for item in channel_data.get("items", []):
             stats = item.get("statistics", {})
@@ -5672,7 +5717,13 @@ def main() -> None:
                         yt_category_id,
                         f"カテゴリー: {yt_category_name}" if yt_search_mode == "カテゴリー" else yt_keyword.strip(),
                     )
-                    st.success(f"{checked}件を確認し、新規候補を{saved}件保存しました。推定使用量: {units_used} units")
+                    if checked == 0:
+                        st.warning(
+                            "YouTube側で該当候補が見つかりませんでした。"
+                            "別カテゴリー、またはキーワード検索で再度試してください。"
+                        )
+                    else:
+                        st.success(f"{checked}件を確認し、新規候補を{saved}件保存しました。推定使用量: {units_used} units")
                 except Exception as exc:
                     st.error(str(exc))
 
