@@ -2540,17 +2540,21 @@ def save_campaign_template(name: str, subject: str, body: str) -> None:
         return
     existing = get_campaign_template(clean_name)
     if existing:
-        sort_order = int(existing["sort_order"])
+        execute(
+            """
+            update campaign_templates
+            set subject = ?, body = ?, updated_at = ?
+            where user_id = ? and id = ?
+            """,
+            (subject, body, now_iso(), current_user_id(), int(existing["id"])),
+        )
+        return
     else:
         max_order = rows(
             "select coalesce(max(sort_order), 0) as max_order from campaign_templates where user_id = ?",
             (current_user_id(),),
         )[0]["max_order"]
         sort_order = int(max_order) + 10
-    execute(
-        "delete from campaign_templates where user_id = ? and name = ?",
-        (current_user_id(), clean_name),
-    )
     execute(
         """
         insert into campaign_templates(user_id, name, sort_order, subject, body, updated_at)
@@ -6155,6 +6159,65 @@ def main() -> None:
                     delete_scenario(int(selected_scenario["id"]))
                     st.success(f"シナリオ「{selected_scenario_name}」を削除しました")
                     st.rerun()
+                if selected_scenario and selected_scenario_steps:
+                    st.divider()
+                    st.caption(
+                        "シナリオに組み込んだテンプレートを編集できます。"
+                        "ここで本文を直しても、シナリオIDとステップ番号は変わらないため、送信済み判定は引き継がれます。"
+                    )
+                    edit_step_options = [
+                        f"{step['step_number']}通目: {step['template_name']}"
+                        for step in selected_scenario_steps
+                    ]
+                    selected_edit_step_label = st.selectbox(
+                        "編集するステップ",
+                        edit_step_options,
+                        key=f"scenario_template_edit_step_{selected_scenario['id']}",
+                    )
+                    selected_edit_step = selected_scenario_steps[edit_step_options.index(selected_edit_step_label)]
+                    edit_template_name = str(selected_edit_step["template_name"] or "")
+                    edit_template = get_campaign_template(edit_template_name)
+                    if not edit_template:
+                        st.warning("このステップのテンプレートが見つかりません。テンプレートを選び直してシナリオを保存してください。")
+                    else:
+                        usage_count = sum(1 for step in rows(
+                            """
+                            select template_name
+                            from scenario_steps
+                            where user_id = ? and template_name = ?
+                            """,
+                            (current_user_id(), edit_template_name),
+                        ))
+                        st.text_input(
+                            "テンプレート名",
+                            value=edit_template_name,
+                            disabled=True,
+                            key=f"scenario_template_name_preview_{selected_scenario['id']}_{selected_edit_step['step_number']}",
+                        )
+                        if usage_count > 1:
+                            st.caption(f"このテンプレートは他のステップ/シナリオでも使われています。保存すると同じテンプレートを使う箇所にも反映されます。")
+                        edit_subject = st.text_input(
+                            "件名",
+                            value=str(edit_template["subject"] or ""),
+                            key=f"scenario_template_subject_{selected_scenario['id']}_{selected_edit_step['step_number']}_{edit_template['id']}",
+                        )
+                        edit_body = st.text_area(
+                            "本文",
+                            value=str(edit_template["body"] or ""),
+                            height=360,
+                            key=f"scenario_template_body_{selected_scenario['id']}_{selected_edit_step['step_number']}_{edit_template['id']}",
+                        )
+                        if st.button(
+                            "このステップのテンプレートを更新",
+                            key=f"save_scenario_step_template_{selected_scenario['id']}_{selected_edit_step['step_number']}_{edit_template['id']}",
+                            use_container_width=True,
+                        ):
+                            save_campaign_template(edit_template_name, edit_subject, edit_body)
+                            st.success(
+                                f"{selected_edit_step['step_number']}通目のテンプレートを更新しました。"
+                                "シナリオの送信済み判定キーは変えていません。"
+                            )
+                            st.rerun()
             if scenarios:
                 with st.expander("シナリオごとの成績"):
                     st.caption("シナリオを選ぶと、その中に入っている各テンプレートの送信成功・失敗・送信待ち・配信停止を確認できます。")
