@@ -2752,7 +2752,7 @@ def generate_ai_scenario(
 商品名:
 {product_name.strip()}
 
-誘導したいURL:
+アフィリエイトURL:
 {product_url.strip() or "未指定"}
 
 商品・商材情報:
@@ -6334,7 +6334,7 @@ def main() -> None:
                     key="ai_scenario_product_name",
                 )
                 ai_product_url = st.text_input(
-                    "誘導URL（任意）",
+                    "アフィリエイトURL（任意）",
                     placeholder="https://...",
                     key="ai_scenario_product_url",
                 )
