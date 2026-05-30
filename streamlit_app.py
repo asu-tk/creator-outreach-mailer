@@ -4114,7 +4114,7 @@ def send_email(to_email: str, subject: str, body: str) -> tuple[bool, str]:
 
 
 def post_send_queue_rows(queue_rows: list[dict]) -> None:
-    chunk_size = 100
+    chunk_size = 500
     for index in range(0, len(queue_rows), chunk_size):
         supabase_request(
             "POST",
@@ -4122,6 +4122,41 @@ def post_send_queue_rows(queue_rows: list[dict]) -> None:
             queue_rows[index : index + chunk_size],
             prefer="return=minimal",
         )
+
+
+def compact_error_message(error: object, limit: int = 500) -> str:
+    return re.sub(r"\s+", " ", str(error or "")).strip()[:limit]
+
+
+def supabase_exact_count(path: str) -> int:
+    config = supabase_config()
+    base_url = config["url"].rstrip("/")
+    url = f"{base_url}/rest/v1/{path.lstrip('/')}"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "apikey": config["service_role_key"],
+            "Authorization": f"Bearer {config['service_role_key']}",
+            "Content-Type": "application/json",
+            "Prefer": "count=exact",
+            "Range-Unit": "items",
+            "Range": "0-0",
+        },
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        content_range = str(response.headers.get("Content-Range") or "")
+    match = re.search(r"/(\d+|\*)$", content_range)
+    if not match or match.group(1) == "*":
+        return 0
+    return int(match.group(1))
+
+
+def count_send_queue_rows(job_id: str) -> int:
+    if not supabase_configured() or not str(job_id or "").strip():
+        return 0
+    query_job_id = urllib.parse.quote(str(job_id), safe="")
+    return supabase_exact_count(f"send_queue?job_id=eq.{query_job_id}&select=id")
 
 
 def send_queue_has_rows(job_id: str) -> bool:
@@ -4133,6 +4168,63 @@ def send_queue_has_rows(job_id: str) -> bool:
         f"send_queue?job_id=eq.{query_job_id}&select=id&limit=1",
     )
     return bool(isinstance(result, list) and result)
+
+
+def mark_send_job_failed(job_id: str, error_message: str = "") -> None:
+    if not supabase_configured() or not str(job_id or "").strip():
+        return
+    query_job_id = urllib.parse.quote(str(job_id), safe="")
+    try:
+        supabase_request(
+            "DELETE",
+            f"send_queue?job_id=eq.{query_job_id}",
+            prefer="return=minimal",
+        )
+    except Exception:
+        pass
+    try:
+        payload = {"status": "failed", "updated_at": now_iso()}
+        supabase_request(
+            "PATCH",
+            f"send_jobs?id=eq.{query_job_id}",
+            payload,
+            prefer="return=minimal",
+        )
+    except Exception as exc:
+        print(f"[send queue] failed-job-mark-error job={job_id} error={compact_error_message(exc)}", flush=True)
+    if error_message:
+        print(f"[send queue] failed-job job={job_id} error={compact_error_message(error_message)}", flush=True)
+
+
+def finalize_send_queue_creation(job_id: str, queue_rows: list[dict]) -> tuple[bool, str]:
+    if not queue_rows:
+        mark_send_job_failed(job_id, "send queue is empty")
+        return False, "送信予約の中身が空です。宛先とシナリオ設定を確認してください。"
+    try:
+        post_send_queue_rows(queue_rows)
+        expected_count = len(queue_rows)
+        created_count = count_send_queue_rows(job_id)
+        if created_count != expected_count:
+            mark_send_job_failed(job_id, f"send queue count mismatch: expected={expected_count} actual={created_count}")
+            return (
+                False,
+                f"送信予約の中身を保存しきれませんでした（{created_count:,}/{expected_count:,}通）。"
+                "中途半端な予約は失敗扱いにしました。もう一度予約を作り直してください。",
+            )
+        supabase_request(
+            "PATCH",
+            f"send_jobs?id=eq.{urllib.parse.quote(str(job_id), safe='')}",
+            {"status": "queued", "total_count": created_count, "updated_at": now_iso()},
+            prefer="return=minimal",
+        )
+        return True, ""
+    except Exception as exc:
+        mark_send_job_failed(job_id, exc)
+        return (
+            False,
+            "送信予約の中身をクラウドへ保存できませんでした。中途半端な予約は失敗扱いにしました。"
+            f"理由: {compact_error_message(exc, 220)}",
+        )
 
 
 def insert_queued_send_rows(send_rows: list[tuple]) -> None:
@@ -4190,7 +4282,7 @@ def create_send_job(
         "smtp_pass": str(account.get("smtp_pass") or ""),
         "delay_seconds": int(delay_seconds),
         "total_count": len(contacts),
-        "status": "queued",
+        "status": "creating",
         "updated_at": now_iso(),
     }
     created_job = supabase_request("POST", "send_jobs", job_payload, prefer="return=representation")
@@ -4229,16 +4321,9 @@ def create_send_job(
                 "scheduled_at": schedule_times[index].isoformat(),
             }
         )
-    if queue_rows:
-        post_send_queue_rows(queue_rows)
-        if not send_queue_has_rows(str(job_id)):
-            supabase_request(
-                "PATCH",
-                f"send_jobs?id=eq.{urllib.parse.quote(str(job_id), safe='')}",
-                {"status": "failed", "updated_at": now_iso()},
-                prefer="return=minimal",
-            )
-            return False, "送信予約の中身をクラウドへ保存できませんでした。もう一度予約を作り直してください。"
+    ok, queue_message = finalize_send_queue_creation(str(job_id), queue_rows)
+    if not ok:
+        return False, queue_message
     queued_at = now_iso()
     insert_queued_send_rows(
         [
@@ -4330,7 +4415,7 @@ def create_scenario_full_send_job(
         "smtp_pass": str(account.get("smtp_pass") or ""),
         "delay_seconds": int(delay_seconds),
         "total_count": total_count,
-        "status": "queued",
+        "status": "creating",
         "updated_at": now_iso(),
     }
     created_job = supabase_request("POST", "send_jobs", job_payload, prefer="return=representation")
@@ -4388,16 +4473,9 @@ def create_scenario_full_send_job(
                 )
             )
 
-    if queue_rows:
-        post_send_queue_rows(queue_rows)
-        if not send_queue_has_rows(job_id):
-            supabase_request(
-                "PATCH",
-                f"send_jobs?id=eq.{urllib.parse.quote(job_id, safe='')}",
-                {"status": "failed", "updated_at": now_iso()},
-                prefer="return=minimal",
-            )
-            return False, "送信予約の中身をクラウドへ保存できませんでした。もう一度予約を作り直してください。"
+    ok, queue_message = finalize_send_queue_creation(job_id, queue_rows)
+    if not ok:
+        return False, queue_message
     insert_queued_send_rows(local_rows)
     return True, f"{len(contacts)}件の宛先に、{len(prepared_steps)}ステップ分（合計{total_count}通）の送信予約を作成しました"
 
@@ -4599,6 +4677,7 @@ def send_job_status_label(status: str) -> str:
     return {
         "queued": "送信待ち",
         "pending": "送信待ち",
+        "creating": "予約作成中",
         "sending": "送信中",
         "running": "送信中",
         "processing": "送信中",
@@ -7954,7 +8033,7 @@ def main() -> None:
                 type="primary",
                 width="stretch",
             )
-        st.info("送信予約を作成すると、送信処理はサーバー側で進みます。予約後はこのタブを閉じても、パソコンの電源を切っても、設定した間隔で送信が続きます。進捗は「最近の送信予約」で確認できます。すべて完了すると、ログイン中のGoogleメールアドレスに完了メールが届きます。")
+        st.info("送信予約を作成すると、送信キューに保存して予定時刻順に処理します。この画面を開いている間は30秒ごとに1通ずつ進めます。サーバー側の定期実行が有効な場合は、タブを閉じても送信が続きます。進捗は「シナリオ・送信予約の進捗」で確認できます。")
 
         if run_test or run_all:
             preflight_errors = []
@@ -8016,7 +8095,7 @@ def main() -> None:
                         )
                     if ok:
                         st.success(message)
-                        st.caption("送信予約はサーバー側で処理されます。タブやPCを閉じても、定期実行が有効なら送信が続きます。")
+                        st.caption("この画面を開いている間は、予定時刻を過ぎた送信待ちを30秒ごとに1通ずつ処理します。")
                     else:
                         st.error(message)
                 else:
