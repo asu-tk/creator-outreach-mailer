@@ -4037,11 +4037,6 @@ def queue_google_contacts_url_import() -> None:
     st.session_state["google_contacts_url"] = ""
 
 
-def queue_outsource_google_url_import() -> None:
-    st.session_state["pending_outsource_google_url"] = str(st.session_state.get("outsource_google_url", "")).strip()
-    st.session_state["outsource_google_url"] = ""
-
-
 def main() -> None:
     st.set_page_config(page_title="Creator Outreach Mailer", layout="wide")
     init_db()
@@ -5472,19 +5467,14 @@ def main() -> None:
                 disabled=candidates.empty,
             )
 
-        outsource_google_url = st.text_input(
-            "今回取り込むGoogleスプレッドシートURL",
-            placeholder="空欄なら登録済みの外注用Googleシートを取り込みます",
-            key="outsource_google_url",
-        )
         if st.button(
-            "外注シートから宛先一覧へ取り込む",
+            "外注用GoogleスプレッドシートURLから宛先一覧へ取り込む",
             key="import_outsource_google_url",
             use_container_width=True,
-            disabled=not (outsource_google_url.strip() or active_outsource_url),
-            on_click=queue_outsource_google_url_import,
+            disabled=not active_outsource_url.startswith("http"),
         ):
-            target_outsource_url = str(st.session_state.pop("pending_outsource_google_url", "")).strip() or active_outsource_url
+            target_outsource_url = active_outsource_url.strip()
+            save_setting("OUTSOURCE_SPREADSHEET_URL", target_outsource_url)
             try:
                 added, skipped, mapping, source_type = import_contacts_google_url(target_outsource_url)
                 st.success(f"{source_type}から{added}件を宛先一覧へ取り込みました。重複や空欄は{skipped}件スキップしました。")
