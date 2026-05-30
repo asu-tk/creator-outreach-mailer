@@ -3622,6 +3622,22 @@ def estimate_send_days(send_count: int, daily_capacity: int) -> int:
     return math.ceil(int(send_count) / int(daily_capacity))
 
 
+def looks_like_email_address(value: str) -> bool:
+    return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", value.strip()))
+
+
+def mask_email_address(value: str) -> str:
+    email = value.strip()
+    if "@" not in email:
+        return email
+    local, domain = email.split("@", 1)
+    if len(local) <= 2:
+        masked_local = local[:1] + "***"
+    else:
+        masked_local = local[:2] + "***"
+    return f"{masked_local}@{domain}"
+
+
 def format_local_datetime(value: datetime) -> str:
     return value.astimezone(APP_TIMEZONE).strftime("%Y-%m-%d %H:%M")
 
@@ -6569,9 +6585,28 @@ def main() -> None:
                     use_container_width=True,
                 )
 
+        if "test_email_input" not in st.session_state:
+            st.session_state["test_email_input"] = get_setting("TEST_EMAIL_ADDRESS", "")
+        with st.expander("テスト送信", expanded=False):
+            show_test_email = st.checkbox("テストメールアドレスを表示する", key="show_test_email_address")
+            test_email_address = st.text_input(
+                "テストメールアドレス",
+                key="test_email_input",
+                type="default" if show_test_email else "password",
+                placeholder="自分の確認用メールアドレス",
+            ).strip()
+            st.caption(
+                "本番の宛先には送りません。送信対象の先頭1件を差し込み例として使い、"
+                "ここに入力したテストメールアドレスへ1通だけ送ります。"
+            )
+
         test_button, send_button = st.columns(2)
         with test_button:
-            run_test = st.button("最初の1件でテスト", use_container_width=True)
+            run_test = st.button(
+                "テストメールアドレスに1通送る",
+                use_container_width=True,
+                disabled=not test_email_address,
+            )
         with send_button:
             run_all = st.button("指定件数を送信予約", type="primary", use_container_width=True)
         st.info("送信予約を作成すると、送信処理はサーバー側で進みます。予約後はこのタブを閉じても、パソコンの電源を切っても、設定した間隔で送信が続きます。進捗は「最近の送信予約」で確認できます。すべて完了すると、ログイン中のGoogleメールアドレスに完了メールが届きます。")
@@ -6584,7 +6619,9 @@ def main() -> None:
                 preflight_errors.append("送信元メール設定が未完了です。SMTPサーバー、ポート、送信元メールアドレス、SMTPパスワードを確認してください。")
             if send_window_end <= send_window_start:
                 preflight_errors.append("メールを送ってよい時間は、「この時間まで」を「この時間から」より後にしてください。")
-            if not confirmed:
+            if run_test and not looks_like_email_address(test_email_address):
+                preflight_errors.append("テストメールアドレスを正しく入力してください。")
+            if run_all and not confirmed:
                 preflight_errors.append("送信前の確認にチェックしてください。これは、送信対象が許諾済み、または法的に送信可能な宛先であることを確認するためのチェックです。")
             if run_all and not final_confirmed:
                 preflight_errors.append("送信前の最終確認にチェックしてください。")
@@ -6595,15 +6632,13 @@ def main() -> None:
                     save_setting("CURRENT_CAMPAIGN_NAME", campaign_name.strip())
                 contacts = fetch_next_send_contacts(
                     current_campaign_key,
-                    int(send_limit),
+                    1 if run_test else int(send_limit),
                     prerequisite_campaign_keys,
                     later_step_campaign_keys,
                     0,
                     unsubscribe_scope,
                     unsubscribe_scope_key,
                 )
-                if run_test:
-                    contacts = contacts[:1]
 
                 if not contacts:
                     st.error("送信できる宛先がありません。宛先一覧、送信済み状況、配信名を確認してください。")
@@ -6627,58 +6662,22 @@ def main() -> None:
                     else:
                         st.error(message)
                 else:
-                    progress = st.progress(0)
-                    log = st.empty()
-                    sent = failed = 0
-                    failed_contacts = []
-                    user_email = current_user_profile()["email"].strip().lower() or current_user_id()
-                    for index, contact in enumerate(contacts):
-                        register_unsubscribe_token(contact, user_email)
-                        unsubscribe_url = build_unsubscribe_url(
-                            contact,
-                            unsubscribe_scope,
-                            unsubscribe_scope_key,
-                            unsubscribe_scope_label,
-                        )
-                        unsubscribe_all_url = build_global_unsubscribe_url(contact)
-                        subject = render_template(effective_subject_template, contact, unsubscribe_url)
-                        body = render_template(
-                            ensure_unsubscribe_link_template(effective_body_template),
-                            contact,
-                            unsubscribe_url,
-                            unsubscribe_all_url,
-                        )
-                        ok, result = send_email(contact["email"], subject, body)
-                        execute(
-                            "insert into sends(user_id, contact_id, campaign_key, subject, status, error, sent_at) values (?, ?, ?, ?, ?, ?, ?)",
-                            (current_user_id(), contact["id"], current_campaign_key, subject, "sent" if ok else "failed", "" if ok else result, now_iso()),
-                        )
-                        sent += 1 if ok else 0
-                        failed += 0 if ok else 1
-                        if not ok:
-                            failed_contacts.append(
-                                {
-                                    "id": int(contact["id"]),
-                                    "email": contact["email"],
-                                    "channel": contact["channel"],
-                                    "error": result,
-                                }
-                            )
-                        progress.progress((index + 1) / max(len(contacts), 1))
-                        log.write(f"{index + 1}/{len(contacts)}: {contact['email']} - {result}")
-
-                    st.success(f"処理完了: 成功 {sent} 件 / 失敗 {failed} 件")
-                    if failed_contacts:
-                        st.error("以下のメールアドレスに送信できませんでした。")
-                        for item in failed_contacts:
-                            columns = st.columns([2.0, 1.6, 3.0, 1.2])
-                            columns[0].write(item["email"])
-                            columns[1].write(item["channel"] or "-")
-                            columns[2].write(item["error"])
-                            if columns[3].button("削除して今後取り込まない", key=f"block_failed_{item['id']}"):
-                                delete_contact(item["id"], block=True, reason="送信失敗")
-                                st.success(f"{item['email']} を削除し、再取り込みしないようにしました")
-                                st.rerun()
+                    contact = contacts[0]
+                    test_unsubscribe_url = "https://example.com/test-unsubscribe"
+                    subject = render_template(effective_subject_template, contact, test_unsubscribe_url)
+                    body = render_template(
+                        ensure_unsubscribe_link_template(effective_body_template),
+                        contact,
+                        test_unsubscribe_url,
+                        test_unsubscribe_url,
+                    )
+                    ok, result = send_email(test_email_address, subject, body)
+                    if ok:
+                        save_setting("TEST_EMAIL_ADDRESS", test_email_address)
+                        st.success(f"{mask_email_address(test_email_address)} にテストメールを1通送信しました。")
+                        st.caption("テスト送信は本番の送信ログに残さず、宛先一覧の送信済み状態も変更しません。")
+                    else:
+                        st.error(result)
 
     query = st.query_params
     token = query.get("unsubscribe_token") or query.get("token")
