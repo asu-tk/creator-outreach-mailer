@@ -2967,16 +2967,22 @@ def fetch_scenario_steps(scenario_id: int) -> list[sqlite3.Row]:
     )
 
 
-def fetch_template_names_used_in_scenarios() -> set[str]:
+def fetch_template_names_used_in_scenarios(exclude_scenario_id: int | None = None) -> set[str]:
+    params: list[object] = [current_user_id()]
+    exclude_clause = ""
+    if exclude_scenario_id is not None:
+        exclude_clause = "and scenario_id != ?"
+        params.append(int(exclude_scenario_id))
     return {
         str(row["template_name"]).strip()
         for row in rows(
-            """
+            f"""
             select distinct template_name
             from scenario_steps
             where user_id = ? and template_name != ''
+            {exclude_clause}
             """,
-            (current_user_id(),),
+            tuple(params),
         )
         if str(row["template_name"]).strip()
     }
@@ -7002,6 +7008,20 @@ def main() -> None:
                     selected_scenario = next((scenario for scenario in scenarios if scenario["name"] == selected_scenario_name), None)
                     if selected_scenario:
                         selected_scenario_steps = fetch_scenario_steps(int(selected_scenario["id"]))
+                used_template_names = fetch_template_names_used_in_scenarios(
+                    int(selected_scenario["id"]) if selected_scenario else None
+                )
+                selectable_template_names = [
+                    template_name
+                    for template_name in template_names
+                    if template_name not in used_template_names
+                ]
+                if selected_scenario:
+                    st.caption("他のシナリオで使われているテンプレートは候補から外しています。")
+                elif used_template_names:
+                    st.caption("すでに他のシナリオで使われているテンプレートは候補に出ません。")
+                if not selectable_template_names:
+                    st.info("未使用のテンプレートがありません。新しいテンプレートを作るか、既存シナリオから外してから選んでください。")
                 scenario_name_input = st.text_input(
                     "シナリオ名",
                     value=selected_scenario["name"] if selected_scenario else "",
@@ -7019,10 +7039,13 @@ def main() -> None:
                 step_values = []
                 for step_number in range(1, step_count + 1):
                     default_template = existing_step_map.get(step_number, "")
-                    default_index = template_names.index(default_template) + 1 if default_template in template_names else 0
+                    step_options = selectable_template_names
+                    if default_template and default_template not in step_options:
+                        step_options = [default_template] + step_options
+                    default_index = step_options.index(default_template) + 1 if default_template in step_options else 0
                     step_template = st.selectbox(
                         f"{step_number}通目",
-                        ["使わない"] + template_names,
+                        ["使わない"] + step_options,
                         index=default_index,
                         key=f"scenario_step_{selected_scenario_name}_{step_number}",
                     )
