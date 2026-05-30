@@ -4897,7 +4897,7 @@ def main() -> None:
                 st.text_input("プレビュー件名", value=preview_subject, disabled=True)
                 st.text_area("プレビュー本文", value=preview_body, height=260, disabled=True)
 
-        with st.expander("送信前の最終確認", expanded=True):
+        with st.expander("送信前の最終確認", expanded=False):
             account = active_smtp_account()
             sender_label = smtp_mail_from(account).strip() or "未設定"
             finish_label = "-"
