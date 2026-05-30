@@ -673,22 +673,32 @@ def require_login() -> bool:
         return True
     manual_user = st.session_state.get("google_user")
     if manual_user:
-        col1, col2 = st.columns([3, 1])
-        col1.caption(f"ログイン中: {manual_user.get('email', 'unknown')}")
-        if col2.button("ログアウト"):
-            st.session_state.pop("google_user", None)
-            st.rerun()
         return True
     if st.user.is_logged_in:
-        col1, col2 = st.columns([3, 1])
-        col1.caption(f"ログイン中: {st.user.get('email', 'unknown')}")
-        if col2.button("ログアウト"):
-            st.logout()
         return True
     st.title("Creator Outreach Mailer")
     st.write("このアプリを使うにはGoogleログインが必要です。")
     st.link_button("Googleでログイン", build_google_login_url())
     st.stop()
+
+
+def render_login_status_bar() -> None:
+    if not auth_is_configured() or current_user_id() == "local-user":
+        return
+    profile = current_user_profile()
+    email = profile.get("email", "").strip() or current_user_id()
+    email_col, logout_col, spacer_col = st.columns([2.1, 0.8, 5.0])
+    email_col.caption(f"ログイン中: {email}")
+    if "google_user" in st.session_state:
+        if logout_col.button("ログアウト", key="logout_manual_user", use_container_width=True):
+            st.session_state.pop("google_user", None)
+            st.rerun()
+        return
+    try:
+        if st.user.is_logged_in and logout_col.button("ログアウト", key="logout_streamlit_user", use_container_width=True):
+            st.logout()
+    except Exception:
+        spacer_col.empty()
 
 
 def inject_loading_indicator() -> None:
@@ -5440,6 +5450,7 @@ def main() -> None:
 
     st.title("Creator Outreach Mailer")
     st.caption("許諾済みの宛先だけに、1件ずつ送信する個人用Webアプリ")
+    render_login_status_bar()
     render_app_state_sync_panel()
 
     if smtp_configured():
