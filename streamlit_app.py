@@ -24,7 +24,6 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 
 try:
     from streamlit_sortables import sort_items
@@ -691,12 +690,12 @@ def render_login_status_bar() -> None:
     email_col, logout_col, spacer_col = st.columns([2.1, 0.8, 5.0])
     email_col.caption(f"ログイン中: {email}")
     if "google_user" in st.session_state:
-        if logout_col.button("ログアウト", key="logout_manual_user", use_container_width=True):
+        if logout_col.button("ログアウト", key="logout_manual_user", width="stretch"):
             st.session_state.pop("google_user", None)
             st.rerun()
         return
     try:
-        if st.user.is_logged_in and logout_col.button("ログアウト", key="logout_streamlit_user", use_container_width=True):
+        if st.user.is_logged_in and logout_col.button("ログアウト", key="logout_streamlit_user", width="stretch"):
             st.logout()
     except Exception:
         spacer_col.empty()
@@ -749,7 +748,7 @@ def render_readonly_mail_body(label: str, text: str, min_height: int = 380) -> N
 
 
 def inject_loading_indicator() -> None:
-    components.html(
+    st.iframe(
         """
         <script>
         (() => {
@@ -2309,7 +2308,7 @@ def render_app_state_sync_panel() -> None:
         else:
             status_col.caption("まだこの画面では保存確認ができていません。")
 
-        if button_col.button("現在のデータを保存", key="manual_save_app_state", use_container_width=True):
+        if button_col.button("現在のデータを保存", key="manual_save_app_state", width="stretch"):
             save_app_state_to_supabase()
             if "_last_app_state_save_error" in st.session_state:
                 st.error("Supabaseへの保存に失敗しました。設定や通信状態を確認してください。")
@@ -2617,6 +2616,32 @@ def openai_api_key() -> str:
 
 def openai_model() -> str:
     return get_nested_secret("openai", "model") or read_secret("OPENAI_MODEL") or "gpt-5.5"
+
+
+def set_ai_scenario_status(status: str, message: str = "", detail: str = "") -> None:
+    st.session_state["ai_scenario_last_status"] = {
+        "status": str(status or "").strip(),
+        "message": str(message or "").strip(),
+        "detail": str(detail or "").strip(),
+        "at": now_iso(),
+    }
+
+
+def ai_scenario_status_label(status: str) -> str:
+    labels = {
+        "idle": "待機中",
+        "running": "生成中",
+        "generated": "生成済み・未保存",
+        "saved": "保存済み",
+        "failed": "エラー",
+    }
+    return labels.get(str(status or "").strip(), "未確認")
+
+
+def log_ai_scenario_event(event: str, detail: str = "") -> None:
+    safe_detail = re.sub(r"\s+", " ", str(detail or "")).strip()[:300]
+    suffix = f" {safe_detail}" if safe_detail else ""
+    print(f"[AI scenario] {event}{suffix}", flush=True)
 
 
 def ai_scenario_schema() -> dict:
@@ -5553,7 +5578,7 @@ def settings_panel() -> None:
         selected_account_id = 0
         if selected_account != "新しく作る":
             selected_account_id = account_ids[options.index(selected_account) - 1]
-        if load_col.button("読み込む", key="load_smtp_account", use_container_width=True, disabled=selected_account_id == 0):
+        if load_col.button("読み込む", key="load_smtp_account", width="stretch", disabled=selected_account_id == 0):
             account = get_smtp_account(selected_account_id)
             if account:
                 st.session_state["smtp_account_id_input"] = int(account["id"])
@@ -5590,7 +5615,7 @@ def settings_panel() -> None:
             placeholder="保存済み" if has_password else "Gmailの場合はアプリパスワード",
         )
 
-        if save_col.button("保存 / 更新", key="save_smtp_account", use_container_width=True):
+        if save_col.button("保存 / 更新", key="save_smtp_account", width="stretch"):
             if not sender_email.strip():
                 st.error("送信元メールアドレスを入力してください")
             else:
@@ -5609,7 +5634,7 @@ def settings_panel() -> None:
                 st.success(f"保存しました。相手には {smtp_mail_from(active_smtp_account())} から届きます。")
                 st.rerun()
 
-        if delete_col.button("削除", key="delete_smtp_account", use_container_width=True, disabled=selected_account_id == 0):
+        if delete_col.button("削除", key="delete_smtp_account", width="stretch", disabled=selected_account_id == 0):
             delete_smtp_account(selected_account_id)
             st.success("送信元設定を削除しました")
             st.rerun()
@@ -6098,7 +6123,7 @@ def render_outsource_import_history_panel() -> None:
             return
 
         display_history = outsource_import_history_display_frame(history)
-        st.dataframe(display_history, use_container_width=True, hide_index=True, height=240)
+        st.dataframe(display_history, width="stretch", hide_index=True, height=240)
         export_name = datetime.now(APP_TIMEZONE).strftime("outsource_import_history_%Y%m%d_%H%M")
         history_csv_col, history_xlsx_col = st.columns(2)
         history_csv_col.download_button(
@@ -6106,14 +6131,14 @@ def render_outsource_import_history_panel() -> None:
             data=display_history.to_csv(index=False).encode("utf-8-sig"),
             file_name=f"{export_name}.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
         history_xlsx_col.download_button(
             "履歴Excelをダウンロード",
             data=dataframe_to_xlsx(display_history, "外注取り込み履歴"),
             file_name=f"{export_name}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
+            width="stretch",
         )
 
         records = history.to_dict("records")
@@ -6204,7 +6229,7 @@ def render_outsource_import_history_panel() -> None:
         if save_receipt_col.button(
             "領収書情報を保存",
             key=f"save_outsource_receipt_{record_id}",
-            use_container_width=True,
+            width="stretch",
         ):
             save_setting("OUTSOURCE_DEFAULT_WORKER_NAME", worker_name.strip())
             save_setting("OUTSOURCE_DEFAULT_UNIT_PRICE_YEN", str(int(unit_price)))
@@ -6224,7 +6249,7 @@ def render_outsource_import_history_panel() -> None:
             data=receipt_html.encode("utf-8-sig"),
             file_name=outsource_receipt_file_name(record_id, issue_date),
             mime="text/html",
-            use_container_width=True,
+            width="stretch",
         )
 
 
@@ -6302,7 +6327,7 @@ def main() -> None:
         if restore_email:
             st.info(f"{restore_email} を宛先一覧に戻しますか？")
             restore_yes_col, restore_no_col = st.columns(2)
-            if restore_yes_col.button("はい、再登録する", key="confirm_restore_blocked_email", use_container_width=True):
+            if restore_yes_col.button("はい、再登録する", key="confirm_restore_blocked_email", width="stretch"):
                 unblock_target(restore_email)
                 restored = add_contact(
                     restore_email,
@@ -6316,7 +6341,7 @@ def main() -> None:
                     st.rerun()
                 else:
                     st.error("再登録できませんでした。すでに宛先一覧にある可能性があります。")
-            if restore_no_col.button("いいえ、戻さない", key="cancel_restore_blocked_email", use_container_width=True):
+            if restore_no_col.button("いいえ、戻さない", key="cancel_restore_blocked_email", width="stretch"):
                 st.session_state["restore_blocked_email"] = ""
                 st.rerun()
 
@@ -6352,7 +6377,7 @@ def main() -> None:
             if st.button(
                 "URLから取り込む",
                 key="import_google_contacts_url",
-                use_container_width=True,
+                width="stretch",
                 disabled=not google_contacts_url.strip(),
                 on_click=queue_google_contacts_url_import,
             ):
@@ -6484,22 +6509,22 @@ def main() -> None:
                 st.info("保存済み配信はまだありません。新しいテンプレートを作成してください。")
         st.caption("保存済みのテンプレートを選んで「読み込む」と、下の件名・本文に反映されます。シナリオに含まれるテンプレートは通常配信側では非表示になります。")
         load_col, new_col, save_col, delete_col = st.columns(4)
-        if load_col.button("読み込む", key="load_campaign_template", use_container_width=True, disabled=not selected_template):
+        if load_col.button("読み込む", key="load_campaign_template", width="stretch", disabled=not selected_template):
             if load_campaign_template_into_session(selected_template):
                 save_setting("CURRENT_CAMPAIGN_NAME", selected_template)
                 st.success(f"{selected_template} を読み込みました")
-        if new_col.button("新しいテンプレートを作る", key="new_campaign_template", use_container_width=True):
+        if new_col.button("新しいテンプレートを作る", key="new_campaign_template", width="stretch"):
             reset_campaign_template_session("", "", "")
             save_setting("CURRENT_CAMPAIGN_NAME", "")
             st.session_state["confirm_delete_campaign_template"] = ""
             st.success("新しいテンプレートを作成できます。配信名、件名、本文を入力して保存してください。")
-        if delete_col.button("このテンプレートを削除", key="delete_campaign_template", use_container_width=True, disabled=not selected_template):
+        if delete_col.button("このテンプレートを削除", key="delete_campaign_template", width="stretch", disabled=not selected_template):
             st.session_state["confirm_delete_campaign_template"] = selected_template
         pending_delete_template = st.session_state.get("confirm_delete_campaign_template", "")
         if pending_delete_template:
             st.warning(f"配信テンプレート「{pending_delete_template}」を削除しますか？この操作は元に戻せません。")
             confirm_delete_col, cancel_delete_col = st.columns(2)
-            if confirm_delete_col.button("はい、削除する", key="confirm_delete_campaign_template_yes", use_container_width=True):
+            if confirm_delete_col.button("はい、削除する", key="confirm_delete_campaign_template_yes", width="stretch"):
                 delete_campaign_template(pending_delete_template)
                 st.session_state["confirm_delete_campaign_template"] = ""
                 remaining_templates = fetch_campaign_templates()
@@ -6512,7 +6537,7 @@ def main() -> None:
                     reset_campaign_template_session("", "", "")
                 st.success(f"{pending_delete_template} を削除しました")
                 st.rerun()
-            if cancel_delete_col.button("いいえ、削除しない", key="confirm_delete_campaign_template_no", use_container_width=True):
+            if cancel_delete_col.button("いいえ、削除しない", key="confirm_delete_campaign_template_no", width="stretch"):
                 st.session_state["confirm_delete_campaign_template"] = ""
                 st.rerun()
         if len(template_names) > 1:
@@ -6550,7 +6575,7 @@ def main() -> None:
                         custom_style=vertical_sort_style,
                     )
                     if sorted_template_names != template_names:
-                        if st.button("この順番で保存", use_container_width=True):
+                        if st.button("この順番で保存", width="stretch"):
                             save_campaign_template_order(sorted_template_names)
                             st.success("並び順を保存しました")
                             st.rerun()
@@ -6563,7 +6588,7 @@ def main() -> None:
                 if normal_template_names:
                     st.dataframe(
                         fetch_campaign_template_stats(normal_template_names),
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=True,
                     )
                 else:
@@ -6572,12 +6597,38 @@ def main() -> None:
             st.session_state.get("ai_generated_scenario")
         )
         ai_scenario_notice = st.session_state.pop("ai_scenario_notice", "")
-        with st.expander("AIシナリオ作成", expanded=bool(ai_generated_pending or ai_scenario_notice)):
+        ai_scenario_last_status = st.session_state.get("ai_scenario_last_status")
+        ai_scenario_status_value = ""
+        if isinstance(ai_scenario_last_status, dict):
+            ai_scenario_status_value = str(ai_scenario_last_status.get("status") or "").strip()
+        with st.expander(
+            "AIシナリオ作成",
+            expanded=bool(ai_generated_pending or ai_scenario_notice or ai_scenario_status_value in {"failed", "generated", "running"}),
+        ):
             st.caption("商品写真、ASP紹介文、ペルソナ情報からステップ配信用の下書きを作ります。生成後に件名・本文を確認してから保存できます。")
             st.caption(f"生成ボタンを押した時だけOpenAI APIを呼びます。使用モデル: {openai_model()}")
             if ai_scenario_notice:
                 st.success(ai_scenario_notice)
             st.info("AIで作成しただけでは登録されません。生成結果を確認して、最後に「この内容でテンプレートとシナリオに保存」を押すと保存されます。")
+            ai_scenario_last_status = st.session_state.get("ai_scenario_last_status")
+            if isinstance(ai_scenario_last_status, dict):
+                status_value = str(ai_scenario_last_status.get("status") or "").strip()
+                status_at = format_jst_datetime(str(ai_scenario_last_status.get("at") or "")) or "-"
+                status_message = str(ai_scenario_last_status.get("message") or "").strip()
+                status_detail = str(ai_scenario_last_status.get("detail") or "").strip()
+                status_text = f"直近のAI生成: {ai_scenario_status_label(status_value)}（{status_at}）"
+                if status_message:
+                    status_text = f"{status_text}\n\n{status_message}"
+                if status_value == "failed":
+                    st.error(status_text)
+                    if status_detail:
+                        st.caption(f"理由: {status_detail[:500]}")
+                elif status_value == "generated":
+                    st.warning(status_text)
+                elif status_value == "saved":
+                    st.success(status_text)
+                elif status_value == "running":
+                    st.info(status_text)
             if not openai_api_key():
                 st.warning("AI生成を使うには、Streamlit SecretsにOpenAI APIキーを追加してください。")
                 st.code(
@@ -6653,13 +6704,21 @@ def main() -> None:
                 disabled=generate_disabled,
             ):
                 if not ai_requested_scenario_name.strip():
+                    set_ai_scenario_status("failed", "AI生成を開始できませんでした。", "シナリオ名を入力してください。")
                     st.error("シナリオ名を入力してください。")
                 elif not ai_product_name.strip():
+                    set_ai_scenario_status("failed", "AI生成を開始できませんでした。", "商品名を入力してください。")
                     st.error("商品名を入力してください。")
                 elif not ai_product_info.strip():
+                    set_ai_scenario_status("failed", "AI生成を開始できませんでした。", "商品説明・ASP紹介文を入力してください。")
                     st.error("商品説明・ASP紹介文を入力してください。")
                 else:
                     try:
+                        set_ai_scenario_status("running", "AIシナリオを生成中です。画面の読み込みが終わるまでお待ちください。")
+                        log_ai_scenario_event(
+                            "started",
+                            f"model={openai_model()} steps={int(ai_step_count)} image={'yes' if ai_product_image or ai_product_image_url.strip() else 'no'}",
+                        )
                         with st.spinner("AIがシナリオ案を作成しています..."):
                             generated_scenario = generate_ai_scenario(
                                 ai_requested_scenario_name,
@@ -6671,15 +6730,24 @@ def main() -> None:
                                 int(ai_step_count),
                                 ai_input_image_reference(ai_product_image, ai_product_image_url),
                             )
+                        generated_step_count = len(generated_scenario.get("steps") or [])
                         scenario_digest = hashlib.sha1(
                             json.dumps(generated_scenario, ensure_ascii=False, sort_keys=True).encode("utf-8")
                         ).hexdigest()[:10]
                         st.session_state["ai_generated_scenario"] = generated_scenario
                         st.session_state["ai_generated_scenario_token"] = scenario_digest
+                        set_ai_scenario_status(
+                            "generated",
+                            f"{generated_step_count}通のAIシナリオ案を作成しました。まだ保存されていません。",
+                        )
+                        log_ai_scenario_event("generated", f"model={openai_model()} steps={generated_step_count}")
                         st.session_state["ai_scenario_notice"] = "AIシナリオ案を作成しました。下の内容を確認してから保存してください。"
                         st.rerun()
                     except Exception as exc:
-                        st.error(str(exc))
+                        error_message = str(exc)
+                        set_ai_scenario_status("failed", "AIシナリオ作成に失敗しました。理由を確認してください。", error_message)
+                        log_ai_scenario_event("failed", error_message)
+                        st.error(error_message)
 
             generated_scenario = st.session_state.get("ai_generated_scenario")
             if isinstance(generated_scenario, dict) and generated_scenario:
@@ -6804,11 +6872,18 @@ def main() -> None:
                             save_campaign_template(template_name, subject, body)
                         saved_scenario_id = save_scenario(edited_scenario_name, edited_template_names)
                         if not saved_scenario_id:
+                            set_ai_scenario_status(
+                                "failed",
+                                "シナリオ保存に失敗しました。",
+                                "シナリオ名とテンプレート名を確認してください。",
+                            )
                             st.error("シナリオを保存できませんでした。シナリオ名とテンプレート名を確認してください。")
                         else:
                             st.session_state.pop("ai_generated_scenario", None)
                             st.session_state.pop("ai_generated_scenario_token", None)
                             st.session_state["scenario_editor_select"] = edited_scenario_name
+                            set_ai_scenario_status("saved", f"シナリオ「{edited_scenario_name}」を保存しました。")
+                            log_ai_scenario_event("saved", f"steps={len(edited_template_names)}")
                             st.session_state["ai_scenario_notice"] = f"シナリオ「{edited_scenario_name}」を保存しました。下のシナリオ設定に追加されています。"
                             st.rerun()
                 if clear_ai_col.button(
@@ -6818,6 +6893,7 @@ def main() -> None:
                 ):
                     st.session_state.pop("ai_generated_scenario", None)
                     st.session_state.pop("ai_generated_scenario_token", None)
+                    set_ai_scenario_status("idle", "生成結果を閉じました。")
                     st.rerun()
         if template_names:
             scenarios = fetch_scenarios()
@@ -6868,12 +6944,12 @@ def main() -> None:
                     if step_template != "使わない":
                         step_values.append(step_template)
                 add_step_col, step_note_col = st.columns([1.0, 2.0])
-                if add_step_col.button("ステップを追加", key=f"add_scenario_step_{selected_scenario_name}", use_container_width=True):
+                if add_step_col.button("ステップを追加", key=f"add_scenario_step_{selected_scenario_name}", width="stretch"):
                     st.session_state[step_count_key] = step_count + 1
                     st.rerun()
                 step_note_col.caption(f"現在 {step_count}通目まで表示しています。不要なステップは「使わない」のままで大丈夫です。")
                 scenario_save_col, scenario_delete_col = st.columns(2)
-                if scenario_save_col.button("シナリオを保存", key=f"save_scenario_{selected_scenario_name}", use_container_width=True):
+                if scenario_save_col.button("シナリオを保存", key=f"save_scenario_{selected_scenario_name}", width="stretch"):
                     if not scenario_name_input.strip():
                         st.error("シナリオ名を入力してください")
                     elif not step_values:
@@ -6884,7 +6960,7 @@ def main() -> None:
                         st.session_state["_reset_scenario_editor_keys"] = selected_scenario_name
                         st.session_state["_force_new_scenario_editor"] = True
                         st.rerun()
-                if selected_scenario and scenario_delete_col.button("このシナリオを削除", key=f"delete_scenario_{selected_scenario['id']}", use_container_width=True):
+                if selected_scenario and scenario_delete_col.button("このシナリオを削除", key=f"delete_scenario_{selected_scenario['id']}", width="stretch"):
                     delete_scenario(int(selected_scenario["id"]))
                     st.success(f"シナリオ「{selected_scenario_name}」を削除しました")
                     st.rerun()
@@ -6939,7 +7015,7 @@ def main() -> None:
                         if st.button(
                             "このステップのテンプレートを更新",
                             key=f"save_scenario_step_template_{selected_scenario['id']}_{selected_edit_step['step_number']}_{edit_template['id']}",
-                            use_container_width=True,
+                            width="stretch",
                         ):
                             save_campaign_template(edit_template_name, edit_subject, edit_body)
                             st.success(
@@ -6967,7 +7043,7 @@ def main() -> None:
                         else:
                             st.dataframe(
                                 scenario_step_stats,
-                                use_container_width=True,
+                                width="stretch",
                                 hide_index=True,
                             )
         scenarios_for_send = fetch_scenarios()
@@ -7089,7 +7165,7 @@ def main() -> None:
             unsubscribe_scope = UNSUBSCRIBE_SCOPE_CAMPAIGN
             unsubscribe_scope_key = effective_campaign_key
             unsubscribe_scope_label = normal_campaign_scope_label(effective_campaign_name)
-            if save_col.button("保存 / 更新", key="save_campaign_template", use_container_width=True):
+            if save_col.button("保存 / 更新", key="save_campaign_template", width="stretch"):
                 if campaign_name.strip():
                     save_campaign_template(campaign_name, subject_template, body_template)
                     save_setting("CURRENT_CAMPAIGN_NAME", campaign_name.strip())
@@ -7448,7 +7524,7 @@ def main() -> None:
                     ]
                 )
             detail_frame = pd.DataFrame(detail_rows)
-            st.dataframe(detail_frame, use_container_width=True, hide_index=True)
+            st.dataframe(detail_frame, width="stretch", hide_index=True)
 
             if confirmation_contacts:
                 st.caption("今回の選択候補です。実際の送信対象は、未送信優先・最終送信が古い順で選ばれます。10件ずつ確認できます。")
@@ -7457,7 +7533,7 @@ def main() -> None:
                 if prev_col.button(
                     "前の10件",
                     key="final_confirmation_prev_page",
-                    use_container_width=True,
+                    width="stretch",
                     disabled=confirmation_page <= 1,
                 ):
                     st.session_state["final_confirmation_page"] = max(1, confirmation_page - 1)
@@ -7465,7 +7541,7 @@ def main() -> None:
                 if next_col.button(
                     "次の10件",
                     key="final_confirmation_next_page",
-                    use_container_width=True,
+                    width="stretch",
                     disabled=confirmation_page >= confirmation_total_pages,
                 ):
                     st.session_state["final_confirmation_page"] = min(confirmation_total_pages, confirmation_page + 1)
@@ -7482,7 +7558,7 @@ def main() -> None:
                             for contact in confirmation_contacts
                         ]
                     ),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                 )
             else:
@@ -7494,7 +7570,7 @@ def main() -> None:
             active_jobs = [job for job in recent_jobs if is_active_send_job(job)]
             with st.expander(f"シナリオ・送信予約の進捗（稼働中{len(active_jobs)}件）", expanded=bool(active_jobs)):
                 refresh_col, note_col = st.columns([1.0, 2.4])
-                if refresh_col.button("状態を更新", use_container_width=True):
+                if refresh_col.button("状態を更新", width="stretch"):
                     sync_send_queue_results()
                     st.rerun()
                 note_col.caption("送信予約の進捗は30秒ごとに自動更新されます。複数シナリオを予約した場合もここでまとめて確認できます。")
@@ -7608,7 +7684,7 @@ def main() -> None:
                                 "created_at": "作成日時",
                             }
                         ),
-                        use_container_width=True,
+                        width="stretch",
                         hide_index=True,
                     )
 
@@ -7627,7 +7703,7 @@ def main() -> None:
                         columns[2].write(f"{send_job_count(job, 'sent_count'):,}件")
                         columns[3].write(f"{send_job_progress_percent(job):.1f}%")
                         columns[4].write(send_job_status_label(str(job.get("status") or "")))
-                        if columns[5].button("予約を取消", key=f"request_cancel_send_job_{job_id}", use_container_width=True):
+                        if columns[5].button("予約を取消", key=f"request_cancel_send_job_{job_id}", width="stretch"):
                             st.session_state["confirm_cancel_send_job_id"] = job_id
                             st.rerun()
 
@@ -7642,7 +7718,7 @@ def main() -> None:
                                 "送信待ちの宛先は未送信の状態に戻ります。"
                             )
                             yes_col, no_col = st.columns(2)
-                            if yes_col.button("はい、取り消す", key=f"confirm_cancel_send_job_yes_{pending_cancel_job_id}", use_container_width=True):
+                            if yes_col.button("はい、取り消す", key=f"confirm_cancel_send_job_yes_{pending_cancel_job_id}", width="stretch"):
                                 ok, message = cancel_send_job(pending_job)
                                 st.session_state["confirm_cancel_send_job_id"] = ""
                                 if ok:
@@ -7650,7 +7726,7 @@ def main() -> None:
                                 else:
                                     st.session_state["send_job_cancel_error"] = message
                                 st.rerun()
-                            if no_col.button("いいえ、取り消さない", key=f"confirm_cancel_send_job_no_{pending_cancel_job_id}", use_container_width=True):
+                            if no_col.button("いいえ、取り消さない", key=f"confirm_cancel_send_job_no_{pending_cancel_job_id}", width="stretch"):
                                 st.session_state["confirm_cancel_send_job_id"] = ""
                                 st.rerun()
 
@@ -7664,7 +7740,7 @@ def main() -> None:
                 )
                 cause_counts = failed_summary["原因分類"].value_counts().reset_index()
                 cause_counts.columns = ["原因分類", "件数"]
-                st.dataframe(cause_counts, use_container_width=True, hide_index=True)
+                st.dataframe(cause_counts, width="stretch", hide_index=True)
 
                 header = st.columns([1.3, 1.8, 1.8, 1.8, 2.6, 1.2, 1.2])
                 headers = ["チャンネル", "メールアドレス", "件名", "原因分類", "対応の目安", "日時", "操作"]
@@ -7725,7 +7801,7 @@ def main() -> None:
 
                 st.caption(f"{len(filtered_history)}件を表示しています。日時は日本時間です。")
                 visible_history = filtered_history.head(int(history_limit))
-                st.dataframe(visible_history, use_container_width=True, hide_index=True)
+                st.dataframe(visible_history, width="stretch", hide_index=True)
 
                 export_name = datetime.now(APP_TIMEZONE).strftime("send_history_%Y%m%d_%H%M")
                 log_csv_col, log_xlsx_col = st.columns(2)
@@ -7734,14 +7810,14 @@ def main() -> None:
                     data=filtered_history.to_csv(index=False).encode("utf-8-sig"),
                     file_name=f"{export_name}.csv",
                     mime="text/csv",
-                    use_container_width=True,
+                    width="stretch",
                 )
                 log_xlsx_col.download_button(
                     "送信ログをExcelでダウンロード",
                     data=dataframe_to_xlsx(filtered_history, sheet_name="送信ログ"),
                     file_name=f"{export_name}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
+                    width="stretch",
                 )
 
         if "test_email_input" not in st.session_state:
@@ -7764,7 +7840,7 @@ def main() -> None:
                 type="default" if show_test_email else "password",
                 placeholder="自分の確認用メールアドレス",
             ).strip()
-            if test_email_save_col.button("保存", key="save_test_email_address", use_container_width=True):
+            if test_email_save_col.button("保存", key="save_test_email_address", width="stretch"):
                 if not looks_like_email_address(test_email_address):
                     st.session_state["test_email_error"] = "テストメールアドレスを正しく入力してください。"
                 else:
@@ -7780,14 +7856,14 @@ def main() -> None:
         with test_button:
             run_test = st.button(
                 "テストメールアドレスに1通送る",
-                use_container_width=True,
+                width="stretch",
                 disabled=not test_email_address,
             )
         with send_button:
             run_all = st.button(
                 "シナリオ全体を送信予約" if scenario_full_auto else "指定件数を送信予約",
                 type="primary",
-                use_container_width=True,
+                width="stretch",
             )
         st.info("送信予約を作成すると、送信処理はサーバー側で進みます。予約後はこのタブを閉じても、パソコンの電源を切っても、設定した間隔で送信が続きます。進捗は「最近の送信予約」で確認できます。すべて完了すると、ログイン中のGoogleメールアドレスに完了メールが届きます。")
 
@@ -7932,7 +8008,7 @@ def main() -> None:
             analysis_tab, history_tab, download_tab = st.tabs(["分析", "停止履歴", "ダウンロード"])
             with analysis_tab:
                 st.caption("停止対象ごとの件数と停止率です。停止率は、その対象の送信成功数に対する配信停止件数で計算しています。")
-                st.dataframe(unsubscribe_summary, use_container_width=True, hide_index=True)
+                st.dataframe(unsubscribe_summary, width="stretch", hide_index=True)
             with history_tab:
                 filter_cols = st.columns([1.2, 2.0])
                 unsubscribe_type = filter_cols[0].selectbox(
@@ -7972,7 +8048,7 @@ def main() -> None:
                         columns[3].write(row["メールアドレス"])
                         columns[4].write(row["チャンネル"])
                         columns[5].write(row["停止理由"])
-                        if columns[6].button("削除", key=f"request_delete_unsubscribe_event_{event_id}", use_container_width=True):
+                        if columns[6].button("削除", key=f"request_delete_unsubscribe_event_{event_id}", width="stretch"):
                             st.session_state["confirm_delete_unsubscribe_event_id"] = event_id
                             st.rerun()
                 else:
@@ -7994,7 +8070,7 @@ def main() -> None:
                         "宛先一覧への自動復活はしません。"
                     )
                     yes_col, no_col = st.columns(2)
-                    if yes_col.button("はい、削除する", key="confirm_delete_unsubscribe_event_yes", use_container_width=True):
+                    if yes_col.button("はい、削除する", key="confirm_delete_unsubscribe_event_yes", width="stretch"):
                         ok, message = delete_unsubscribe_event(pending_delete_unsubscribe_id)
                         st.session_state["confirm_delete_unsubscribe_event_id"] = 0
                         if ok:
@@ -8002,7 +8078,7 @@ def main() -> None:
                         else:
                             st.session_state["unsubscribe_delete_error"] = message
                         st.rerun()
-                    if no_col.button("いいえ、削除しない", key="confirm_delete_unsubscribe_event_no", use_container_width=True):
+                    if no_col.button("いいえ、削除しない", key="confirm_delete_unsubscribe_event_no", width="stretch"):
                         st.session_state["confirm_delete_unsubscribe_event_id"] = 0
                         st.rerun()
             with download_tab:
@@ -8013,14 +8089,14 @@ def main() -> None:
                     data=downloadable_unsubscribes.to_csv(index=False).encode("utf-8-sig"),
                     file_name=f"{export_name}_history.csv",
                     mime="text/csv",
-                    use_container_width=True,
+                    width="stretch",
                 )
                 xlsx_col.download_button(
                     "配信停止履歴をExcelでダウンロード",
                     data=dataframe_to_xlsx(downloadable_unsubscribes, sheet_name="配信停止履歴"),
                     file_name=f"{export_name}_history.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
+                    width="stretch",
                 )
                 summary_csv_col, summary_xlsx_col = st.columns(2)
                 summary_csv_col.download_button(
@@ -8028,14 +8104,14 @@ def main() -> None:
                     data=unsubscribe_summary.to_csv(index=False).encode("utf-8-sig"),
                     file_name=f"{export_name}_summary.csv",
                     mime="text/csv",
-                    use_container_width=True,
+                    width="stretch",
                 )
                 summary_xlsx_col.download_button(
                     "配信停止分析をExcelでダウンロード",
                     data=dataframe_to_xlsx(unsubscribe_summary, sheet_name="配信停止分析"),
                     file_name=f"{export_name}_summary.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
+                    width="stretch",
                 )
 
     blocked_targets = fetch_blocked_targets()
@@ -8148,7 +8224,7 @@ def main() -> None:
             if bulk_action == "分類を変更":
                 bulk_status = st.selectbox("変更後の分類", CONTACT_STATUS_OPTIONS, index=CONTACT_STATUS_OPTIONS.index("送信対象"), key="bulk_contacts_status")
             bulk_confirm = st.checkbox("この一括操作を実行することを確認しました", key="bulk_contacts_confirm")
-            if st.button("一括操作を実行", key="bulk_contacts_apply", use_container_width=True, disabled=not bulk_confirm):
+            if st.button("一括操作を実行", key="bulk_contacts_apply", width="stretch", disabled=not bulk_confirm):
                 target_ids = [int(contact_id) for contact_id in contacts["id"].tolist()]
                 if bulk_action == "分類を変更":
                     for contact_id in target_ids:
@@ -8172,14 +8248,14 @@ def main() -> None:
             data=export_frame.to_csv(index=False).encode("utf-8-sig"),
             file_name=f"{export_name}.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
         download_xlsx_col.download_button(
             "Excelでダウンロード",
             data=dataframe_to_xlsx(export_frame),
             file_name=f"{export_name}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
+            width="stretch",
         )
 
         total_contacts = len(contacts)
@@ -8254,12 +8330,12 @@ def main() -> None:
         create_sheet_col.link_button(
             "新しいGoogleスプレッドシートを作る",
             "https://sheets.new",
-            use_container_width=True,
+            width="stretch",
         )
         sheet_home_col.link_button(
             "Googleスプレッドシート一覧を開く",
             "https://docs.google.com/spreadsheets/u/0/",
-            use_container_width=True,
+            width="stretch",
         )
         registered_outsource_url = st.text_input(
             "外注用GoogleスプレッドシートURL",
@@ -8275,7 +8351,7 @@ def main() -> None:
         if not ready_for_sheet:
             st.info(sheet_ready_message or "空のGoogleシートへ自動で候補を書き込むには、アプリ用のサービスアカウント設定が必要です。")
         save_url_col, open_url_col = st.columns(2)
-        if save_url_col.button("このURLを保存", key="save_outsource_sheet_url", use_container_width=True):
+        if save_url_col.button("このURLを保存", key="save_outsource_sheet_url", width="stretch"):
             cleaned_outsource_url = registered_outsource_url.strip()
             save_setting("OUTSOURCE_SPREADSHEET_URL", cleaned_outsource_url)
             st.session_state["last_outsource_sheet_url"] = cleaned_outsource_url
@@ -8323,9 +8399,9 @@ def main() -> None:
                 st.caption(sheet_ready_message or "サービスアカウント設定を確認してください。")
             st.write(f"YouTube候補: {len(candidates)}件")
         if active_outsource_url.startswith("http"):
-            open_url_col.link_button("登録したGoogleシートを開く", active_outsource_url, use_container_width=True)
+            open_url_col.link_button("登録したGoogleシートを開く", active_outsource_url, width="stretch")
         else:
-            open_url_col.button("登録したGoogleシートを開く", key="open_empty_outsource_sheet_url", use_container_width=True, disabled=True)
+            open_url_col.button("登録したGoogleシートを開く", key="open_empty_outsource_sheet_url", width="stretch", disabled=True)
         sync_blockers = []
         if not active_outsource_url.startswith("http"):
             sync_blockers.append("外注用GoogleスプレッドシートURLが保存されていません。")
@@ -8351,7 +8427,7 @@ def main() -> None:
             reflected_checked_at = str(reflection_snapshot.get("checked_at") or "")
 
         check_col, refresh_col = st.columns(2)
-        if check_col.button("Googleシート接続を確認", key="check_outsource_sheet_connection", use_container_width=True):
+        if check_col.button("Googleシート接続を確認", key="check_outsource_sheet_connection", width="stretch"):
             try:
                 save_setting("OUTSOURCE_SPREADSHEET_URL", active_outsource_url)
                 st.success(check_outsource_spreadsheet_connection(active_outsource_url))
@@ -8360,7 +8436,7 @@ def main() -> None:
         if refresh_col.button(
             "反映状態を更新",
             key="refresh_outsource_reflection_status",
-            use_container_width=True,
+            width="stretch",
             disabled=bool(sync_blockers) or candidates.empty,
         ):
             try:
@@ -8397,7 +8473,7 @@ def main() -> None:
             st.caption(f"新しく反映できる候補は0件です（登録済みシートに反映済み: {reflected_count}件）。")
         else:
             st.caption(f"新しく反映できる候補: {len(sync_candidates)}件（登録済みシートに反映済み: {reflected_count}件）")
-        if st.button("候補一覧を登録済みシートへ反映", key="sync_outsource_sheet", use_container_width=True):
+        if st.button("候補一覧を登録済みシートへ反映", key="sync_outsource_sheet", width="stretch"):
             save_setting("OUTSOURCE_SPREADSHEET_URL", active_outsource_url)
             try:
                 spreadsheet_url, exported_count, already_count = append_new_outsource_candidates(candidates)
@@ -8435,7 +8511,7 @@ def main() -> None:
                 data=outsource_frame.to_csv(index=False).encode("utf-8-sig"),
                 file_name=f"{export_name}.csv",
                 mime="text/csv",
-                use_container_width=True,
+                width="stretch",
                 disabled=sync_candidates.empty,
             )
             download_xlsx_col.download_button(
@@ -8443,14 +8519,14 @@ def main() -> None:
                 data=dataframe_to_xlsx(outsource_frame, "外注用候補"),
                 file_name=f"{export_name}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
+                width="stretch",
                 disabled=sync_candidates.empty,
             )
 
         if st.button(
             "外注用GoogleスプレッドシートURLから宛先一覧へ取り込む",
             key="import_outsource_google_url",
-            use_container_width=True,
+            width="stretch",
             disabled=not active_outsource_url.startswith("http"),
         ):
             target_outsource_url = active_outsource_url.strip()
@@ -8497,7 +8573,7 @@ def main() -> None:
         ).strip().lower()
         if st.session_state.pop("scroll_to_candidates_top", False):
             scroll_nonce = int(st.session_state.get("scroll_to_candidates_nonce", 0))
-            components.html(
+            st.iframe(
                 """
                 <script>
                 const scrollNonce = __SCROLL_NONCE__;
@@ -8612,7 +8688,7 @@ def main() -> None:
         if prev_col.button(
             "前のページ",
             key="candidates_prev_page_bottom",
-            use_container_width=True,
+            width="stretch",
             disabled=int(candidate_current_page) <= 1,
             on_click=change_candidate_page,
             args=(-1, candidate_total_pages),
@@ -8627,7 +8703,7 @@ def main() -> None:
         if next_col.button(
             "次のページ",
             key="candidates_next_page_bottom",
-            use_container_width=True,
+            width="stretch",
             disabled=int(candidate_current_page) >= candidate_total_pages,
             on_click=change_candidate_page,
             args=(1, candidate_total_pages),
