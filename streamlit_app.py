@@ -2689,6 +2689,19 @@ def uploaded_image_to_data_url(uploaded_file) -> str:
     return f"data:{mime_type};base64,{encoded}"
 
 
+def ai_input_image_reference(uploaded_file, image_url: str) -> str:
+    uploaded_image = uploaded_image_to_data_url(uploaded_file)
+    if uploaded_image:
+        return uploaded_image
+    clean_url = str(image_url or "").strip()
+    if not clean_url:
+        return ""
+    parsed_url = urllib.parse.urlparse(clean_url)
+    if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+        raise RuntimeError("商品写真URLは https://... の形式で入力してください。")
+    return clean_url
+
+
 def friendly_openai_error(detail: str, status_code: int = 0) -> str:
     message = detail.strip()
     try:
@@ -2707,13 +2720,14 @@ def friendly_openai_error(detail: str, status_code: int = 0) -> str:
 
 
 def generate_ai_scenario(
+    scenario_name: str,
     product_name: str,
     product_url: str,
     product_info: str,
     persona_info: str,
     tone: str,
     step_count: int,
-    image_data_url: str = "",
+    image_reference: str = "",
 ) -> dict:
     api_key = openai_api_key()
     if not api_key:
@@ -2732,6 +2746,9 @@ def generate_ai_scenario(
         "配信停止URLはアプリが自動付与するため、本文にはURLを入れないでください。"
     )
     user_text = f"""
+希望するシナリオ名:
+{scenario_name.strip() or "未指定"}
+
 商品名:
 {product_name.strip()}
 
@@ -2751,7 +2768,8 @@ ASP紹介文・ペルソナ・訴求情報:
 {clean_step_count}
 
 出力条件:
-- scenario_nameは商品名が分かる短い名前にする
+- 希望するシナリオ名が指定されている場合、scenario_nameは必ずその名前をそのまま使う
+- 希望するシナリオ名が未指定の場合、scenario_nameは商品名が分かる短い名前にする
 - stepsは必ず{clean_step_count}件作る
 - template_nameは各ステップで重複しない名前にする
 - subjectは自然な日本語で、釣りすぎない
@@ -2762,8 +2780,8 @@ ASP紹介文・ペルソナ・訴求情報:
 """.strip()
 
     content: list[dict] = [{"type": "input_text", "text": user_text}]
-    if image_data_url:
-        content.append({"type": "input_image", "image_url": image_data_url, "detail": "auto"})
+    if image_reference:
+        content.append({"type": "input_image", "image_url": image_reference, "detail": "auto"})
 
     payload = {
         "model": openai_model(),
@@ -2807,6 +2825,8 @@ ASP紹介文・ペルソナ・訴求情報:
     steps = scenario.get("steps") or []
     if not isinstance(steps, list) or not steps:
         raise RuntimeError("シナリオのステップが生成されませんでした。入力内容を増やして再度試してください。")
+    if scenario_name.strip():
+        scenario["scenario_name"] = scenario_name.strip()
     return scenario
 
 
@@ -6303,6 +6323,11 @@ def main() -> None:
 
             ai_input_left, ai_input_right = st.columns([1.2, 1.0])
             with ai_input_left:
+                ai_requested_scenario_name = st.text_input(
+                    "シナリオ名",
+                    placeholder="例: UniVerse 初回営業シナリオ",
+                    key="ai_scenario_requested_name",
+                )
                 ai_product_name = st.text_input(
                     "商品名",
                     placeholder="例: UniVerse / サッカーボール教材",
@@ -6313,13 +6338,20 @@ def main() -> None:
                     placeholder="https://...",
                     key="ai_scenario_product_url",
                 )
+                ai_product_image_url = st.text_input(
+                    "商品写真URL（任意）",
+                    placeholder="https://.../image.jpg",
+                    key="ai_scenario_product_image_url",
+                )
                 ai_product_image = st.file_uploader(
-                    "商品写真（任意）",
+                    "商品写真をアップロード（任意）",
                     type=["png", "jpg", "jpeg", "webp"],
                     key="ai_scenario_product_image",
                 )
                 if ai_product_image:
                     st.image(ai_product_image, caption="商品写真プレビュー", width=260)
+                elif ai_product_image_url.strip():
+                    st.caption("画像URLをAIに渡します。URL先が外部から見られない場合は、アップロードを使ってください。")
             with ai_input_right:
                 ai_step_count = st.number_input(
                     "作成する通数",
@@ -6355,7 +6387,9 @@ def main() -> None:
                 width="stretch",
                 disabled=generate_disabled,
             ):
-                if not ai_product_name.strip():
+                if not ai_requested_scenario_name.strip():
+                    st.error("シナリオ名を入力してください。")
+                elif not ai_product_name.strip():
                     st.error("商品名を入力してください。")
                 elif not ai_product_info.strip():
                     st.error("商品説明・ASP紹介文を入力してください。")
@@ -6363,13 +6397,14 @@ def main() -> None:
                     try:
                         with st.spinner("AIがシナリオ案を作成しています..."):
                             generated_scenario = generate_ai_scenario(
+                                ai_requested_scenario_name,
                                 ai_product_name,
                                 ai_product_url,
                                 ai_product_info,
                                 ai_persona_info,
                                 ai_tone,
                                 int(ai_step_count),
-                                uploaded_image_to_data_url(ai_product_image),
+                                ai_input_image_reference(ai_product_image, ai_product_image_url),
                             )
                         scenario_digest = hashlib.sha1(
                             json.dumps(generated_scenario, ensure_ascii=False, sort_keys=True).encode("utf-8")
