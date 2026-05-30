@@ -5382,7 +5382,8 @@ def main() -> None:
         ready_for_sheet, sheet_ready_message = google_sheet_write_ready()
         service_account_email = google_service_account_email()
         if service_account_email:
-            st.caption(f"このGoogleシートを {service_account_email} に編集者として共有すると、アプリが候補一覧を書き込めます。")
+            st.caption("このGoogleシートを下のサービスアカウントに編集者として共有すると、アプリが候補一覧を書き込めます。")
+            st.code(service_account_email, language=None)
         if not ready_for_sheet:
             st.info(sheet_ready_message or "空のGoogleシートへ自動で候補を書き込むには、アプリ用のサービスアカウント設定が必要です。")
         save_url_col, open_url_col = st.columns(2)
