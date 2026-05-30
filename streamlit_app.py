@@ -67,6 +67,11 @@ GOOGLE_SHEET_WRITE_DISABLED_MESSAGE = (
 OUTSOURCE_MIN_UNIT_PRICE_YEN = 10
 OUTSOURCE_MAX_UNIT_PRICE_YEN = 300
 OUTSOURCE_DEFAULT_UNIT_PRICE_YEN = 50
+UNSUBSCRIBE_SCOPE_GLOBAL = "global"
+UNSUBSCRIBE_SCOPE_SCENARIO = "scenario"
+UNSUBSCRIBE_SCOPE_CAMPAIGN = "campaign"
+UNSUBSCRIBE_REASON_GLOBAL = "配信停止:global"
+UNSUBSCRIBE_REASON_PREFIX = "配信停止:"
 
 YOUTUBE_VIDEO_CATEGORIES = {
     "エンターテイメント": "24",
@@ -933,6 +938,9 @@ def init_db() -> None:
                 youtube_channel_id text not null default '',
                 channel text not null default '',
                 campaign_key text not null default '',
+                scope text not null default 'campaign',
+                scope_key text not null default '',
+                scope_label text not null default '',
                 unsubscribed_at text not null
             );
 
@@ -1010,6 +1018,45 @@ def init_db() -> None:
         if "sort_order" not in campaign_columns:
             db.execute("alter table campaign_templates add column sort_order integer not null default 0")
             db.execute("update campaign_templates set sort_order = id where sort_order = 0")
+        unsubscribe_columns = [row[1] for row in db.execute("pragma table_info(unsubscribe_events)").fetchall()]
+        unsubscribe_migrations = {
+            "scope": "alter table unsubscribe_events add column scope text not null default 'campaign'",
+            "scope_key": "alter table unsubscribe_events add column scope_key text not null default ''",
+            "scope_label": "alter table unsubscribe_events add column scope_label text not null default ''",
+        }
+        for column, statement in unsubscribe_migrations.items():
+            if column not in unsubscribe_columns:
+                db.execute(statement)
+        db.execute(
+            """
+            update unsubscribe_events
+            set scope = 'campaign',
+                scope_key = campaign_key,
+                scope_label = 'この配信'
+            where coalesce(scope_key, '') = '' and coalesce(campaign_key, '') != ''
+            """
+        )
+        db.execute(
+            """
+            insert into unsubscribe_events
+            (user_id, contact_email, youtube_channel_id, channel, campaign_key, scope, scope_key, scope_label, unsubscribed_at)
+            select user_id, email, youtube_channel_id, channel, '', 'global', 'global', 'すべての案内', created_at
+            from blocked_targets
+            where reason = '配信停止URL'
+              and not exists (
+                  select 1
+                  from unsubscribe_events ue
+                  where ue.user_id = blocked_targets.user_id
+                    and ue.scope = 'global'
+                    and (
+                        (blocked_targets.email != '' and ue.contact_email = blocked_targets.email)
+                        or
+                        (blocked_targets.youtube_channel_id != '' and ue.youtube_channel_id = blocked_targets.youtube_channel_id)
+                    )
+              )
+            """
+        )
+        db.execute("delete from blocked_targets where reason = '配信停止URL'")
         db.commit()
 
 
@@ -1028,6 +1075,28 @@ def fetch_contacts() -> pd.DataFrame:
                 c.contact_status,
                 c.replied_at,
                 c.created_at,
+                exists (
+                    select 1
+                    from unsubscribe_events ue_global
+                    where ue_global.user_id = c.user_id
+                      and ue_global.scope = 'global'
+                      and (
+                          (ue_global.contact_email != '' and ue_global.contact_email = lower(c.email))
+                          or
+                          (ue_global.youtube_channel_id != '' and ue_global.youtube_channel_id = c.youtube_channel_id)
+                      )
+                ) as global_unsubscribed,
+                exists (
+                    select 1
+                    from unsubscribe_events ue_scoped
+                    where ue_scoped.user_id = c.user_id
+                      and ue_scoped.scope != 'global'
+                      and (
+                          (ue_scoped.contact_email != '' and ue_scoped.contact_email = lower(c.email))
+                          or
+                          (ue_scoped.youtube_channel_id != '' and ue_scoped.youtube_channel_id = c.youtube_channel_id)
+                      )
+                ) as scoped_unsubscribed,
                 coalesce(max(s.sent_at), '') as last_sent
             from contacts c
             left join sends s on s.contact_id = c.id
@@ -2576,6 +2645,64 @@ def scenario_step_campaign_key(scenario_id: int, step_number: int) -> str:
     return campaign_key(f"scenario:{int(scenario_id)}:step:{int(step_number)}")
 
 
+def unsubscribe_reason(scope: str, scope_key: str) -> str:
+    clean_scope = str(scope or UNSUBSCRIBE_SCOPE_CAMPAIGN).strip() or UNSUBSCRIBE_SCOPE_CAMPAIGN
+    clean_key = str(scope_key or "").strip()
+    if clean_scope == UNSUBSCRIBE_SCOPE_GLOBAL:
+        return UNSUBSCRIBE_REASON_GLOBAL
+    return f"{UNSUBSCRIBE_REASON_PREFIX}{clean_scope}:{clean_key}"
+
+
+def parse_unsubscribe_reason(reason: str) -> tuple[str, str]:
+    clean_reason = str(reason or "").strip()
+    if clean_reason in {"配信停止URL", UNSUBSCRIBE_REASON_GLOBAL}:
+        return UNSUBSCRIBE_SCOPE_GLOBAL, UNSUBSCRIBE_SCOPE_GLOBAL
+    if clean_reason.startswith(UNSUBSCRIBE_REASON_PREFIX):
+        payload = clean_reason[len(UNSUBSCRIBE_REASON_PREFIX) :]
+        scope, _, scope_key = payload.partition(":")
+        if scope in {UNSUBSCRIBE_SCOPE_GLOBAL, UNSUBSCRIBE_SCOPE_SCENARIO, UNSUBSCRIBE_SCOPE_CAMPAIGN}:
+            return scope, scope_key or (UNSUBSCRIBE_SCOPE_GLOBAL if scope == UNSUBSCRIBE_SCOPE_GLOBAL else "")
+    return "", ""
+
+
+def normal_campaign_scope_label(name: str) -> str:
+    return str(name or "").strip() or "この配信"
+
+
+def scope_display_label(scope: str, scope_key: str, scope_label: str = "") -> str:
+    clean_scope = str(scope or "").strip()
+    clean_key = str(scope_key or "").strip()
+    clean_label = str(scope_label or "").strip()
+    if clean_scope == UNSUBSCRIBE_SCOPE_GLOBAL:
+        return "すべての案内"
+    if clean_scope == UNSUBSCRIBE_SCOPE_SCENARIO:
+        return f"シナリオ: {clean_label or clean_key or '-'}"
+    if clean_scope == UNSUBSCRIBE_SCOPE_CAMPAIGN:
+        return f"配信: {clean_label or clean_key or '-'}"
+    return clean_label or "-"
+
+
+def campaign_keys_for_unsubscribe_scope(scope: str, scope_key: str) -> list[str]:
+    clean_scope = str(scope or "").strip()
+    clean_key = str(scope_key or "").strip()
+    if clean_scope == UNSUBSCRIBE_SCOPE_GLOBAL:
+        return []
+    if clean_scope == UNSUBSCRIBE_SCOPE_CAMPAIGN:
+        return [clean_key] if clean_key else []
+    if clean_scope == UNSUBSCRIBE_SCOPE_SCENARIO and clean_key:
+        scenario = rows(
+            "select id from scenarios where user_id = ? and name = ? limit 1",
+            (current_user_id(), clean_key),
+        )
+        if not scenario:
+            return []
+        return [
+            scenario_step_campaign_key(int(scenario[0]["id"]), int(step["step_number"]))
+            for step in fetch_scenario_steps(int(scenario[0]["id"]))
+        ]
+    return []
+
+
 def change_candidate_page(delta: int, total_pages: int) -> None:
     current_page = int(st.session_state.get("candidates_page", 1))
     st.session_state["candidates_page"] = max(1, min(int(total_pages), current_page + int(delta)))
@@ -3221,39 +3348,84 @@ def check_smtp_login() -> tuple[bool, str]:
         return False, friendly_smtp_error(str(exc))
 
 
-def render_template(text: str, contact: sqlite3.Row, unsubscribe_url: str) -> str:
+def render_template(
+    text: str,
+    contact: sqlite3.Row,
+    unsubscribe_url: str,
+    unsubscribe_all_url: str = "",
+) -> str:
     values = {
         "name": contact["name"] or "ご担当者",
         "email": contact["email"],
         "channel": contact["channel"] or "貴チャンネル",
         "unsubscribe_url": unsubscribe_url,
+        "unsubscribe_all_url": unsubscribe_all_url or unsubscribe_url,
     }
     return Template(text).safe_substitute(values)
 
 
 def ensure_unsubscribe_link_template(body_template: str) -> str:
-    if "${unsubscribe_url}" in body_template:
+    has_scoped_url = "${unsubscribe_url}" in body_template
+    has_global_url = "${unsubscribe_all_url}" in body_template
+    if has_scoped_url and has_global_url:
         return body_template
-    return body_template.rstrip() + "\n\n不要な場合はこちらから配信停止できます。\n${unsubscribe_url}"
+    suffix = ""
+    if not has_scoped_url:
+        suffix += "\n\n不要な場合はこちらからこの案内だけ配信停止できます。\n${unsubscribe_url}"
+    if not has_global_url:
+        suffix += "\n\nすべての案内を停止する場合はこちらから配信停止できます。\n${unsubscribe_all_url}"
+    return body_template.rstrip() + suffix
 
 
-def build_unsubscribe_mailto(contact: sqlite3.Row) -> str:
+def build_unsubscribe_mailto(
+    contact: sqlite3.Row,
+    scope: str = UNSUBSCRIBE_SCOPE_CAMPAIGN,
+    scope_key: str = "",
+    scope_label: str = "",
+) -> str:
     account = active_smtp_account()
     reply_to = get_secret("UNSUBSCRIBE_EMAIL", "") or str(account.get("sender_email") or "")
     subject = "配信停止希望"
     body = (
         "配信停止を希望します。\n\n"
+        f"停止範囲: {scope_display_label(scope, scope_key, scope_label)}\n"
         f"対象メールアドレス: {contact['email']}\n"
         f"チャンネル名: {contact['channel'] or '-'}\n"
     )
     return f"mailto:{reply_to}?subject={quote(subject)}&body={quote(body)}"
 
 
-def build_unsubscribe_url(contact: sqlite3.Row) -> str:
+def build_unsubscribe_url(
+    contact: sqlite3.Row,
+    scope: str = UNSUBSCRIBE_SCOPE_CAMPAIGN,
+    scope_key: str = "",
+    scope_label: str = "",
+) -> str:
+    clean_scope = str(scope or UNSUBSCRIBE_SCOPE_CAMPAIGN).strip() or UNSUBSCRIBE_SCOPE_CAMPAIGN
+    clean_key = str(scope_key or "").strip()
+    clean_label = str(scope_label or "").strip()
     if supabase_configured():
         base_url = supabase_config()["url"].rstrip("/")
-        return f"{base_url}/functions/v1/unsubscribe?token={quote(str(contact['token']))}"
-    return build_unsubscribe_mailto(contact)
+        query = urllib.parse.urlencode(
+            {
+                "token": str(contact["token"]),
+                "scope": clean_scope,
+                "scope_key": clean_key,
+                "scope_label": clean_label,
+            },
+            quote_via=urllib.parse.quote,
+        )
+        return f"{base_url}/functions/v1/unsubscribe?{query}"
+    return build_unsubscribe_mailto(contact, clean_scope, clean_key, clean_label)
+
+
+def build_global_unsubscribe_url(contact: sqlite3.Row) -> str:
+    return build_unsubscribe_url(
+        contact,
+        UNSUBSCRIBE_SCOPE_GLOBAL,
+        UNSUBSCRIBE_SCOPE_GLOBAL,
+        "すべての案内",
+    )
 
 
 def register_unsubscribe_token(contact: sqlite3.Row, user_email: str) -> None:
@@ -3396,6 +3568,9 @@ def create_send_job(
     delay_seconds: int,
     window_start: datetime_time,
     window_end: datetime_time,
+    unsubscribe_scope: str = UNSUBSCRIBE_SCOPE_CAMPAIGN,
+    unsubscribe_scope_key: str = "",
+    unsubscribe_scope_label: str = "",
 ) -> tuple[bool, str]:
     if not supabase_configured():
         return False, "送信予約にはSupabase設定が必要です"
@@ -3434,9 +3609,20 @@ def create_send_job(
     queue_rows = []
     for index, contact in enumerate(contacts):
         register_unsubscribe_token(contact, user_email)
-        unsubscribe_url = build_unsubscribe_url(contact)
+        unsubscribe_url = build_unsubscribe_url(
+            contact,
+            unsubscribe_scope,
+            unsubscribe_scope_key or campaign_key_value,
+            unsubscribe_scope_label or campaign_name,
+        )
+        unsubscribe_all_url = build_global_unsubscribe_url(contact)
         subject = render_template(subject_template, contact, unsubscribe_url)
-        body = render_template(ensure_unsubscribe_link_template(body_template), contact, unsubscribe_url)
+        body = render_template(
+            ensure_unsubscribe_link_template(body_template),
+            contact,
+            unsubscribe_url,
+            unsubscribe_all_url,
+        )
         queue_rows.append(
             {
                 "job_id": job_id,
@@ -3570,10 +3756,15 @@ def delete_pending_sends_for_unsubscribe(
     contact_id: int = 0,
     contact_email: str = "",
     youtube_channel_id: str = "",
+    scope: str = UNSUBSCRIBE_SCOPE_GLOBAL,
+    scope_key: str = "",
 ) -> int:
     user_id = current_user_id()
     normalized_email = contact_email.strip().lower()
     channel_id = youtube_channel_id.strip()
+    clean_scope = str(scope or UNSUBSCRIBE_SCOPE_GLOBAL).strip() or UNSUBSCRIBE_SCOPE_GLOBAL
+    clean_key = str(scope_key or "").strip()
+    target_campaign_keys = campaign_keys_for_unsubscribe_scope(clean_scope, clean_key)
     local_contact_ids: set[int] = set()
     if contact_id:
         local_contact_ids.add(int(contact_id))
@@ -3608,38 +3799,53 @@ def delete_pending_sends_for_unsubscribe(
                 remote_filters.append(f"contact_email=eq.{urllib.parse.quote(normalized_email, safe='')}")
 
             for remote_filter in remote_filters:
-                try:
-                    deleted_rows = supabase_request(
-                        "DELETE",
-                        (
-                            "send_queue"
-                            f"?user_email=eq.{query_email}"
-                            "&status=eq.pending"
-                            f"&{remote_filter}"
-                            "&select=job_id,contact_local_id,campaign_key,subject"
-                        ),
-                        prefer="return=representation",
+                campaign_filters = target_campaign_keys if clean_scope != UNSUBSCRIBE_SCOPE_GLOBAL else [""]
+                for campaign_key_filter in campaign_filters:
+                    campaign_part = (
+                        f"&campaign_key=eq.{urllib.parse.quote(campaign_key_filter, safe='')}"
+                        if campaign_key_filter
+                        else ""
                     )
-                except Exception:
-                    deleted_rows = []
-                if not isinstance(deleted_rows, list):
-                    continue
-                for item in deleted_rows:
-                    job_id = str(item.get("job_id") or "")
-                    if job_id:
-                        affected_job_ids.add(job_id)
-                    key = (
-                        job_id,
-                        int(item.get("contact_local_id") or 0),
-                        str(item.get("subject") or ""),
-                    )
-                    deleted_remote_keys.add(key)
+                    try:
+                        deleted_rows = supabase_request(
+                            "DELETE",
+                            (
+                                "send_queue"
+                                f"?user_email=eq.{query_email}"
+                                "&status=eq.pending"
+                                f"&{remote_filter}"
+                                f"{campaign_part}"
+                                "&select=job_id,contact_local_id,campaign_key,subject"
+                            ),
+                            prefer="return=representation",
+                        )
+                    except Exception:
+                        deleted_rows = []
+                    if not isinstance(deleted_rows, list):
+                        continue
+                    for item in deleted_rows:
+                        job_id = str(item.get("job_id") or "")
+                        if job_id:
+                            affected_job_ids.add(job_id)
+                        key = (
+                            job_id,
+                            int(item.get("contact_local_id") or 0),
+                            str(item.get("subject") or ""),
+                        )
+                        deleted_remote_keys.add(key)
             deleted_count += len(deleted_remote_keys)
             refresh_supabase_send_jobs(affected_job_ids)
 
     local_deleted = 0
     if local_contact_ids:
         placeholders = ",".join("?" for _ in local_contact_ids)
+        campaign_clause = ""
+        campaign_params: list[str] = []
+        if clean_scope != UNSUBSCRIBE_SCOPE_GLOBAL:
+            if not target_campaign_keys:
+                return max(deleted_count, local_deleted)
+            campaign_clause = f"and campaign_key in ({','.join('?' for _ in target_campaign_keys)})"
+            campaign_params = target_campaign_keys
         with sqlite3.connect(DB_PATH) as db:
             cursor = db.execute(
                 f"""
@@ -3647,8 +3853,9 @@ def delete_pending_sends_for_unsubscribe(
                 where user_id = ?
                   and status = 'queued'
                   and contact_id in ({placeholders})
+                  {campaign_clause}
                 """,
-                (user_id, *sorted(local_contact_ids)),
+                (user_id, *sorted(local_contact_ids), *campaign_params),
             )
             local_deleted = max(cursor.rowcount, 0)
             db.commit()
@@ -3746,8 +3953,15 @@ def record_unsubscribe_event(
     youtube_channel_id: str = "",
     channel: str = "",
     unsubscribed_at: str = "",
+    campaign_key_value: str = "",
+    scope: str = UNSUBSCRIBE_SCOPE_CAMPAIGN,
+    scope_key: str = "",
+    scope_label: str = "",
 ) -> None:
     user_id = current_user_id()
+    clean_scope = str(scope or UNSUBSCRIBE_SCOPE_CAMPAIGN).strip() or UNSUBSCRIBE_SCOPE_CAMPAIGN
+    clean_scope_key = str(scope_key or "").strip()
+    clean_scope_label = str(scope_label or "").strip()
     contact_rows = []
     if contact_id:
         contact_rows = rows(
@@ -3792,7 +4006,12 @@ def record_unsubscribe_event(
                 (user_id, local_contact_id),
             )
             campaign_row = matches[0] if matches else None
-        campaign_key_value = campaign_row["campaign_key"] if campaign_row else ""
+        resolved_campaign_key = campaign_key_value or (campaign_row["campaign_key"] if campaign_row else "")
+        if clean_scope == UNSUBSCRIBE_SCOPE_CAMPAIGN and not clean_scope_key:
+            clean_scope_key = resolved_campaign_key
+        if clean_scope == UNSUBSCRIBE_SCOPE_GLOBAL:
+            clean_scope_key = UNSUBSCRIBE_SCOPE_GLOBAL
+            clean_scope_label = clean_scope_label or "すべての案内"
         email_value = str(contact["email"] or contact_email).strip().lower()
         channel_id_value = str(contact["youtube_channel_id"] or youtube_channel_id).strip()
         channel_value = str(contact["channel"] or channel).strip()
@@ -3800,19 +4019,33 @@ def record_unsubscribe_event(
             """
             select id
             from unsubscribe_events
-            where user_id = ? and contact_email = ? and campaign_key = ?
+            where user_id = ?
+              and contact_email = ?
+              and scope = ?
+              and scope_key = ?
             limit 1
             """,
-            (user_id, email_value, campaign_key_value),
+            (user_id, email_value, clean_scope, clean_scope_key),
         )
         if exists:
             continue
         execute(
             """
-            insert into unsubscribe_events(user_id, contact_email, youtube_channel_id, channel, campaign_key, unsubscribed_at)
-            values (?, ?, ?, ?, ?, ?)
+            insert into unsubscribe_events
+            (user_id, contact_email, youtube_channel_id, channel, campaign_key, scope, scope_key, scope_label, unsubscribed_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (user_id, email_value, channel_id_value, channel_value, campaign_key_value, event_time),
+            (
+                user_id,
+                email_value,
+                channel_id_value,
+                channel_value,
+                resolved_campaign_key,
+                clean_scope,
+                clean_scope_key,
+                clean_scope_label or scope_display_label(clean_scope, clean_scope_key),
+                event_time,
+            ),
         )
 
 
@@ -3824,33 +4057,82 @@ def sync_unsubscribes_from_supabase() -> None:
         return
     try:
         query_email = urllib.parse.quote(user_email, safe="")
-        results = supabase_request(
+        token_results = supabase_request(
             "GET",
             f"unsubscribe_tokens?user_email=eq.{query_email}&unsubscribed_at=not.is.null&select=contact_local_id,contact_email,youtube_channel_id,channel,unsubscribed_at",
         )
-        if not isinstance(results, list):
-            return
-        for item in results:
+        if not isinstance(token_results, list):
+            token_results = []
+        for item in token_results:
             contact_id = int(item.get("contact_local_id") or 0)
             contact_email = str(item.get("contact_email") or "").strip().lower()
             youtube_channel_id = str(item.get("youtube_channel_id") or "").strip()
             channel = str(item.get("channel") or "").strip()
             unsubscribed_at = str(item.get("unsubscribed_at") or now_iso())
-            record_unsubscribe_event(contact_id, contact_email, youtube_channel_id, channel, unsubscribed_at)
-            delete_pending_sends_for_unsubscribe(contact_id, contact_email, youtube_channel_id)
-            block_target(contact_email, youtube_channel_id, channel, "配信停止URL")
-            if contact_id:
-                delete_contact(contact_id)
-            elif contact_email:
-                matched = rows("select id from contacts where user_id = ? and email = ?", (current_user_id(), contact_email))
-                for row in matched:
-                    record_unsubscribe_event(int(row["id"]), contact_email, youtube_channel_id, channel, unsubscribed_at)
-                    delete_contact(int(row["id"]))
-            elif youtube_channel_id:
-                matched = rows("select id from contacts where user_id = ? and youtube_channel_id = ?", (current_user_id(), youtube_channel_id))
-                for row in matched:
-                    record_unsubscribe_event(int(row["id"]), contact_email, youtube_channel_id, channel, unsubscribed_at)
-                    delete_contact(int(row["id"]))
+            record_unsubscribe_event(
+                contact_id,
+                contact_email,
+                youtube_channel_id,
+                channel,
+                unsubscribed_at,
+                scope=UNSUBSCRIBE_SCOPE_GLOBAL,
+                scope_key=UNSUBSCRIBE_SCOPE_GLOBAL,
+                scope_label="すべての案内",
+            )
+            delete_pending_sends_for_unsubscribe(
+                contact_id,
+                contact_email,
+                youtube_channel_id,
+                UNSUBSCRIBE_SCOPE_GLOBAL,
+                UNSUBSCRIBE_SCOPE_GLOBAL,
+            )
+
+        remote_blocks = supabase_request(
+            "GET",
+            f"blocked_targets?user_email=eq.{query_email}&select=email,youtube_channel_id,channel,reason,created_at",
+        )
+        if not isinstance(remote_blocks, list):
+            remote_blocks = []
+        for item in remote_blocks:
+            reason = str(item.get("reason") or "")
+            scope, scope_key = parse_unsubscribe_reason(reason)
+            if not scope:
+                continue
+            contact_email = str(item.get("email") or "").strip().lower()
+            youtube_channel_id = str(item.get("youtube_channel_id") or "").strip()
+            channel = str(item.get("channel") or "").strip()
+            created_at = str(item.get("created_at") or now_iso())
+            scope_label = "すべての案内" if scope == UNSUBSCRIBE_SCOPE_GLOBAL else scope_key
+            matched = []
+            if contact_email:
+                matched = rows(
+                    "select id from contacts where user_id = ? and email = ?",
+                    (current_user_id(), contact_email),
+                )
+            if not matched and youtube_channel_id:
+                matched = rows(
+                    "select id from contacts where user_id = ? and youtube_channel_id = ?",
+                    (current_user_id(), youtube_channel_id),
+                )
+            target_ids = [int(row["id"]) for row in matched] or [0]
+            for contact_id in target_ids:
+                record_unsubscribe_event(
+                    contact_id,
+                    contact_email,
+                    youtube_channel_id,
+                    channel,
+                    created_at,
+                    scope=scope,
+                    scope_key=scope_key,
+                    scope_label=scope_label,
+                )
+                delete_pending_sends_for_unsubscribe(
+                    contact_id,
+                    contact_email,
+                    youtube_channel_id,
+                    scope,
+                    scope_key,
+                )
     except Exception:
         return
 
@@ -3914,15 +4196,51 @@ def exclusion_sql(exclusion_keys: list[str], contact_alias: str = "c") -> tuple[
     return "\n".join(conditions), params
 
 
+def unsubscribe_exclusion_sql(
+    scope: str,
+    scope_key: str,
+    contact_alias: str = "c",
+) -> tuple[str, list[str]]:
+    clean_scope = str(scope or UNSUBSCRIBE_SCOPE_CAMPAIGN).strip() or UNSUBSCRIBE_SCOPE_CAMPAIGN
+    clean_key = str(scope_key or "").strip()
+    params: list[str] = []
+    scope_condition = "ue.scope = 'global'"
+    if clean_scope != UNSUBSCRIBE_SCOPE_GLOBAL and clean_key:
+        scope_condition = "(ue.scope = 'global' or (ue.scope = ? and ue.scope_key = ?))"
+        params.extend([clean_scope, clean_key])
+    return (
+        f"""
+        and not exists (
+            select 1
+            from unsubscribe_events ue
+            where ue.user_id = {contact_alias}.user_id
+              and (
+                  (ue.contact_email != '' and ue.contact_email = lower({contact_alias}.email))
+                  or
+                  (ue.youtube_channel_id != '' and ue.youtube_channel_id = {contact_alias}.youtube_channel_id)
+              )
+              and {scope_condition}
+        )
+        """,
+        params,
+    )
+
+
 def fetch_next_send_contacts(
     campaign_key_value: str,
     limit: int,
     prerequisite_keys: list[str] | None = None,
     exclusion_keys: list[str] | None = None,
     offset: int = 0,
+    unsubscribe_scope: str = UNSUBSCRIBE_SCOPE_CAMPAIGN,
+    unsubscribe_scope_key: str = "",
 ) -> list[sqlite3.Row]:
     prereq_sql, prereq_params = prerequisite_sql(prerequisite_keys or [])
     exclude_sql, exclude_params = exclusion_sql(exclusion_keys or [])
+    unsub_sql, unsub_params = unsubscribe_exclusion_sql(
+        unsubscribe_scope,
+        unsubscribe_scope_key or campaign_key_value,
+    )
     return rows(
         f"""
         select
@@ -3942,6 +4260,7 @@ def fetch_next_send_contacts(
           )
         {prereq_sql}
         {exclude_sql}
+        {unsub_sql}
         group by c.id
         order by
             case when max(s.sent_at) is null then 0 else 1 end,
@@ -3949,7 +4268,15 @@ def fetch_next_send_contacts(
             c.id asc
         limit ? offset ?
         """,
-        (current_user_id(), campaign_key_value, *prereq_params, *exclude_params, int(limit), int(offset)),
+        (
+            current_user_id(),
+            campaign_key_value,
+            *prereq_params,
+            *exclude_params,
+            *unsub_params,
+            int(limit),
+            int(offset),
+        ),
     )
 
 
@@ -3957,9 +4284,15 @@ def count_next_send_contacts(
     campaign_key_value: str,
     prerequisite_keys: list[str] | None = None,
     exclusion_keys: list[str] | None = None,
+    unsubscribe_scope: str = UNSUBSCRIBE_SCOPE_CAMPAIGN,
+    unsubscribe_scope_key: str = "",
 ) -> int:
     prereq_sql, prereq_params = prerequisite_sql(prerequisite_keys or [])
     exclude_sql, exclude_params = exclusion_sql(exclusion_keys or [])
+    unsub_sql, unsub_params = unsubscribe_exclusion_sql(
+        unsubscribe_scope,
+        unsubscribe_scope_key or campaign_key_value,
+    )
     return int(
         rows(
             f"""
@@ -3980,8 +4313,15 @@ def count_next_send_contacts(
               )
               {prereq_sql}
               {exclude_sql}
+              {unsub_sql}
             """,
-            (current_user_id(), campaign_key_value, *prereq_params, *exclude_params),
+            (
+                current_user_id(),
+                campaign_key_value,
+                *prereq_params,
+                *exclude_params,
+                *unsub_params,
+            ),
         )[0]["count"]
         or 0
     )
@@ -3991,11 +4331,25 @@ def count_waiting_for_prerequisites(
     campaign_key_value: str,
     prerequisite_keys: list[str],
     exclusion_keys: list[str] | None = None,
+    unsubscribe_scope: str = UNSUBSCRIBE_SCOPE_CAMPAIGN,
+    unsubscribe_scope_key: str = "",
 ) -> int:
     if not prerequisite_keys:
         return 0
-    qualified_count = count_next_send_contacts(campaign_key_value, prerequisite_keys, exclusion_keys or [])
-    unrestricted_count = count_next_send_contacts(campaign_key_value, [], exclusion_keys or [])
+    qualified_count = count_next_send_contacts(
+        campaign_key_value,
+        prerequisite_keys,
+        exclusion_keys or [],
+        unsubscribe_scope,
+        unsubscribe_scope_key,
+    )
+    unrestricted_count = count_next_send_contacts(
+        campaign_key_value,
+        [],
+        exclusion_keys or [],
+        unsubscribe_scope,
+        unsubscribe_scope_key,
+    )
     return max(0, int(unrestricted_count) - int(qualified_count))
 
 
@@ -4003,11 +4357,25 @@ def count_excluded_by_later_steps(
     campaign_key_value: str,
     prerequisite_keys: list[str],
     exclusion_keys: list[str],
+    unsubscribe_scope: str = UNSUBSCRIBE_SCOPE_CAMPAIGN,
+    unsubscribe_scope_key: str = "",
 ) -> int:
     if not exclusion_keys:
         return 0
-    unrestricted_count = count_next_send_contacts(campaign_key_value, prerequisite_keys, [])
-    allowed_count = count_next_send_contacts(campaign_key_value, prerequisite_keys, exclusion_keys)
+    unrestricted_count = count_next_send_contacts(
+        campaign_key_value,
+        prerequisite_keys,
+        [],
+        unsubscribe_scope,
+        unsubscribe_scope_key,
+    )
+    allowed_count = count_next_send_contacts(
+        campaign_key_value,
+        prerequisite_keys,
+        exclusion_keys,
+        unsubscribe_scope,
+        unsubscribe_scope_key,
+    )
     return max(0, int(unrestricted_count) - int(allowed_count))
 
 
@@ -4075,6 +4443,14 @@ def prepare_send_history_display(frame: pd.DataFrame) -> pd.DataFrame:
         campaign_key(template["name"]): template["name"]
         for template in fetch_campaign_templates()
     }
+    for scenario in fetch_scenarios():
+        for step in fetch_scenario_steps(int(scenario["id"])):
+            step_key = scenario_step_campaign_key(int(scenario["id"]), int(step["step_number"]))
+            template_name_by_key[step_key] = scenario_step_campaign_name(
+                str(scenario["name"] or ""),
+                int(step["step_number"]),
+                str(step["template_name"] or ""),
+            )
     display = frame.copy().fillna("")
     display["日時"] = display["sent_at"].apply(format_jst_datetime)
     display["状態"] = display["status"].apply(send_status_label)
@@ -4111,9 +4487,13 @@ def fetch_campaign_template_stats(template_names: list[str]) -> pd.DataFrame:
             """
             select count(*) as count
             from unsubscribe_events
-            where user_id = ? and campaign_key = ?
+            where user_id = ?
+              and (
+                  campaign_key = ?
+                  or (scope = 'campaign' and scope_key = ?)
+              )
             """,
-            (current_user_id(), key),
+            (current_user_id(), key, key),
         )[0]["count"]
         sent_count = int(counts["sent_count"] or 0)
         unsubscribe_rate = (int(unsubscribe_count or 0) / sent_count * 100) if sent_count else 0
@@ -4133,6 +4513,11 @@ def fetch_campaign_template_stats(template_names: list[str]) -> pd.DataFrame:
 
 def fetch_scenario_step_stats(scenario_id: int) -> pd.DataFrame:
     records = []
+    scenario = rows(
+        "select name from scenarios where user_id = ? and id = ? limit 1",
+        (current_user_id(), int(scenario_id)),
+    )
+    scenario_name = str(scenario[0]["name"] or "") if scenario else ""
     steps = fetch_scenario_steps(int(scenario_id))
     for step in steps:
         step_number = int(step["step_number"])
@@ -4153,9 +4538,14 @@ def fetch_scenario_step_stats(scenario_id: int) -> pd.DataFrame:
             """
             select count(*) as count
             from unsubscribe_events
-            where user_id = ? and campaign_key = ?
+            where user_id = ?
+              and (
+                  campaign_key = ?
+                  or (scope = 'campaign' and scope_key = ?)
+                  or (scope = 'scenario' and scope_key = ?)
+              )
             """,
-            (current_user_id(), key),
+            (current_user_id(), key, key, scenario_name),
         )[0]["count"]
         sent_count = int(counts["sent_count"] or 0)
         unsubscribe_rate = (int(unsubscribe_count or 0) / sent_count * 100) if sent_count else 0
@@ -4222,6 +4612,45 @@ def fetch_blocked_targets() -> pd.DataFrame:
             db,
             params=(current_user_id(),),
         )
+
+
+def fetch_unsubscribe_events(limit: int = 500) -> pd.DataFrame:
+    with sqlite3.connect(DB_PATH) as db:
+        return pd.read_sql_query(
+            """
+            select
+                id,
+                contact_email,
+                youtube_channel_id,
+                channel,
+                campaign_key,
+                scope,
+                scope_key,
+                scope_label,
+                unsubscribed_at
+            from unsubscribe_events
+            where user_id = ?
+            order by id desc
+            limit ?
+            """,
+            db,
+            params=(current_user_id(), int(limit)),
+        ).fillna("")
+
+
+def unsubscribe_events_display_frame(events: pd.DataFrame) -> pd.DataFrame:
+    if events.empty:
+        return pd.DataFrame(columns=["停止日時", "停止範囲", "メールアドレス", "チャンネル", "詳細"])
+    display = events.copy()
+    display["停止日時"] = display["unsubscribed_at"].apply(format_jst_datetime)
+    display["停止範囲"] = display.apply(
+        lambda row: scope_display_label(row["scope"], row["scope_key"], row["scope_label"]),
+        axis=1,
+    )
+    display["メールアドレス"] = display["contact_email"].replace("", "-")
+    display["チャンネル"] = display["channel"].replace("", display["youtube_channel_id"]).replace("", "-")
+    display["詳細"] = display["campaign_key"].replace("", "-")
+    return display[["停止日時", "停止範囲", "メールアドレス", "チャンネル", "詳細"]]
 
 
 def add_contact(
@@ -5427,6 +5856,9 @@ def main() -> None:
         effective_campaign_key = campaign_key(campaign_name)
         effective_subject_template = subject_template
         effective_body_template = body_template
+        unsubscribe_scope = UNSUBSCRIBE_SCOPE_CAMPAIGN
+        unsubscribe_scope_key = effective_campaign_key
+        unsubscribe_scope_label = normal_campaign_scope_label(effective_campaign_name)
         prerequisite_campaign_keys: list[str] = []
         later_step_campaign_keys: list[str] = []
         scenario_context = ""
@@ -5461,6 +5893,9 @@ def main() -> None:
                         int(send_scenario["id"]),
                         int(selected_step["step_number"]),
                     )
+                    unsubscribe_scope = UNSUBSCRIBE_SCOPE_SCENARIO
+                    unsubscribe_scope_key = str(send_scenario["name"] or "").strip()
+                    unsubscribe_scope_label = str(send_scenario["name"] or "").strip()
                     if selected_template_for_step:
                         effective_subject_template = selected_template_for_step["subject"]
                         effective_body_template = selected_template_for_step["body"]
@@ -5485,6 +5920,9 @@ def main() -> None:
             effective_campaign_key = campaign_key(campaign_name)
             effective_subject_template = subject_template
             effective_body_template = body_template
+            unsubscribe_scope = UNSUBSCRIBE_SCOPE_CAMPAIGN
+            unsubscribe_scope_key = effective_campaign_key
+            unsubscribe_scope_label = normal_campaign_scope_label(effective_campaign_name)
             if save_col.button("保存 / 更新", key="save_campaign_template", use_container_width=True):
                 if campaign_name.strip():
                     save_campaign_template(campaign_name, subject_template, body_template)
@@ -5494,10 +5932,15 @@ def main() -> None:
                 else:
                     st.error("配信名を入力してください")
         current_campaign_key = effective_campaign_key
+        if unsubscribe_scope == UNSUBSCRIBE_SCOPE_CAMPAIGN:
+            unsubscribe_scope_key = current_campaign_key
+            unsubscribe_scope_label = normal_campaign_scope_label(effective_campaign_name)
         estimated_remaining_count = count_next_send_contacts(
             current_campaign_key,
             prerequisite_campaign_keys,
             later_step_campaign_keys,
+            unsubscribe_scope,
+            unsubscribe_scope_key,
         )
         window_col_start, window_col_end = st.columns(2)
         send_window_start = window_col_start.time_input(
@@ -5578,12 +6021,23 @@ def main() -> None:
         target_count = rows(
             """
             select count(*) as count
-            from contacts
-            where user_id = ?
-              and consent = 1
-              and unsubscribed = 0
-              and email != ''
-              and coalesce(contact_status, '送信対象') in ('未確認', 'メール確認済み', '送信対象')
+            from contacts c
+            where c.user_id = ?
+              and c.consent = 1
+              and c.unsubscribed = 0
+              and c.email != ''
+              and coalesce(c.contact_status, '送信対象') in ('未確認', 'メール確認済み', '送信対象')
+              and not exists (
+                  select 1
+                  from unsubscribe_events ue
+                  where ue.user_id = c.user_id
+                    and ue.scope = 'global'
+                    and (
+                        (ue.contact_email != '' and ue.contact_email = lower(c.email))
+                        or
+                        (ue.youtube_channel_id != '' and ue.youtube_channel_id = c.youtube_channel_id)
+                    )
+              )
             """,
             (current_user_id(),),
         )[0]["count"]
@@ -5603,16 +6057,26 @@ def main() -> None:
             """,
             (current_user_id(), current_campaign_key),
         )[0]["count"]
-        remaining_count = count_next_send_contacts(current_campaign_key, prerequisite_campaign_keys, later_step_campaign_keys)
+        remaining_count = count_next_send_contacts(
+            current_campaign_key,
+            prerequisite_campaign_keys,
+            later_step_campaign_keys,
+            unsubscribe_scope,
+            unsubscribe_scope_key,
+        )
         prerequisite_waiting_count = count_waiting_for_prerequisites(
             current_campaign_key,
             prerequisite_campaign_keys,
             later_step_campaign_keys,
+            unsubscribe_scope,
+            unsubscribe_scope_key,
         )
         later_step_excluded_count = count_excluded_by_later_steps(
             current_campaign_key,
             prerequisite_campaign_keys,
             later_step_campaign_keys,
+            unsubscribe_scope,
+            unsubscribe_scope_key,
         )
         metric_cols = st.columns(4)
         metric_cols[0].metric("送信対象", f"{target_count}件")
@@ -5651,6 +6115,9 @@ def main() -> None:
             1,
             prerequisite_campaign_keys,
             later_step_campaign_keys,
+            0,
+            unsubscribe_scope,
+            unsubscribe_scope_key,
         ) if effective_campaign_name.strip() else []
         confirmation_page_size = 10
         confirmation_total_pages = max(1, (int(planned_count) + confirmation_page_size - 1) // confirmation_page_size)
@@ -5669,6 +6136,8 @@ def main() -> None:
                 prerequisite_campaign_keys,
                 later_step_campaign_keys,
                 confirmation_offset,
+                unsubscribe_scope,
+                unsubscribe_scope_key,
             )
             if effective_campaign_name.strip() and planned_count > 0
             else []
@@ -5690,12 +6159,19 @@ def main() -> None:
                 st.write("プレビューできる送信対象がありません。宛先一覧、配信名、送信済み状況を確認してください。")
             else:
                 preview_contact = preview_contacts[0]
-                preview_unsubscribe_url = build_unsubscribe_url(preview_contact)
+                preview_unsubscribe_url = build_unsubscribe_url(
+                    preview_contact,
+                    unsubscribe_scope,
+                    unsubscribe_scope_key,
+                    unsubscribe_scope_label,
+                )
+                preview_unsubscribe_all_url = build_global_unsubscribe_url(preview_contact)
                 preview_subject = render_template(effective_subject_template, preview_contact, preview_unsubscribe_url)
                 preview_body = render_template(
                     ensure_unsubscribe_link_template(effective_body_template),
                     preview_contact,
                     preview_unsubscribe_url,
+                    preview_unsubscribe_all_url,
                 )
                 st.caption(
                     f"送信対象の先頭1件で確認しています: "
@@ -6010,6 +6486,9 @@ def main() -> None:
                     int(send_limit),
                     prerequisite_campaign_keys,
                     later_step_campaign_keys,
+                    0,
+                    unsubscribe_scope,
+                    unsubscribe_scope_key,
                 )
                 if run_test:
                     contacts = contacts[:1]
@@ -6026,6 +6505,9 @@ def main() -> None:
                         int(delay),
                         send_window_start,
                         send_window_end,
+                        unsubscribe_scope,
+                        unsubscribe_scope_key,
+                        unsubscribe_scope_label,
                     )
                     if ok:
                         st.success(message)
@@ -6040,9 +6522,20 @@ def main() -> None:
                     user_email = current_user_profile()["email"].strip().lower() or current_user_id()
                     for index, contact in enumerate(contacts):
                         register_unsubscribe_token(contact, user_email)
-                        unsubscribe_url = build_unsubscribe_url(contact)
+                        unsubscribe_url = build_unsubscribe_url(
+                            contact,
+                            unsubscribe_scope,
+                            unsubscribe_scope_key,
+                            unsubscribe_scope_label,
+                        )
+                        unsubscribe_all_url = build_global_unsubscribe_url(contact)
                         subject = render_template(effective_subject_template, contact, unsubscribe_url)
-                        body = render_template(ensure_unsubscribe_link_template(effective_body_template), contact, unsubscribe_url)
+                        body = render_template(
+                            ensure_unsubscribe_link_template(effective_body_template),
+                            contact,
+                            unsubscribe_url,
+                            unsubscribe_all_url,
+                        )
                         ok, result = send_email(contact["email"], subject, body)
                         execute(
                             "insert into sends(user_id, contact_id, campaign_key, subject, status, error, sent_at) values (?, ?, ?, ?, ?, ?, ?)",
@@ -6076,8 +6569,14 @@ def main() -> None:
                                 st.rerun()
 
     query = st.query_params
-    token = query.get("unsubscribe_token")
+    token = query.get("unsubscribe_token") or query.get("token")
     if token:
+        unsubscribe_scope_from_query = str(query.get("scope") or UNSUBSCRIBE_SCOPE_GLOBAL).strip() or UNSUBSCRIBE_SCOPE_GLOBAL
+        unsubscribe_scope_key_from_query = str(query.get("scope_key") or "").strip()
+        unsubscribe_scope_label_from_query = str(query.get("scope_label") or "").strip()
+        if unsubscribe_scope_from_query == UNSUBSCRIBE_SCOPE_GLOBAL:
+            unsubscribe_scope_key_from_query = UNSUBSCRIBE_SCOPE_GLOBAL
+            unsubscribe_scope_label_from_query = "すべての案内"
         contact = rows("select id, email, youtube_channel_id, channel from contacts where token = ?", (token,))
         if contact:
             item = contact[0]
@@ -6086,24 +6585,47 @@ def main() -> None:
                 str(item["email"] or ""),
                 str(item["youtube_channel_id"] or ""),
                 str(item["channel"] or ""),
+                scope=unsubscribe_scope_from_query,
+                scope_key=unsubscribe_scope_key_from_query,
+                scope_label=unsubscribe_scope_label_from_query,
             )
             delete_pending_sends_for_unsubscribe(
                 int(item["id"]),
                 str(item["email"] or ""),
                 str(item["youtube_channel_id"] or ""),
+                unsubscribe_scope_from_query,
+                unsubscribe_scope_key_from_query,
             )
-            block_target(str(item["email"] or ""), str(item["youtube_channel_id"] or ""), str(item["channel"] or ""), "配信停止URL")
-            delete_contact(int(item["id"]))
-        st.success("配信停止を受け付けました。宛先一覧と未送信の予約から削除しました。")
+        st.success("配信停止を受け付けました。対象範囲の未送信予約から外しました。")
 
     st.divider()
     st.subheader("宛先一覧")
     cleanup_blocked_targets_for_existing_contacts()
     contacts = fetch_contacts()
+    unsubscribe_events = fetch_unsubscribe_events()
+    if not unsubscribe_events.empty:
+        with st.expander(f"配信停止管理（{len(unsubscribe_events)}件）"):
+            st.caption(
+                "配信停止は宛先自体を消さず、停止範囲だけを記録します。"
+                "全体停止はすべての案内を止め、シナリオ停止はそのシナリオだけ止めます。"
+            )
+            display_unsubscribes = unsubscribe_events_display_frame(unsubscribe_events)
+            unsubscribe_search = st.text_input(
+                "配信停止を検索",
+                placeholder="メールアドレス、チャンネル、停止範囲で検索",
+                key="unsubscribe_events_search",
+            ).strip().lower()
+            if unsubscribe_search:
+                mask = display_unsubscribes.fillna("").astype(str).apply(
+                    lambda column: column.str.lower().str.contains(unsubscribe_search, regex=False)
+                ).any(axis=1)
+                display_unsubscribes = display_unsubscribes[mask]
+            st.dataframe(display_unsubscribes.head(200), use_container_width=True, hide_index=True)
+
     blocked_targets = fetch_blocked_targets()
     if not blocked_targets.empty:
-        with st.expander(f"配信停止済み・削除済みリスト（{len(blocked_targets)}件）"):
-            st.caption("ここにあるメールアドレスやYouTubeチャンネルは、CSV取り込みや候補検索から自動で戻らないようにしています。必要な場合だけ宛先一覧へ戻してください。")
+        with st.expander(f"削除済み・除外リスト（{len(blocked_targets)}件）"):
+            st.caption("ここは手動削除や送信失敗などで、再取り込みしたくない宛先のリストです。配信停止だけの宛先は上の配信停止管理に残します。")
             blocked_search = st.text_input(
                 "除外リストを検索",
                 placeholder="メールアドレス、チャンネル名、理由で検索",
@@ -6175,7 +6697,9 @@ def main() -> None:
             options=["古い順", "新しい順"],
         )
         contacts["状態"] = contacts.apply(
-            lambda row: "停止" if row["unsubscribed"] else ("送信可" if row["consent"] else "要確認"),
+            lambda row: "全体停止"
+            if row.get("global_unsubscribed")
+            else ("一部停止" if row.get("scoped_unsubscribed") else ("送信可" if row["consent"] else "要確認")),
             axis=1,
         )
 
