@@ -11,6 +11,7 @@ const NOTIFY_SMTP_PASS = Deno.env.get("NOTIFY_SMTP_PASS") ?? "";
 const NOTIFY_MAIL_FROM = Deno.env.get("NOTIFY_MAIL_FROM") ?? NOTIFY_SMTP_USER;
 const UNSUBSCRIBE_REASON_PREFIX = "配信停止:";
 const UNSUBSCRIBE_REASON_GLOBAL = "配信停止:global";
+const STALE_SENDING_SECONDS = 10 * 60;
 
 function jsonResponse(data: unknown, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -97,6 +98,19 @@ async function deleteQueue(id: string) {
   await supabaseRequest(`send_queue?id=eq.${id}`, {
     method: "DELETE",
     headers: { Prefer: "return=minimal" },
+  });
+}
+
+async function recoverStaleSendingRows() {
+  const cutoff = new Date(Date.now() - STALE_SENDING_SECONDS * 1000).toISOString();
+  return await supabaseRequest(`send_queue?status=eq.sending&updated_at=lt.${encodeURIComponent(cutoff)}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({
+      status: "pending",
+      error: "",
+      updated_at: new Date().toISOString(),
+    }),
   });
 }
 
@@ -222,6 +236,10 @@ Deno.serve(async (req: Request) => {
     }
 
     const now = new Date().toISOString();
+    const recoveredRows = await recoverStaleSendingRows();
+    if (Array.isArray(recoveredRows) && recoveredRows.length > 0) {
+      console.log(`Recovered stale sending rows: ${recoveredRows.length}`);
+    }
     const dueRows = await supabaseRequest(`send_queue?status=eq.pending&scheduled_at=lte.${encodeURIComponent(now)}&select=*&order=scheduled_at.asc&limit=1`);
     if (!dueRows.length) return jsonResponse({ ok: true, message: "no due emails" });
 

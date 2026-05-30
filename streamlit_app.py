@@ -3925,6 +3925,31 @@ def register_unsubscribe_token(contact: sqlite3.Row, user_email: str) -> None:
     )
 
 
+def register_unsubscribe_tokens(contacts: list[sqlite3.Row], user_email: str) -> None:
+    if not supabase_configured() or not contacts:
+        return
+    token_rows = [
+        {
+            "user_email": user_email,
+            "token": str(contact["token"]),
+            "contact_local_id": int(contact["id"]),
+            "contact_email": str(contact["email"] or "").strip().lower(),
+            "youtube_channel_id": str(contact["youtube_channel_id"] or ""),
+            "channel": str(contact["channel"] or ""),
+            "updated_at": now_iso(),
+        }
+        for contact in contacts
+    ]
+    chunk_size = 500
+    for index in range(0, len(token_rows), chunk_size):
+        supabase_request(
+            "POST",
+            "unsubscribe_tokens?on_conflict=token",
+            token_rows[index : index + chunk_size],
+            prefer="resolution=merge-duplicates,return=minimal",
+        )
+
+
 def next_window_start(moment: datetime, window_start: datetime_time) -> datetime:
     return datetime.combine(moment.date() + timedelta(days=1), window_start, APP_TIMEZONE)
 
@@ -4303,8 +4328,8 @@ def create_send_job(
         return False, "送信予約の作成に失敗しました"
     job_id = created_job[0]["id"]
     queue_rows = []
+    register_unsubscribe_tokens(contacts, user_email)
     for index, contact in enumerate(contacts):
-        register_unsubscribe_token(contact, user_email)
         unsubscribe_url = build_unsubscribe_url(
             contact,
             unsubscribe_scope,
@@ -4439,8 +4464,7 @@ def create_scenario_full_send_job(
     queue_rows: list[dict] = []
     local_rows: list[tuple] = []
     queued_at = now_iso()
-    for contact in contacts:
-        register_unsubscribe_token(contact, user_email)
+    register_unsubscribe_tokens(contacts, user_email)
 
     for step_index, step in enumerate(prepared_steps):
         for contact_index, contact in enumerate(contacts):
@@ -5304,6 +5328,31 @@ def fetch_recent_send_jobs(limit: int = 20) -> list[dict]:
         return result if isinstance(result, list) else []
     except Exception:
         return []
+
+
+def mark_stale_empty_creating_jobs_failed(jobs: list[dict]) -> None:
+    if not supabase_configured() or not jobs:
+        return
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=5)
+    for job in jobs:
+        if str(job.get("status") or "").lower() != "creating":
+            continue
+        created_at = parse_utc_datetime(str(job.get("created_at") or ""))
+        if not created_at or created_at >= cutoff:
+            continue
+        job_id = str(job.get("id") or "").strip()
+        if not job_id or send_queue_has_rows(job_id):
+            continue
+        try:
+            supabase_request(
+                "PATCH",
+                f"send_jobs?id=eq.{urllib.parse.quote(job_id, safe='')}",
+                {"status": "failed", "updated_at": now_iso()},
+                prefer="return=minimal",
+            )
+            job["status"] = "failed"
+        except Exception:
+            continue
 
 
 def fetch_send_job_queue_summary(job_id: str) -> dict[str, object]:
@@ -7756,6 +7805,7 @@ def main() -> None:
 
         recent_jobs = fetch_recent_send_jobs(limit=20)
         if recent_jobs:
+            mark_stale_empty_creating_jobs_failed(recent_jobs)
             active_jobs = [job for job in recent_jobs if is_active_send_job(job)]
             job_queue_summaries = {
                 str(job.get("id") or ""): fetch_send_job_queue_summary(str(job.get("id") or ""))
