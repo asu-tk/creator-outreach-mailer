@@ -1166,6 +1166,24 @@ def update_outsource_spreadsheet(candidates: pd.DataFrame, share_with_link: bool
     return spreadsheet_url, max(0, len(values) - 1)
 
 
+def check_outsource_spreadsheet_connection(url: str) -> str:
+    ready, message = google_sheet_write_ready()
+    if not ready:
+        raise ValueError(message)
+    if not url.strip().startswith("http"):
+        raise ValueError("外注用GoogleスプレッドシートURLを入力してください。")
+    token = google_service_account_token(["https://www.googleapis.com/auth/spreadsheets.readonly"])
+    spreadsheet_id = extract_google_file_id(url.strip(), "spreadsheets")
+    metadata = google_api_request(
+        "GET",
+        f"https://sheets.googleapis.com/v4/spreadsheets/{urllib.parse.quote(spreadsheet_id, safe='')}",
+        token,
+    )
+    title = str(metadata.get("properties", {}).get("title") or "名称未設定")
+    sheet_count = len(metadata.get("sheets", []))
+    return f"接続できました: {title}（タブ{sheet_count}件）"
+
+
 def refresh_outsource_sheet_if_possible() -> str:
     if not get_setting("OUTSOURCE_SPREADSHEET_ID").strip():
         return ""
@@ -5358,30 +5376,47 @@ def main() -> None:
         active_outsource_url = str(
             st.session_state.get("last_outsource_sheet_url") or registered_outsource_url.strip() or stored_outsource_url
         )
+        with st.expander("外注シート連携の状態"):
+            st.write(f"GoogleシートURL: {'設定あり' if active_outsource_url.startswith('http') else '未設定'}")
+            st.write(f"サービスアカウント: {'設定あり' if service_account_email else '未設定'}")
+            if service_account_email:
+                st.code(service_account_email)
+            st.write(f"Google連携ライブラリ: {'利用可能' if ready_for_sheet else '未確認または不足'}")
+            if not ready_for_sheet:
+                st.caption(sheet_ready_message or "サービスアカウント設定を確認してください。")
+            st.write(f"YouTube候補: {len(candidates)}件")
         if active_outsource_url.startswith("http"):
             open_url_col.link_button("登録したGoogleシートを開く", active_outsource_url, use_container_width=True)
         else:
             open_url_col.button("登録したGoogleシートを開く", key="open_empty_outsource_sheet_url", use_container_width=True, disabled=True)
+        if st.button("Googleシート接続を確認", key="check_outsource_sheet_connection", use_container_width=True):
+            try:
+                save_setting("OUTSOURCE_SPREADSHEET_URL", active_outsource_url)
+                st.success(check_outsource_spreadsheet_connection(active_outsource_url))
+            except Exception as exc:
+                st.error(f"接続できませんでした: {exc}")
         sync_blockers = []
         if not active_outsource_url.startswith("http"):
             sync_blockers.append("外注用GoogleスプレッドシートURLが保存されていません。")
         if not ready_for_sheet:
             sync_blockers.append(sheet_ready_message or "サービスアカウント設定を確認してください。")
-        if candidates.empty:
-            sync_blockers.append("YouTube候補一覧に反映する候補がありません。")
         if sync_blockers:
             st.warning("候補一覧を反映できない理由: " + " / ".join(sync_blockers))
+        elif candidates.empty:
+            st.caption("反映できる候補は0件です。押すとGoogleシートに見出しだけ作ります。")
         else:
             st.caption(f"反映できる候補: {len(candidates)}件")
-        sync_disabled = bool(sync_blockers)
-        if st.button("候補一覧を登録済みシートへ反映", key="sync_outsource_sheet", use_container_width=True, disabled=sync_disabled):
+        if st.button("候補一覧を登録済みシートへ反映", key="sync_outsource_sheet", use_container_width=True):
             save_setting("OUTSOURCE_SPREADSHEET_URL", active_outsource_url)
             try:
                 spreadsheet_url, exported_count = update_outsource_spreadsheet(candidates, False)
                 st.session_state["last_outsource_sheet_url"] = spreadsheet_url
                 st.success(f"候補{exported_count}件をGoogleシートへ反映しました。外注さんにはメールアドレス欄だけ入力してもらってください。")
             except Exception as exc:
-                st.error(str(exc))
+                if sync_blockers:
+                    st.error("反映できませんでした: " + " / ".join(sync_blockers))
+                else:
+                    st.error(f"反映できませんでした: {exc}")
         st.caption("列名はアプリが用意します。外注さんにはメールアドレス欄と必要ならメモだけ入力してもらってください。")
 
         with st.expander("CSV / Excelで作る場合の予備ダウンロード"):
