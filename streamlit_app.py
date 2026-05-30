@@ -1486,6 +1486,42 @@ def format_outsource_sheet(token: str, spreadsheet_id: str, sheet_id: int) -> No
                         "fields": "dataValidation",
                     }
                 },
+                {
+                    "updateDimensionProperties": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "dimension": "COLUMNS",
+                            "startIndex": OUTSOURCE_SHEET_COLUMNS.index(OUTSOURCE_DISCARD_COLUMN),
+                            "endIndex": OUTSOURCE_SHEET_COLUMNS.index(OUTSOURCE_DISCARD_COLUMN) + 1,
+                        },
+                        "properties": {"pixelSize": 130},
+                        "fields": "pixelSize",
+                    }
+                },
+                {
+                    "updateDimensionProperties": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "dimension": "COLUMNS",
+                            "startIndex": OUTSOURCE_SHEET_COLUMNS.index("メモ"),
+                            "endIndex": OUTSOURCE_SHEET_COLUMNS.index("メモ") + 1,
+                        },
+                        "properties": {"pixelSize": 190},
+                        "fields": "pixelSize",
+                    }
+                },
+                {
+                    "updateDimensionProperties": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "dimension": "COLUMNS",
+                            "startIndex": OUTSOURCE_SHEET_COLUMNS.index("状態"),
+                            "endIndex": OUTSOURCE_SHEET_COLUMNS.index("状態") + 1,
+                        },
+                        "properties": {"pixelSize": 110},
+                        "fields": "pixelSize",
+                    }
+                },
             ]
         },
     )
