@@ -1004,16 +1004,46 @@ def get_or_create_outsource_spreadsheet(token: str) -> tuple[str, str]:
     raise ValueError("先に空のGoogleスプレッドシートを作り、そのURLを登録してください。")
 
 
-def get_outsource_sheet_id(token: str, spreadsheet_id: str) -> int:
+def rename_sheet(token: str, spreadsheet_id: str, sheet_id: int, title: str) -> None:
+    google_api_request(
+        "POST",
+        f"https://sheets.googleapis.com/v4/spreadsheets/{urllib.parse.quote(spreadsheet_id, safe='')}:batchUpdate",
+        token,
+        {
+            "requests": [
+                {
+                    "updateSheetProperties": {
+                        "properties": {"sheetId": sheet_id, "title": title},
+                        "fields": "title",
+                    }
+                }
+            ]
+        },
+    )
+
+
+def get_outsource_sheet_id(token: str, spreadsheet_id: str, preferred_gid: str = "") -> int:
     metadata = google_api_request(
         "GET",
         f"https://sheets.googleapis.com/v4/spreadsheets/{urllib.parse.quote(spreadsheet_id, safe='')}",
         token,
     )
+    sheets = metadata.get("sheets", [])
     for sheet in metadata.get("sheets", []):
         properties = sheet.get("properties", {})
         if properties.get("title") == OUTSOURCE_SHEET_NAME:
             return int(properties.get("sheetId") or 0)
+    for sheet in sheets:
+        properties = sheet.get("properties", {})
+        sheet_id = int(properties.get("sheetId") or 0)
+        if preferred_gid and str(sheet_id) == str(preferred_gid):
+            rename_sheet(token, spreadsheet_id, sheet_id, OUTSOURCE_SHEET_NAME)
+            return sheet_id
+    if len(sheets) == 1:
+        properties = sheets[0].get("properties", {})
+        sheet_id = int(properties.get("sheetId") or 0)
+        rename_sheet(token, spreadsheet_id, sheet_id, OUTSOURCE_SHEET_NAME)
+        return sheet_id
     result = google_api_request(
         "POST",
         f"https://sheets.googleapis.com/v4/spreadsheets/{urllib.parse.quote(spreadsheet_id, safe='')}:batchUpdate",
@@ -1095,7 +1125,8 @@ def update_outsource_spreadsheet(candidates: pd.DataFrame, share_with_link: bool
         ]
     )
     spreadsheet_id, spreadsheet_url = get_or_create_outsource_spreadsheet(token)
-    sheet_id = get_outsource_sheet_id(token, spreadsheet_id)
+    preferred_gid = extract_google_sheet_gid(spreadsheet_url)
+    sheet_id = get_outsource_sheet_id(token, spreadsheet_id, preferred_gid)
     encoded_id = urllib.parse.quote(spreadsheet_id, safe="")
     encoded_range = urllib.parse.quote(google_sheet_range(OUTSOURCE_SHEET_NAME), safe="")
     google_api_request(
