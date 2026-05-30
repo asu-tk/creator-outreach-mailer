@@ -669,6 +669,115 @@ def require_login() -> bool:
     st.stop()
 
 
+def inject_loading_indicator() -> None:
+    components.html(
+        """
+        <script>
+        (() => {
+            const win = window.parent;
+            const doc = win.document;
+            if (win.__creatorOutreachLoadingIndicatorInstalled) {
+                return;
+            }
+            win.__creatorOutreachLoadingIndicatorInstalled = true;
+
+            const style = doc.createElement("style");
+            style.id = "creator-outreach-loading-style";
+            style.textContent = `
+                @keyframes creatorOutreachLoadingSpin {
+                    to { transform: rotate(360deg); }
+                }
+                #creator-outreach-loading-indicator {
+                    display: none;
+                    position: fixed;
+                    inset: 0;
+                    z-index: 2147483000;
+                    pointer-events: none;
+                    align-items: center;
+                    justify-content: center;
+                    background: rgba(248, 250, 252, 0.30);
+                }
+                body.creator-outreach-is-loading #creator-outreach-loading-indicator {
+                    display: flex;
+                }
+                .creator-outreach-loading-card {
+                    display: inline-flex;
+                    align-items: center;
+                    gap: 12px;
+                    min-width: 168px;
+                    justify-content: center;
+                    padding: 14px 18px;
+                    border-radius: 8px;
+                    border: 1px solid rgba(148, 163, 184, 0.45);
+                    background: rgba(255, 255, 255, 0.96);
+                    box-shadow: 0 18px 45px rgba(15, 23, 42, 0.18);
+                    color: #0f172a;
+                    font-family: "Source Sans Pro", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+                    font-size: 0.95rem;
+                    font-weight: 700;
+                    letter-spacing: 0;
+                }
+                .creator-outreach-loading-spinner {
+                    width: 20px;
+                    height: 20px;
+                    border-radius: 999px;
+                    border: 3px solid #dbeafe;
+                    border-top-color: #2563eb;
+                    animation: creatorOutreachLoadingSpin 0.8s linear infinite;
+                    flex: 0 0 auto;
+                }
+                @media (prefers-reduced-motion: reduce) {
+                    .creator-outreach-loading-spinner {
+                        animation: none;
+                    }
+                }
+            `;
+            doc.head.appendChild(style);
+
+            const indicator = doc.createElement("div");
+            indicator.id = "creator-outreach-loading-indicator";
+            indicator.innerHTML = `
+                <div class="creator-outreach-loading-card" role="status" aria-live="polite">
+                    <div class="creator-outreach-loading-spinner" aria-hidden="true"></div>
+                    <div>読み込み中...</div>
+                </div>
+            `;
+            doc.body.appendChild(indicator);
+
+            function elementIsVisible(element) {
+                const rect = element.getBoundingClientRect();
+                const computed = win.getComputedStyle(element);
+                return (
+                    rect.width > 0 &&
+                    rect.height > 0 &&
+                    computed.display !== "none" &&
+                    computed.visibility !== "hidden" &&
+                    computed.opacity !== "0"
+                );
+            }
+
+            function updateIndicator() {
+                const widgets = Array.from(doc.querySelectorAll('[data-testid="stStatusWidget"]'));
+                const running = widgets.some((widget) => {
+                    if (!elementIsVisible(widget)) {
+                        return false;
+                    }
+                    const text = (widget.innerText || widget.textContent || "").trim().toLowerCase();
+                    return text.includes("running") || text.includes("実行") || text.includes("処理") || text.includes("読み込み");
+                });
+                doc.body.classList.toggle("creator-outreach-is-loading", running);
+            }
+
+            win.setInterval(updateIndicator, 180);
+            updateIndicator();
+        })();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
 def get_secret(name: str, default: str = "") -> str:
     saved = get_setting(name)
     if saved:
@@ -4185,6 +4294,7 @@ def queue_google_contacts_url_import() -> None:
 
 def main() -> None:
     st.set_page_config(page_title="Creator Outreach Mailer", layout="wide")
+    inject_loading_indicator()
     init_db()
 
     if not require_login():
