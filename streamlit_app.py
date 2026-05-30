@@ -4177,6 +4177,116 @@ def record_unsubscribe_event(
         )
 
 
+def delete_remote_unsubscribe_mirror(event: sqlite3.Row) -> list[str]:
+    warnings = []
+    if not supabase_configured():
+        return warnings
+    user_email = current_user_profile()["email"].strip().lower()
+    if not user_email:
+        return warnings
+
+    query_user_email = urllib.parse.quote(user_email, safe="")
+    contact_email = str(event["contact_email"] or "").strip().lower()
+    youtube_channel_id = str(event["youtube_channel_id"] or "").strip()
+    scope = str(event["scope"] or "").strip() or UNSUBSCRIBE_SCOPE_CAMPAIGN
+    scope_key = str(event["scope_key"] or "").strip()
+    reason = unsubscribe_reason(scope, scope_key)
+
+    try:
+        reason_values = [reason]
+        if scope == UNSUBSCRIBE_SCOPE_GLOBAL:
+            reason_values.append("配信停止URL")
+        for reason_value in dict.fromkeys(reason_values):
+            reason_query = urllib.parse.quote(reason_value, safe="")
+            base_path = f"blocked_targets?user_email=eq.{query_user_email}&reason=eq.{reason_query}"
+            if contact_email:
+                contact_query = urllib.parse.quote(contact_email, safe="")
+                supabase_request(
+                    "DELETE",
+                    f"{base_path}&email=eq.{contact_query}",
+                    prefer="return=minimal",
+                )
+            if youtube_channel_id:
+                channel_query = urllib.parse.quote(youtube_channel_id, safe="")
+                supabase_request(
+                    "DELETE",
+                    f"{base_path}&youtube_channel_id=eq.{channel_query}",
+                    prefer="return=minimal",
+                )
+
+        if scope == UNSUBSCRIBE_SCOPE_GLOBAL:
+            token_payload = {"unsubscribed_at": None, "updated_at": now_iso()}
+            if contact_email:
+                contact_query = urllib.parse.quote(contact_email, safe="")
+                supabase_request(
+                    "PATCH",
+                    f"unsubscribe_tokens?user_email=eq.{query_user_email}&contact_email=eq.{contact_query}",
+                    token_payload,
+                    prefer="return=minimal",
+                )
+            if youtube_channel_id:
+                channel_query = urllib.parse.quote(youtube_channel_id, safe="")
+                supabase_request(
+                    "PATCH",
+                    f"unsubscribe_tokens?user_email=eq.{query_user_email}&youtube_channel_id=eq.{channel_query}",
+                    token_payload,
+                    prefer="return=minimal",
+                )
+            contact_matches = []
+            if contact_email:
+                contact_matches = rows(
+                    "select id from contacts where user_id = ? and email = ? limit 1",
+                    (current_user_id(), contact_email),
+                )
+            if not contact_matches and youtube_channel_id:
+                contact_matches = rows(
+                    "select id from contacts where user_id = ? and youtube_channel_id = ? limit 1",
+                    (current_user_id(), youtube_channel_id),
+                )
+            if contact_matches:
+                supabase_request(
+                    "PATCH",
+                    f"unsubscribe_tokens?user_email=eq.{query_user_email}&contact_local_id=eq.{int(contact_matches[0]['id'])}",
+                    token_payload,
+                    prefer="return=minimal",
+                )
+    except Exception as exc:
+        warnings.append(f"クラウド側の配信停止記録を消せませんでした: {friendly_smtp_error(str(exc))}")
+    return warnings
+
+
+def delete_unsubscribe_event(event_id: int) -> tuple[bool, str]:
+    event_rows = rows(
+        """
+        select
+            id,
+            contact_email,
+            youtube_channel_id,
+            channel,
+            campaign_key,
+            scope,
+            scope_key,
+            scope_label,
+            unsubscribed_at
+        from unsubscribe_events
+        where user_id = ? and id = ?
+        limit 1
+        """,
+        (current_user_id(), int(event_id)),
+    )
+    if not event_rows:
+        return False, "削除する配信停止記録が見つかりませんでした。"
+
+    warnings = delete_remote_unsubscribe_mirror(event_rows[0])
+    execute(
+        "delete from unsubscribe_events where user_id = ? and id = ?",
+        (current_user_id(), int(event_id)),
+    )
+    if warnings:
+        return True, "配信停止記録を削除しました。ただし、" + " / ".join(warnings)
+    return True, "配信停止記録を削除しました。宛先一覧への自動復活はしていません。"
+
+
 def sync_unsubscribes_from_supabase() -> None:
     if not supabase_configured():
         return
@@ -4820,9 +4930,10 @@ def sent_count_for_unsubscribe_scope(scope: str, scope_key: str) -> int:
 
 def unsubscribe_events_display_frame(events: pd.DataFrame) -> pd.DataFrame:
     if events.empty:
-        return pd.DataFrame(columns=["停止日時", "停止種類", "停止対象", "メールアドレス", "チャンネル", "停止理由", "内部キー"])
+        return pd.DataFrame(columns=["_event_id", "停止日時", "停止種類", "停止対象", "メールアドレス", "チャンネル", "停止理由", "内部キー"])
     campaign_names = campaign_display_name_map()
     display = events.copy()
+    display["_event_id"] = display["id"].astype(int)
     display["停止日時"] = display["unsubscribed_at"].apply(format_jst_datetime)
     display["停止種類"] = display["scope"].apply(unsubscribe_scope_kind_label)
     display["停止対象"] = display.apply(
@@ -4836,7 +4947,7 @@ def unsubscribe_events_display_frame(events: pd.DataFrame) -> pd.DataFrame:
     ).replace("", "-")
     display["停止理由"] = "配信停止URLクリック"
     display["内部キー"] = display["scope_key"].where(display["scope_key"].astype(str).str.strip() != "", display["campaign_key"]).replace("", "-")
-    return display[["停止日時", "停止種類", "停止対象", "メールアドレス", "チャンネル", "停止理由", "内部キー"]]
+    return display[["_event_id", "停止日時", "停止種類", "停止対象", "メールアドレス", "チャンネル", "停止理由", "内部キー"]]
 
 
 def unsubscribe_events_summary_frame(events: pd.DataFrame) -> pd.DataFrame:
@@ -6833,7 +6944,14 @@ def main() -> None:
                 "配信停止は宛先自体を消さず、どの範囲で停止されたかを記録します。"
                 "停止種類と停止対象を見ると、どのシナリオ・どの配信で止まったかを確認できます。"
             )
+            unsubscribe_delete_notice = st.session_state.pop("unsubscribe_delete_notice", "")
+            unsubscribe_delete_error = st.session_state.pop("unsubscribe_delete_error", "")
+            if unsubscribe_delete_notice:
+                st.success(unsubscribe_delete_notice)
+            if unsubscribe_delete_error:
+                st.error(unsubscribe_delete_error)
             display_unsubscribes = unsubscribe_events_display_frame(unsubscribe_events)
+            downloadable_unsubscribes = display_unsubscribes.drop(columns=["_event_id"], errors="ignore")
             unsubscribe_summary = unsubscribe_events_summary_frame(unsubscribe_events)
             stop_counts = display_unsubscribes["停止種類"].value_counts()
             metric_cols = st.columns(4)
@@ -6867,20 +6985,75 @@ def main() -> None:
                     ).any(axis=1)
                     filtered_unsubscribes = filtered_unsubscribes[mask]
                 st.caption(f"{len(filtered_unsubscribes)}件を表示しています。")
-                st.dataframe(filtered_unsubscribes.head(300), use_container_width=True, hide_index=True)
+                st.dataframe(
+                    filtered_unsubscribes.drop(columns=["_event_id"], errors="ignore").head(300),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                if not filtered_unsubscribes.empty:
+                    st.divider()
+                    st.caption(
+                        "誤って配信停止した記録だけを削除できます。"
+                        "削除しても宛先一覧へ自動追加はしません。宛先一覧に残っている場合だけ、その停止範囲の送信対象に戻ります。"
+                    )
+                    delete_options = [int(value) for value in filtered_unsubscribes["_event_id"].head(300).tolist()]
+                    label_by_id = {
+                        int(row["_event_id"]): (
+                            f"{row['停止日時']} / {row['停止種類']} / {row['停止対象']} / "
+                            f"{row['メールアドレス']} / {row['チャンネル']}"
+                        )
+                        for _, row in filtered_unsubscribes.head(300).iterrows()
+                    }
+                    selected_unsubscribe_delete_id = st.selectbox(
+                        "削除する配信停止記録",
+                        options=delete_options,
+                        format_func=lambda event_id: label_by_id.get(int(event_id), str(event_id)),
+                        key="delete_unsubscribe_event_select",
+                    )
+                    if st.button("選択した配信停止を削除", key="request_delete_unsubscribe_event", use_container_width=True):
+                        st.session_state["confirm_delete_unsubscribe_event_id"] = int(selected_unsubscribe_delete_id)
+                        st.rerun()
+
+                pending_delete_unsubscribe_id = int(st.session_state.get("confirm_delete_unsubscribe_event_id") or 0)
+                if pending_delete_unsubscribe_id:
+                    pending_label = ""
+                    if pending_delete_unsubscribe_id in set(display_unsubscribes["_event_id"].astype(int).tolist()):
+                        pending_row = display_unsubscribes[
+                            display_unsubscribes["_event_id"].astype(int) == pending_delete_unsubscribe_id
+                        ].iloc[0]
+                        pending_label = (
+                            f"{pending_row['停止種類']} / {pending_row['停止対象']} / "
+                            f"{pending_row['メールアドレス']}"
+                        )
+                    st.warning(
+                        f"配信停止記録「{pending_label or pending_delete_unsubscribe_id}」を削除しますか？"
+                        "宛先一覧への自動復活はしません。"
+                    )
+                    yes_col, no_col = st.columns(2)
+                    if yes_col.button("はい、削除する", key="confirm_delete_unsubscribe_event_yes", use_container_width=True):
+                        ok, message = delete_unsubscribe_event(pending_delete_unsubscribe_id)
+                        st.session_state["confirm_delete_unsubscribe_event_id"] = 0
+                        if ok:
+                            st.session_state["unsubscribe_delete_notice"] = message
+                        else:
+                            st.session_state["unsubscribe_delete_error"] = message
+                        st.rerun()
+                    if no_col.button("いいえ、削除しない", key="confirm_delete_unsubscribe_event_no", use_container_width=True):
+                        st.session_state["confirm_delete_unsubscribe_event_id"] = 0
+                        st.rerun()
             with download_tab:
                 export_name = datetime.now(APP_TIMEZONE).strftime("unsubscribe_analytics_%Y%m%d_%H%M")
                 csv_col, xlsx_col = st.columns(2)
                 csv_col.download_button(
                     "配信停止履歴をCSVでダウンロード",
-                    data=display_unsubscribes.to_csv(index=False).encode("utf-8-sig"),
+                    data=downloadable_unsubscribes.to_csv(index=False).encode("utf-8-sig"),
                     file_name=f"{export_name}_history.csv",
                     mime="text/csv",
                     use_container_width=True,
                 )
                 xlsx_col.download_button(
                     "配信停止履歴をExcelでダウンロード",
-                    data=dataframe_to_xlsx(display_unsubscribes, sheet_name="配信停止履歴"),
+                    data=dataframe_to_xlsx(downloadable_unsubscribes, sheet_name="配信停止履歴"),
                     file_name=f"{export_name}_history.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
