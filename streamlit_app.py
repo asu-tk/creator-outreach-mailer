@@ -75,6 +75,10 @@ AI_IMAGE_MAX_BYTES = 8 * 1024 * 1024
 STREAMLIT_SEND_QUEUE_BATCH_SIZE = 1
 STREAMLIT_SEND_QUEUE_MIN_INTERVAL_SECONDS = 25
 STREAMLIT_SEND_QUEUE_STALE_SENDING_SECONDS = 10 * 60
+BACKGROUND_SYNC_MIN_INTERVAL_SECONDS = 60
+UNSUBSCRIBE_SYNC_MIN_INTERVAL_SECONDS = 120
+BLOCKED_TARGET_CLEANUP_MIN_INTERVAL_SECONDS = 300
+SEND_JOB_SUMMARY_CACHE_SECONDS = 60
 UNSUBSCRIBE_SCOPE_GLOBAL = "global"
 UNSUBSCRIBE_SCOPE_SCENARIO = "scenario"
 UNSUBSCRIBE_SCOPE_CAMPAIGN = "campaign"
@@ -220,6 +224,18 @@ def format_jst_datetime_compact(value: str) -> str:
 
 def today_key() -> str:
     return datetime.now(APP_TIMEZONE).strftime("%Y-%m-%d")
+
+
+def should_run_session_interval(key: str, min_interval_seconds: int, force: bool = False) -> bool:
+    now_epoch = time.time()
+    if force:
+        st.session_state[key] = now_epoch
+        return True
+    last_run = float(st.session_state.get(key, 0) or 0)
+    if now_epoch - last_run < max(1, int(min_interval_seconds)):
+        return False
+    st.session_state[key] = now_epoch
+    return True
 
 
 def campaign_key(campaign_name: str) -> str:
@@ -3290,7 +3306,9 @@ def restore_blocked_target_by_id(blocked_id: int) -> tuple[bool, str]:
     return False, "除外は解除しましたが、宛先一覧への復元はできませんでした。メールアドレスやチャンネルの重複を確認してください。"
 
 
-def cleanup_blocked_targets_for_existing_contacts() -> None:
+def cleanup_blocked_targets_for_existing_contacts(force: bool = False) -> None:
+    if not force and not should_run_session_interval("_blocked_targets_cleanup_at", BLOCKED_TARGET_CLEANUP_MIN_INTERVAL_SECONDS):
+        return
     execute(
         """
         delete from blocked_targets
@@ -4197,6 +4215,21 @@ def count_send_queue_rows(job_id: str) -> int:
     return supabase_exact_count(f"send_queue?job_id=eq.{query_job_id}&select=id")
 
 
+def count_send_queue_rows_by_status(job_id: str, statuses: list[str] | tuple[str, ...]) -> int:
+    if not supabase_configured() or not str(job_id or "").strip() or not statuses:
+        return 0
+    query_job_id = urllib.parse.quote(str(job_id), safe="")
+    clean_statuses = [str(status).strip() for status in statuses if str(status).strip()]
+    if not clean_statuses:
+        return 0
+    if len(clean_statuses) == 1:
+        status_filter = f"status=eq.{urllib.parse.quote(clean_statuses[0], safe='')}"
+    else:
+        status_values = ",".join(urllib.parse.quote(status, safe="") for status in clean_statuses)
+        status_filter = f"status=in.({status_values})"
+    return supabase_exact_count(f"send_queue?job_id=eq.{query_job_id}&{status_filter}&select=id")
+
+
 def send_queue_has_rows(job_id: str) -> bool:
     if not supabase_configured() or not str(job_id or "").strip():
         return False
@@ -4707,14 +4740,22 @@ def process_due_send_queue_from_streamlit(force: bool = False) -> dict[str, int 
             print(f"[send queue] process-failed job={job_id} row={row_id} error={exc}", flush=True)
 
     refresh_supabase_send_jobs(affected_job_ids)
+    if affected_job_ids:
+        clear_send_job_queue_summary_cache()
     return result
 
 
-def sync_send_queue_results() -> None:
+def sync_send_queue_results(force: bool = False) -> None:
     if not supabase_configured():
         return
     user_email = current_user_profile()["email"].strip().lower()
     if not user_email:
+        return
+    if not should_run_session_interval(
+        "_send_queue_results_sync_at",
+        BACKGROUND_SYNC_MIN_INTERVAL_SECONDS,
+        force=force,
+    ):
         return
     try:
         query_email = urllib.parse.quote(user_email, safe="")
@@ -4937,18 +4978,13 @@ def refresh_supabase_send_jobs(job_ids: set[str]) -> None:
             continue
         try:
             query_job_id = urllib.parse.quote(job_id, safe="")
-            queue_rows = supabase_request(
-                "GET",
-                f"send_queue?job_id=eq.{query_job_id}&select=status",
-            )
-            if not isinstance(queue_rows, list):
-                continue
-            sent_count = sum(1 for row in queue_rows if row.get("status") == "sent")
-            failed_count = sum(1 for row in queue_rows if row.get("status") == "failed")
-            pending_count = sum(1 for row in queue_rows if row.get("status") in ["pending", "sending"])
+            total_count = count_send_queue_rows(job_id)
+            sent_count = count_send_queue_rows_by_status(job_id, ["sent"])
+            failed_count = count_send_queue_rows_by_status(job_id, ["failed"])
+            pending_count = count_send_queue_rows_by_status(job_id, ["pending", "sending"])
             status = "finished" if pending_count == 0 else "sending"
             payload = {
-                "total_count": len(queue_rows),
+                "total_count": total_count,
                 "sent_count": sent_count,
                 "failed_count": failed_count,
                 "status": status,
@@ -5224,11 +5260,15 @@ def delete_unsubscribe_event(event_id: int) -> tuple[bool, str]:
     return True, "配信停止記録を削除しました。宛先一覧への自動復活はしていません。"
 
 
-def sync_unsubscribes_from_supabase() -> None:
+def sync_unsubscribes_from_supabase(force: bool = False) -> None:
     if not supabase_configured():
         return
     user_email = current_user_profile()["email"].strip().lower()
     if not user_email:
+        return
+    if not should_run_session_interval(
+        "_unsubscribes_sync_at", UNSUBSCRIBE_SYNC_MIN_INTERVAL_SECONDS, force=force
+    ):
         return
     try:
         query_email = urllib.parse.quote(user_email, safe="")
@@ -5355,7 +5395,13 @@ def mark_stale_empty_creating_jobs_failed(jobs: list[dict]) -> None:
             continue
 
 
-def fetch_send_job_queue_summary(job_id: str) -> dict[str, object]:
+def clear_send_job_queue_summary_cache() -> None:
+    for key in list(st.session_state.keys()):
+        if str(key).startswith("_send_job_queue_summary::"):
+            st.session_state.pop(key, None)
+
+
+def fetch_send_job_queue_summary(job_id: str, force: bool = False) -> dict[str, object]:
     summary: dict[str, object] = {
         "has_queue": False,
         "first_queue_status": "",
@@ -5367,6 +5413,13 @@ def fetch_send_job_queue_summary(job_id: str) -> dict[str, object]:
     }
     if not supabase_configured() or not str(job_id or "").strip():
         return summary
+    cache_key = f"_send_job_queue_summary::{job_id}"
+    cached = st.session_state.get(cache_key)
+    if not force and isinstance(cached, dict):
+        cached_at = float(cached.get("at", 0) or 0)
+        cached_value = cached.get("value")
+        if isinstance(cached_value, dict) and time.time() - cached_at < SEND_JOB_SUMMARY_CACHE_SECONDS:
+            return dict(cached_value)
     try:
         query_job_id = urllib.parse.quote(str(job_id), safe="")
         first_rows = supabase_request(
@@ -5412,6 +5465,7 @@ def fetch_send_job_queue_summary(job_id: str) -> dict[str, object]:
         summary["sending_count"] = 0
         summary["stale_sending_count"] = 0
         summary["overdue_pending"] = False
+    st.session_state[cache_key] = {"at": time.time(), "value": dict(summary)}
     return summary
 
 
@@ -7807,16 +7861,18 @@ def main() -> None:
         if recent_jobs:
             mark_stale_empty_creating_jobs_failed(recent_jobs)
             active_jobs = [job for job in recent_jobs if is_active_send_job(job)]
+            summary_target_jobs = active_jobs or recent_jobs[:3]
             job_queue_summaries = {
                 str(job.get("id") or ""): fetch_send_job_queue_summary(str(job.get("id") or ""))
-                for job in recent_jobs
+                for job in summary_target_jobs
                 if str(job.get("id") or "")
             }
             with st.expander(f"シナリオ・送信予約の進捗（稼働中{len(active_jobs)}件）", expanded=bool(active_jobs)):
                 refresh_col, note_col = st.columns([1.0, 2.4])
                 if refresh_col.button("状態を更新", width="stretch"):
                     process_due_send_queue_from_streamlit(force=True)
-                    sync_send_queue_results()
+                    sync_send_queue_results(force=True)
+                    clear_send_job_queue_summary_cache()
                     st.rerun()
                 note_col.caption("送信予約の進捗は30秒ごとに自動更新されます。この画面を開いている間は、予定時刻を過ぎた送信待ちも1通ずつ処理します。")
                 cancel_notice = st.session_state.pop("send_job_cancel_notice", "")

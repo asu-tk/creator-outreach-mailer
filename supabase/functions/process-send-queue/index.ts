@@ -38,6 +38,40 @@ async function supabaseRequest(path: string, options: RequestInit = {}) {
   return text ? JSON.parse(text) : [];
 }
 
+async function supabaseExactCount(path: string) {
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    method: "GET",
+    headers: {
+      apikey: SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SERVICE_ROLE_KEY}`,
+      "Content-Type": "application/json",
+      Prefer: "count=exact",
+      "Range-Unit": "items",
+      Range: "0-0",
+    },
+  });
+  if (!response.ok) {
+    const detail = await response.text();
+    throw new Error(`Supabase ${response.status}: ${detail}`);
+  }
+  const contentRange = response.headers.get("content-range") ?? "";
+  const match = contentRange.match(/\/(\d+|\*)$/);
+  if (!match || match[1] === "*") return 0;
+  return Number(match[1]);
+}
+
+function statusFilter(statuses: string[]) {
+  const cleanStatuses = statuses.map((status) => String(status).trim()).filter(Boolean);
+  if (cleanStatuses.length === 1) return `status=eq.${encodeFilter(cleanStatuses[0])}`;
+  return `status=in.(${cleanStatuses.map((status) => encodeFilter(status)).join(",")})`;
+}
+
+async function countQueue(jobId: string, statuses: string[] = []) {
+  const base = `send_queue?job_id=eq.${encodeFilter(jobId)}`;
+  const filter = statuses.length ? `&${statusFilter(statuses)}` : "";
+  return await supabaseExactCount(`${base}${filter}&select=id`);
+}
+
 function encodeFilter(value: unknown) {
   return encodeURIComponent(String(value ?? "").trim());
 }
@@ -200,10 +234,10 @@ async function sendCompletionNotice(job: Record<string, unknown>, sent: number, 
 }
 
 async function updateJob(jobId: string) {
-  const rows = await supabaseRequest(`send_queue?job_id=eq.${jobId}&select=status`);
-  const sent = rows.filter((row: { status: string }) => row.status === "sent").length;
-  const failed = rows.filter((row: { status: string }) => row.status === "failed").length;
-  const pending = rows.filter((row: { status: string }) => row.status === "pending" || row.status === "sending").length;
+  const total = await countQueue(jobId);
+  const sent = await countQueue(jobId, ["sent"]);
+  const failed = await countQueue(jobId, ["failed"]);
+  const pending = await countQueue(jobId, ["pending", "sending"]);
   const status = pending === 0 ? "finished" : "sending";
   const now = new Date().toISOString();
 
@@ -211,7 +245,7 @@ async function updateJob(jobId: string) {
     method: "PATCH",
     headers: { Prefer: "return=minimal" },
     body: JSON.stringify({
-      total_count: rows.length,
+      total_count: total,
       sent_count: sent,
       failed_count: failed,
       status,
