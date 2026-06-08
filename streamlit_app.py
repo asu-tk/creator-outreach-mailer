@@ -914,9 +914,17 @@ def get_secret(name: str, default: str = "") -> str:
         return os.getenv(name, default)
 
 
+def sqlite_connect() -> sqlite3.Connection:
+    DATA_DIR.mkdir(exist_ok=True)
+    db = sqlite3.connect(DB_PATH, timeout=30)
+    db.execute("pragma busy_timeout = 30000")
+    return db
+
+
+@st.cache_resource(show_spinner=False)
 def init_db() -> None:
     DATA_DIR.mkdir(exist_ok=True)
-    with sqlite3.connect(DB_PATH) as db:
+    with sqlite_connect() as db:
         db.executescript(
             """
             create table if not exists contacts (
@@ -1131,41 +1139,46 @@ def init_db() -> None:
         for column, statement in unsubscribe_migrations.items():
             if column not in unsubscribe_columns:
                 db.execute(statement)
-        db.execute(
-            """
-            update unsubscribe_events
-            set scope = 'campaign',
-                scope_key = campaign_key,
-                scope_label = 'この配信'
-            where coalesce(scope_key, '') = '' and coalesce(campaign_key, '') != ''
-            """
-        )
-        db.execute(
-            """
-            insert into unsubscribe_events
-            (user_id, contact_email, youtube_channel_id, channel, campaign_key, scope, scope_key, scope_label, unsubscribed_at)
-            select user_id, email, youtube_channel_id, channel, '', 'global', 'global', 'すべての案内', created_at
-            from blocked_targets
-            where reason = '配信停止URL'
-              and not exists (
-                  select 1
-                  from unsubscribe_events ue
-                  where ue.user_id = blocked_targets.user_id
-                    and ue.scope = 'global'
-                    and (
-                        (blocked_targets.email != '' and ue.contact_email = blocked_targets.email)
-                        or
-                        (blocked_targets.youtube_channel_id != '' and ue.youtube_channel_id = blocked_targets.youtube_channel_id)
-                    )
-              )
-            """
-        )
-        db.execute("delete from blocked_targets where reason = '配信停止URL'")
         db.commit()
+        try:
+            db.execute(
+                """
+                update unsubscribe_events
+                set scope = 'campaign',
+                    scope_key = campaign_key,
+                    scope_label = 'この配信'
+                where coalesce(scope_key, '') = '' and coalesce(campaign_key, '') != ''
+                """
+            )
+            db.execute(
+                """
+                insert into unsubscribe_events
+                (user_id, contact_email, youtube_channel_id, channel, campaign_key, scope, scope_key, scope_label, unsubscribed_at)
+                select user_id, email, youtube_channel_id, channel, '', 'global', 'global', 'すべての案内', created_at
+                from blocked_targets
+                where reason = '配信停止URL'
+                  and not exists (
+                      select 1
+                      from unsubscribe_events ue
+                      where ue.user_id = blocked_targets.user_id
+                        and ue.scope = 'global'
+                        and (
+                            (blocked_targets.email != '' and ue.contact_email = blocked_targets.email)
+                            or
+                            (blocked_targets.youtube_channel_id != '' and ue.youtube_channel_id = blocked_targets.youtube_channel_id)
+                        )
+                  )
+                """
+            )
+            db.execute("delete from blocked_targets where reason = '配信停止URL'")
+            db.commit()
+        except sqlite3.OperationalError as exc:
+            db.rollback()
+            print(f"[init_db] skipped legacy unsubscribe migration: {exc}", flush=True)
 
 
 def fetch_contacts() -> pd.DataFrame:
-    with sqlite3.connect(DB_PATH) as db:
+    with sqlite_connect() as db:
         return pd.read_sql_query(
             """
             select
@@ -1218,7 +1231,7 @@ def count_contacts() -> int:
 
 
 def fetch_candidates() -> pd.DataFrame:
-    with sqlite3.connect(DB_PATH) as db:
+    with sqlite_connect() as db:
         return pd.read_sql_query(
             """
             select
@@ -1891,7 +1904,7 @@ def dataframe_to_xlsx(frame: pd.DataFrame, sheet_name: str = "宛先一覧") -> 
 
 
 def execute(query: str, params: tuple = ()) -> None:
-    with sqlite3.connect(DB_PATH) as db:
+    with sqlite_connect() as db:
         db.execute(query, params)
         db.commit()
     mark_app_state_dirty()
@@ -1926,7 +1939,7 @@ def save_outsource_import_history(
     )
     candidate_removed_count = int(mapping.get("candidate_removed") or 0)
     candidate_discarded_count = int(mapping.get("candidate_discarded") or 0)
-    with sqlite3.connect(DB_PATH) as db:
+    with sqlite_connect() as db:
         cursor = db.execute(
             """
             insert into outsource_imports
@@ -1957,7 +1970,7 @@ def save_outsource_import_history(
 
 
 def fetch_outsource_import_history(limit: int = 100) -> pd.DataFrame:
-    with sqlite3.connect(DB_PATH) as db:
+    with sqlite_connect() as db:
         return pd.read_sql_query(
             """
             select
@@ -1992,7 +2005,7 @@ def update_outsource_import_receipt(
     payment_status: str,
     receipt_issued_at: str,
 ) -> None:
-    with sqlite3.connect(DB_PATH) as db:
+    with sqlite_connect() as db:
         db.execute(
             """
             update outsource_imports
@@ -2202,7 +2215,7 @@ def table_columns(db: sqlite3.Connection, table: str) -> list[str]:
 def export_local_app_state() -> dict:
     user_id = current_user_id()
     state_tables: dict[str, list[dict]] = {}
-    with sqlite3.connect(DB_PATH) as db:
+    with sqlite_connect() as db:
         db.row_factory = sqlite3.Row
         for table in APP_STATE_TABLES:
             columns = table_columns(db, table)
@@ -2261,7 +2274,7 @@ def restore_local_app_state(state: dict) -> None:
 
     st.session_state["_restoring_app_state"] = True
     try:
-        with sqlite3.connect(DB_PATH) as db:
+        with sqlite_connect() as db:
             for table in delete_order:
                 columns = table_columns(db, table)
                 if "user_id" in columns:
@@ -2422,7 +2435,7 @@ def get_setting(key: str, default: str = "") -> str:
     if not DB_PATH.exists():
         return default
     scoped_key = f"{current_user_id()}::{key}"
-    with sqlite3.connect(DB_PATH) as db:
+    with sqlite_connect() as db:
         row = db.execute("select value from settings where key = ?", (scoped_key,)).fetchone()
         return str(row[0]) if row else default
 
@@ -3749,7 +3762,7 @@ def search_youtube_channels(
 
 
 def rows(query: str, params: tuple = ()) -> list[sqlite3.Row]:
-    with sqlite3.connect(DB_PATH) as db:
+    with sqlite_connect() as db:
         db.row_factory = sqlite3.Row
         return list(db.execute(query, params))
 
@@ -4312,7 +4325,7 @@ def finalize_send_queue_creation(job_id: str, queue_rows: list[dict]) -> tuple[b
 def insert_queued_send_rows(send_rows: list[tuple]) -> None:
     if not send_rows:
         return
-    with sqlite3.connect(DB_PATH) as db:
+    with sqlite_connect() as db:
         db.executemany(
             """
             insert into sends(user_id, contact_id, campaign_key, send_job_id, subject, status, error, sent_at)
@@ -4843,7 +4856,7 @@ def is_cancelable_send_job(job: dict) -> bool:
 
 def delete_local_queued_sends_for_job(send_job_id: str, queue_rows: list[dict]) -> int:
     deleted_count = 0
-    with sqlite3.connect(DB_PATH) as db:
+    with sqlite_connect() as db:
         for item in queue_rows:
             contact_id = int(item.get("contact_local_id") or 0)
             campaign_key_value = str(item.get("campaign_key") or "")
@@ -4963,7 +4976,7 @@ def delete_pending_sends_for_unsubscribe(
                 return max(deleted_count, local_deleted)
             campaign_clause = f"and campaign_key in ({','.join('?' for _ in target_campaign_keys)})"
             campaign_params = target_campaign_keys
-        with sqlite3.connect(DB_PATH) as db:
+        with sqlite_connect() as db:
             cursor = db.execute(
                 f"""
                 delete from sends
@@ -5706,7 +5719,7 @@ def count_excluded_by_later_steps(
 
 
 def fetch_failed_sends(limit: int = 20) -> pd.DataFrame:
-    with sqlite3.connect(DB_PATH) as db:
+    with sqlite_connect() as db:
         return pd.read_sql_query(
             """
             select
@@ -5737,7 +5750,7 @@ def send_status_label(status: str) -> str:
 
 
 def fetch_send_history(limit: int = 500) -> pd.DataFrame:
-    with sqlite3.connect(DB_PATH) as db:
+    with sqlite_connect() as db:
         return pd.read_sql_query(
             """
             select
@@ -5926,7 +5939,7 @@ def safety_check_messages(
 
 
 def fetch_blocked_targets() -> pd.DataFrame:
-    with sqlite3.connect(DB_PATH) as db:
+    with sqlite_connect() as db:
         return pd.read_sql_query(
             """
             select
@@ -5946,7 +5959,7 @@ def fetch_blocked_targets() -> pd.DataFrame:
 
 
 def fetch_unsubscribe_events(limit: int = 500) -> pd.DataFrame:
-    with sqlite3.connect(DB_PATH) as db:
+    with sqlite_connect() as db:
         return pd.read_sql_query(
             """
             select
